@@ -48,7 +48,7 @@ def config_file(tmp_path, monkeypatch):
 class TestLoadConfig:
     def test_defaults_when_file_missing(self, config_file):
         cfg = load_config()
-        assert cfg["quality"] == "HIGH"
+        assert cfg["quality"] == "LOSSLESS"
         assert cfg["page_size"] == 15
         assert cfg["progress_bar_width"] == 50
         assert cfg["volume"] == 100
@@ -77,6 +77,83 @@ class TestLoadConfig:
         }))
         cfg = load_config()
         assert cfg == {**DEFAULTS, "version": config_mod.CONFIG_VERSION}
+
+
+class TestMigration:
+    """v1 named every tier one step below the stream it asked for. The rename
+    must keep an existing user on the exact same bytes, never downgrade them."""
+
+    def test_v1_low_becomes_high(self, config_file):
+        config_file.write_text(json.dumps({"version": 1, "quality": "LOW"}))
+        assert load_config()["quality"] == "HIGH"
+
+    def test_v1_high_becomes_lossless(self, config_file):
+        config_file.write_text(json.dumps({"version": 1, "quality": "HIGH"}))
+        assert load_config()["quality"] == "LOSSLESS"
+
+    def test_v1_top_tiers_are_unchanged(self, config_file):
+        """v1's LOSSLESS and HIGH asked for the same stream, and HIRES was
+        already correct — neither name moves."""
+        for saved in ("LOSSLESS", "HIRES"):
+            config_file.write_text(json.dumps({"version": 1, "quality": saved}))
+            assert load_config()["quality"] == saved
+
+    def test_v1_stream_is_preserved_end_to_end(self, config_file):
+        """The point of the migration: same tidalapi Quality before and after."""
+        import tidalapi
+
+        config_file.write_text(json.dumps({"version": 1, "quality": "LOW"}))
+        p = HeadlessTidalPlayer()
+        assert p.session.audio_quality == tidalapi.Quality.low_320k  # v1's "LOW"
+
+    def test_v2_passes_through_untouched(self, config_file):
+        config_file.write_text(json.dumps({"version": 2, "quality": "LOW", "page_size": 22}))
+        cfg = load_config()
+        assert cfg["quality"] == "LOW"
+        assert cfg["page_size"] == 22
+
+    def test_versionless_file_is_treated_as_current(self, config_file):
+        """No version key means "written by this build" — don't rename."""
+        config_file.write_text(json.dumps({"quality": "LOW"}))
+        assert load_config()["quality"] == "LOW"
+
+    def test_migration_stamps_the_new_version(self, config_file):
+        config_file.write_text(json.dumps({"version": 1, "quality": "HIGH"}))
+        assert load_config()["version"] == config_mod.CONFIG_VERSION
+
+    def test_junk_version_never_raises(self, config_file):
+        config_file.write_text(json.dumps({"version": "banana", "quality": "HIRES"}))
+        assert load_config()["quality"] == "HIRES"
+
+    def test_migration_is_idempotent(self, config_file):
+        """Load, save, load again — the value must settle, not climb a tier
+        per launch."""
+        config_file.write_text(json.dumps({"version": 1, "quality": "LOW"}))
+        save_config(load_config())
+        assert load_config()["quality"] == "HIGH"
+
+
+class TestQualityTiers:
+    """The player's map is the only place setting names meet tidalapi."""
+
+    def test_every_choice_maps_to_a_distinct_tidalapi_tier(self):
+        values = [HeadlessTidalPlayer.QUALITY_MAP[c] for c in config_mod.QUALITY_CHOICES]
+        assert len(set(values)) == len(values)
+
+    def test_map_covers_the_spec_choices_exactly(self):
+        assert set(HeadlessTidalPlayer.QUALITY_MAP) == set(config_mod.QUALITY_CHOICES)
+        assert set(HeadlessTidalPlayer.QUALITY_LABELS) == set(config_mod.QUALITY_CHOICES)
+        assert set(config_mod.QUALITY_MEANINGS) == set(config_mod.QUALITY_CHOICES)
+
+    def test_tiers_ascend(self):
+        import tidalapi
+
+        assert [HeadlessTidalPlayer.QUALITY_MAP[c] for c in config_mod.QUALITY_CHOICES] == [
+            tidalapi.Quality.low_96k,
+            tidalapi.Quality.low_320k,
+            tidalapi.Quality.high_lossless,
+            tidalapi.Quality.hi_res_lossless,
+        ]
 
 
 class TestSaveLoadRoundTrip:
@@ -143,7 +220,7 @@ class TestCoerce:
         assert coerce(get_spec("quality"), "hires") == "HIRES"
 
     def test_unknown_choice_falls_back(self):
-        assert coerce(get_spec("quality"), "MP3") == "HIGH"
+        assert coerce(get_spec("quality"), "MP3") == DEFAULTS["quality"]
 
 
 class TestCycleValue:
@@ -158,6 +235,22 @@ class TestCycleValue:
     def test_choice_steps_in_spec_order(self):
         spec = get_spec("quality")
         assert cycle_value(spec, "LOW", 1) == "HIGH"
+
+    def test_every_choice_setting_wraps_at_both_ends(self):
+        """Choices are a ring: → off the last lands on the first, and back."""
+        for spec in SETTINGS_SPEC:
+            if spec["kind"] != "choice":
+                continue
+            first, last = spec["choices"][0], spec["choices"][-1]
+            assert cycle_value(spec, last, 1) == first
+            assert cycle_value(spec, first, -1) == last
+
+    def test_full_forward_lap_returns_to_start(self):
+        spec = get_spec("quality")
+        value = spec["choices"][0]
+        for _ in range(len(spec["choices"])):
+            value = cycle_value(spec, value, 1)
+        assert value == spec["choices"][0]
 
     def test_int_steps_and_stops_at_bounds(self):
         spec = get_spec("progress_bar_width")
@@ -202,23 +295,25 @@ class TestSettingsKeyHandler:
     def test_quality_cycles_and_wraps(self, config_file):
         p = self._player()
         p._settings_cursor = 0  # quality row
-        assert p.config["quality"] == "HIGH"
-        p._handle_settings_key(player_mod.KEY_RIGHT)
         assert p.config["quality"] == "LOSSLESS"
         p._handle_settings_key(player_mod.KEY_RIGHT)
         assert p.config["quality"] == "HIRES"
         p._handle_settings_key(player_mod.KEY_RIGHT)
-        assert p.config["quality"] == "LOW"  # wrapped
+        assert p.config["quality"] == "LOW"  # wrapped past the last value
+        p._handle_settings_key(player_mod.KEY_RIGHT)
+        assert p.config["quality"] == "HIGH"
         p._handle_settings_key(player_mod.KEY_LEFT)
-        assert p.config["quality"] == "HIRES"
+        assert p.config["quality"] == "LOW"
+        p._handle_settings_key(player_mod.KEY_LEFT)
+        assert p.config["quality"] == "HIRES"  # wrapped past the first value
 
     def test_quality_change_applies_live(self, config_file):
         import tidalapi
 
         p = self._player()
         p._settings_cursor = 0
-        p._handle_settings_key(player_mod.KEY_LEFT)  # HIGH → LOW
-        assert p._quality_name == "LOW"
+        p._handle_settings_key(player_mod.KEY_LEFT)  # LOSSLESS → HIGH
+        assert p._quality_name == "HIGH"
         assert p.session.audio_quality == tidalapi.Quality.low_320k
 
     def test_page_size_change_applies_live_and_saves(self, config_file):

@@ -408,18 +408,19 @@ class HeadlessTidalPlayer:
     MODE_ADD_TO_PLAYLIST = "add_to_playlist"
     MODE_SETTINGS = "settings"
 
-    # Setting name → tidalapi quality, and the stream label shown to the user.
-    # Both are keyed by setting name so the player badge and the settings row
-    # can never disagree (HIGH and LOSSLESS share one tidalapi value).
+    # Setting name → tidalapi quality, and the terse badge shown on the player.
+    # One name per tidalapi tier, same spelling as tidalapi uses, so the setting
+    # name, the badge and the bytes TIDAL sends can never disagree. (Older
+    # configs named every tier one step low; utils.config migrates them.)
     QUALITY_MAP = {
-        "LOW": tidalapi.Quality.low_320k,
-        "HIGH": tidalapi.Quality.high_lossless,
+        "LOW": tidalapi.Quality.low_96k,
+        "HIGH": tidalapi.Quality.low_320k,
         "LOSSLESS": tidalapi.Quality.high_lossless,
         "HIRES": tidalapi.Quality.hi_res_lossless,
     }
     QUALITY_LABELS = {
-        "LOW": "HIGH 320k",
-        "HIGH": "LOSSLESS",
+        "LOW": "96k AAC",
+        "HIGH": "320k AAC",
         "LOSSLESS": "LOSSLESS",
         "HIRES": "HI-RES",
     }
@@ -500,7 +501,8 @@ class HeadlessTidalPlayer:
         # Quality: an explicit --quality wins for this run only; it is never
         # written back to config.json, so the saved default survives
         name = (quality or self.config["quality"]).upper()
-        self._quality_name = name if name in self.QUALITY_MAP else "HIGH"
+        # config["quality"] is already validated, so it is a safe last resort
+        self._quality_name = name if name in self.QUALITY_MAP else self.config["quality"]
         self.session.audio_quality = self.QUALITY_MAP[self._quality_name]
 
     def _get_user_display_name(self) -> str:
@@ -1174,13 +1176,28 @@ class HeadlessTidalPlayer:
                 content.append(f"‹ {value} ›", style="bold cyan")
             else:
                 content.append(f"  {value}", style="dim cyan")
-            if spec["key"] == "quality":
-                label = self.QUALITY_LABELS.get(str(value).upper(), "")
-                if label:
-                    content.append(f"  → {label}", style="dim")
+            # A choice value on its own says nothing about what you'll hear —
+            # spell the stream out next to it
+            meaning = spec.get("value_desc", {}).get(str(value).upper(), "")
+            if meaning:
+                content.append(f"  {meaning}", style="dim")
 
         spec = SETTINGS_SPEC[self._settings_cursor]
         content.append(f"\n\n   {spec['desc']}", style="dim")
+        # The whole ladder, so ←/→ lands somewhere you already understand.
+        # Fits 80 columns for the four quality tiers.
+        if spec.get("value_desc"):
+            content.append("\n   ", style="")
+            current = str(self.config.get(spec["key"], spec["default"])).upper()
+            for i, choice in enumerate(spec["choices"]):
+                if i:
+                    content.append(" · ", style="dim")
+                on = choice == current
+                content.append(choice, style="bold cyan" if on else "dim")
+                # Badge text, unless it just repeats the name (HIRES / HI-RES)
+                short = self.QUALITY_LABELS.get(choice, "")
+                if short and short.replace("-", "") != choice:
+                    content.append(f" {short}", style="cyan" if on else "dim")
         # A --quality flag beats the saved value for this run without changing it
         if self._quality_name != self.config.get("quality"):
             content.append(
@@ -1427,6 +1444,18 @@ class HeadlessTidalPlayer:
         self._search_history.insert(0, q)
         self._search_history = self._search_history[:20]
 
+    @staticmethod
+    def _search_split(page: int) -> tuple:
+        """How many tracks / albums / artists make up one page of results.
+        Keeps the old 50/30/20 feel, but scaled to "Songs per page" instead of
+        a hardcoded 5/3/2 — one page of search is one page of rows, like every
+        other list. Albums and artists never round away to nothing."""
+        # Floor division, so the rounding always falls to tracks and songs stay
+        # at least half the page even at the 5-row minimum
+        albums = max(1, page * 3 // 10)
+        artists = max(1, page * 2 // 10)
+        return max(1, page - albums - artists), albums, artists
+
     def _do_search(self):
         query = self._search_query.strip()
         if not query:
@@ -1436,18 +1465,37 @@ class HeadlessTidalPlayer:
         self._search_results = []
         self._search_cursor = 0
         self._search_message = ""
+        # Snapshot the size now: changing the setting mid-flight retunes the
+        # next search, it never refetches this one
+        page = self._page_size
 
         def _run():
             try:
-                results = self.session.search(query, models=[tidalapi.Track, tidalapi.Album, tidalapi.Artist], limit=8)
+                # TIDAL applies `limit` per type, so a single request at the page
+                # size covers every category — including the slack we need when
+                # one category comes up short. Well under tidalapi's 300 ceiling.
+                results = self.session.search(
+                    query, models=[tidalapi.Track, tidalapi.Album, tidalapi.Artist], limit=page
+                )
+                found_tracks = list(results.get("tracks") or [])
+                found_albums = list(results.get("albums") or [])
+                found_artists = list(results.get("artists") or [])
+
+                n_tracks, n_albums, n_artists = self._search_split(page)
+                # A query with one album shouldn't waste the other album rows —
+                # hand the shortfall to tracks, which is what you searched for
+                n_albums = min(n_albums, len(found_albums))
+                n_artists = min(n_artists, len(found_artists))
+                n_tracks = page - n_albums - n_artists
+
                 items = []
-                for track in (results.get("tracks") or [])[:5]:
+                for track in found_tracks[:n_tracks]:
                     artist = track.artists[0].name if track.artists else ""
                     items.append({"type": "track", "name": track.name, "artist": artist, "obj": track})
-                for album in (results.get("albums") or [])[:3]:
+                for album in found_albums[:n_albums]:
                     artist = album.artist.name if album.artist else ""
                     items.append({"type": "album", "name": album.name, "artist": artist, "obj": album})
-                for artist in (results.get("artists") or [])[:2]:
+                for artist in found_artists[:n_artists]:
                     items.append({"type": "artist", "name": artist.name, "artist": "", "obj": artist})
                 self._search_results = items
                 if not items:
@@ -1511,7 +1559,9 @@ class HeadlessTidalPlayer:
 
         def _run():
             try:
-                tracks = artist.get_top_tracks(limit=20)
+                # At least a page — a 40-row page must not show 20 tracks and
+                # claim that's all the artist has
+                tracks = artist.get_top_tracks(limit=max(20, self._page_size))
                 self._browse_tracks = list(tracks)
                 if not self._browse_tracks:
                     self._browse_message = "No tracks found"

@@ -18,20 +18,41 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 
 CONFIG_DIR = Path.home() / ".config" / "ticli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+# Ascending, and named exactly like tidalapi's Quality values so the setting
+# name, the stream label and what TIDAL actually sends can't drift apart.
 QUALITY_CHOICES = ["LOW", "HIGH", "LOSSLESS", "HIRES"]
+
+# What each tier actually streams. Sourced from tidalapi: Quality.low_96k /
+# low_320k are AAC (media.py parses their DASH codecs as mp4a.40.5 / mp4a.40.2),
+# high_lossless is FLAC at the 16-bit/44.1 kHz TIDAL assumes when a stream
+# reports no resolution, and hi_res_lossless is FLAC above that — tidalapi
+# doesn't pin its ceiling, so the wording stays deliberately open.
+QUALITY_MEANINGS = {
+    "LOW": "AAC ~96 kbps, lossy",
+    "HIGH": "AAC ~320 kbps, lossy",
+    "LOSSLESS": "FLAC 16-bit/44.1 kHz, CD quality",
+    "HIRES": "FLAC above CD, hi-res where the master allows",
+}
+
+# v1 called every tier one step below what it actually streamed (its "LOW" asked
+# for 320k, its "HIGH" for lossless). Renaming the tiers would have silently
+# downgraded saved configs, so v1 values are lifted to the name that keeps the
+# same stream. Applied once, on load; the next save stamps version 2.
+QUALITY_V1_RENAMES = {"LOW": "HIGH", "HIGH": "LOSSLESS"}
 
 SETTINGS_SPEC: list[dict] = [
     {
         "key": "quality",
         "label": "Quality",
         "kind": "choice",
-        "default": "HIGH",
+        "default": "LOSSLESS",
         "choices": QUALITY_CHOICES,
+        "value_desc": QUALITY_MEANINGS,
         "desc": "Stream quality. Applies from the next track. --quality overrides it for one run.",
     },
     {
@@ -110,6 +131,21 @@ def cycle_value(spec: dict, value, step: int):
     return current
 
 
+def _migrate(cfg: dict) -> dict:
+    """Bring an older config up to CONFIG_VERSION. Value-preserving by design:
+    a migration may rename a value, never change what the user hears."""
+    try:
+        version = int(cfg.get("version", CONFIG_VERSION))
+    except (TypeError, ValueError):
+        version = CONFIG_VERSION
+    if version < 2:
+        quality = cfg.get("quality")
+        if isinstance(quality, str):
+            cfg["quality"] = QUALITY_V1_RENAMES.get(quality.upper(), quality)
+    cfg["version"] = CONFIG_VERSION
+    return cfg
+
+
 def load_config() -> dict:
     """Load settings. Missing or corrupt file → defaults, never raises."""
     data = {}
@@ -125,8 +161,10 @@ def load_config() -> dict:
     # Unknown keys ride along untouched so save_config can write them back
     cfg = dict(data)
     cfg["version"] = data.get("version", CONFIG_VERSION)
+    cfg = _migrate(cfg)
+    # Read back out of cfg, not data — migration may have rewritten a value
     for spec in SETTINGS_SPEC:
-        cfg[spec["key"]] = coerce(spec, data.get(spec["key"], spec["default"]))
+        cfg[spec["key"]] = coerce(spec, cfg.get(spec["key"], spec["default"]))
     return cfg
 
 
