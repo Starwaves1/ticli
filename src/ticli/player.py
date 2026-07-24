@@ -63,6 +63,23 @@ STATE_FILE = STATE_DIR / "player_state.json"
 
 AUDIO_PLAYERS = ["mpv", "ffplay"]
 
+IS_MACOS = sys.platform == "darwin"
+
+# macOS media keys (keyboard, AirPods taps, Control Center): mpv registers with
+# MPRemoteCommandCenter and turns remote commands into these key names. We rebind
+# them over IPC so they set a property ticli polls, instead of mpv acting on them
+# itself (NEXT would otherwise end the playlist, STOP would quit mpv).
+MEDIA_KEY_ACTIONS = {
+    "PLAY": "toggle",       # togglePlayPause
+    "PLAYPAUSE": "toggle",
+    "PLAYONLY": "play",     # play
+    "PAUSEONLY": "pause",   # pause
+    "STOP": "pause",        # stop — pause rather than let mpv quit
+    "NEXT": "next",         # nextTrack
+    "PREV": "prev",         # previousTrack
+}
+MEDIA_KEY_PROP = "user-data/ticli/media-key"
+
 
 def _find_audio_player():
     """Find an available audio player binary."""
@@ -94,13 +111,18 @@ class AudioPlayer:
         self._cache_process: Optional[subprocess.Popen] = None
         self._play_start: Optional[float] = None
         self._seek_offset: float = 0
+        # macOS media keys: rebound per mpv process, title shown in Now Playing
+        self._media_keys_bound = False
+        self._media_title: Optional[str] = None
 
-    def play_url(self, url: str, seek: float = 0):
+    def play_url(self, url: str, seek: float = 0, title: Optional[str] = None):
         """Play an audio URL, stopping any current playback."""
         self.stop()
         with self._lock:
             self._paused = False
             self._current_url = url
+            self._media_title = title
+            self._media_keys_bound = False
             self._seek_offset = seek
             self._play_start = time.time()
             if self.player_cmd == "mpv":
@@ -260,6 +282,35 @@ class AudioPlayer:
             return float(reply["data"])
         return None
 
+    def _bind_media_keys(self) -> bool:
+        """Point mpv's media keys at MEDIA_KEY_PROP so ticli handles them."""
+        for key, action in MEDIA_KEY_ACTIONS.items():
+            if not self._mpv_command(
+                {"command": ["keybind", key, f"set {MEDIA_KEY_PROP} {action}"]}
+            ):
+                return False
+        if self._media_title:
+            # Shown in Control Center / lock screen instead of the raw stream URL
+            self._mpv_command(
+                {"command": ["set_property", "force-media-title", self._media_title]}
+            )
+        return True
+
+    def poll_media_key(self) -> Optional[str]:
+        """Return a pending media-key action, or None. macOS + mpv only."""
+        if not IS_MACOS or self.player_cmd != "mpv" or not self._ipc_path:
+            return None
+        if not self._media_keys_bound:
+            self._media_keys_bound = self._bind_media_keys()
+            if not self._media_keys_bound:
+                return None
+        reply = self._mpv_request({"command": ["get_property", MEDIA_KEY_PROP]})
+        # The property only exists once a key was actually pressed
+        if not reply or reply.get("error") != "success" or not reply.get("data"):
+            return None
+        self._mpv_command({"command": ["set_property", MEDIA_KEY_PROP, ""]})
+        return reply["data"]
+
     def stop(self):
         """Stop current playback."""
         with self._lock:
@@ -284,6 +335,7 @@ class AudioPlayer:
             self._paused = False
             self._play_start = None
             self._seek_offset = 0
+            self._media_keys_bound = False
             # Clean up mpv socket
             if self._ipc_path:
                 try:
@@ -619,7 +671,9 @@ class HeadlessTidalPlayer:
         self._track_changing = True
         try:
             url = track.get_url()
-            self.audio.play_url(url, seek=seek)
+            artist = ", ".join(a.name for a in track.artists) if track.artists else ""
+            title = f"{track.name} — {artist}" if artist else track.name
+            self.audio.play_url(url, seek=seek, title=title)
             self._current_track = track
             self._playing = True
             self._play_start_time = time.time()
@@ -709,6 +763,19 @@ class HeadlessTidalPlayer:
                 pass
         threading.Thread(target=_run, daemon=True).start()
 
+    def _handle_media_key(self, action):
+        """Apply a media-key action coming from mpv (macOS only)."""
+        if action == "next":
+            self._next_track()
+        elif action == "prev":
+            self._prev_track()
+        elif action == "toggle":
+            self._toggle_play()
+        elif action == "play" and not self._playing:
+            self._toggle_play()
+        elif action == "pause" and self._playing:
+            self._toggle_play()
+
     def _monitor_playback(self):
         """Background thread: auto-advance, position resync, periodic save."""
         last_save = time.time()
@@ -741,6 +808,8 @@ class HeadlessTidalPlayer:
             if time.time() - last_save > 10:
                 self._save_state()
                 last_save = time.time()
+            if self.audio:
+                self._handle_media_key(self.audio.poll_media_key())
             time.sleep(0.5)
 
     # ── Display builders ──
