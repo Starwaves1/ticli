@@ -38,3 +38,9 @@ session.json
 
 # Claude Code
 .claude/
+
+# AI project memory (local only)
+ai/
+
+# AI project memory (local only)
+ai/

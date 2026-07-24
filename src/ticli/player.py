@@ -127,12 +127,12 @@ class AudioPlayer:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                # Play directly from URL for first play (cache may not be ready yet)
-                source = url if seek == 0 else self._cache_file
+                # Always play from the URL here — the cache has only just
+                # started downloading, so it can't satisfy a seek yet
                 cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
                 if seek > 0:
                     cmd += ["-ss", str(seek)]
-                cmd.append(source)
+                cmd.append(url)
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -157,8 +157,16 @@ class AudioPlayer:
             if not self._process or self._process.poll() is not None or self._paused:
                 return
             if self.player_cmd == "mpv" and self._ipc_path:
-                self._mpv_command({"command": ["set_property", "pause", True]})
-                self._paused = True
+                # The IPC socket takes ~100ms to come up after spawn — retry
+                # briefly so an immediate pause isn't silently lost, and only
+                # mark paused once mpv actually acknowledged the command
+                for _ in range(5):
+                    if self._mpv_command({"command": ["set_property", "pause", True]}):
+                        self._paused = True
+                        return
+                    if not self._process or self._process.poll() is not None:
+                        return
+                    time.sleep(0.1)
             else:
                 # ffplay: record position, kill process (instant silence)
                 elapsed = time.time() - self._play_start if self._play_start else 0
@@ -172,18 +180,21 @@ class AudioPlayer:
                 self._process = None
                 self._paused = True
 
-    def resume(self):
-        """Resume paused playback."""
+    def resume(self) -> bool:
+        """Resume paused playback. False if it failed (e.g. player died)."""
         with self._lock:
             if not self._paused:
-                return
+                return False
             if self.player_cmd == "mpv" and self._ipc_path:
-                self._mpv_command({"command": ["set_property", "pause", False]})
-                self._paused = False
+                if self._mpv_command({"command": ["set_property", "pause", False]}):
+                    self._paused = False
+                    return True
+                return False
             else:
                 # ffplay: restart from cached local file (instant, no network)
                 if self._cache_file and os.path.exists(self._cache_file):
                     self._play_from_cache(self._seek_offset)
+                    return True
                 elif self._current_url:
                     # Cache not ready — fall back to URL
                     self._paused = False
@@ -194,17 +205,61 @@ class AudioPlayer:
                         self.play_url(url, seek=seek)
                     finally:
                         self._lock.acquire()
+                    return True
+            return False
 
-    def _mpv_command(self, cmd: dict):
-        """Send a JSON IPC command to mpv via Unix socket."""
+    def _mpv_request(self, cmd: dict, timeout: float = 0.5) -> Optional[dict]:
+        """Send a JSON IPC command to mpv and return its reply, or None."""
+        if not self._ipc_path:
+            return None
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
-            sock.connect(self._ipc_path)
-            sock.sendall((json.dumps(cmd) + "\n").encode())
-            sock.close()
-        except (OSError, ConnectionRefusedError):
+            sock.settimeout(timeout)
+            try:
+                sock.connect(self._ipc_path)
+                payload = dict(cmd)
+                payload["request_id"] = 1
+                sock.sendall((json.dumps(payload) + "\n").encode())
+                # mpv also broadcasts events on this socket — scan lines for
+                # the reply carrying our request_id
+                buf = b""
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    for line in buf.split(b"\n"):
+                        if not line.strip():
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if msg.get("request_id") == 1:
+                            return msg
+            finally:
+                sock.close()
+        except OSError:
             pass
+        return None
+
+    def _mpv_command(self, cmd: dict) -> bool:
+        """Send an mpv IPC command; True only if mpv acknowledged it."""
+        reply = self._mpv_request(cmd)
+        return reply is not None and reply.get("error") == "success"
+
+    def get_time_pos(self) -> Optional[float]:
+        """Ask mpv for its actual playback position. None if unavailable."""
+        if self.player_cmd != "mpv":
+            return None
+        with self._lock:
+            if self._paused or not self._process or self._process.poll() is not None:
+                return None
+            reply = self._mpv_request({"command": ["get_property", "time-pos"]}, timeout=0.2)
+        if reply and reply.get("error") == "success" and isinstance(reply.get("data"), (int, float)):
+            return float(reply["data"])
+        return None
 
     def stop(self):
         """Stop current playback."""
@@ -248,7 +303,13 @@ class AudioPlayer:
     @property
     def is_paused(self) -> bool:
         with self._lock:
-            return self._paused
+            if not self._paused:
+                return False
+            if self.player_cmd == "mpv":
+                # A paused mpv must still be alive; a dead one can't resume.
+                # (ffplay pause kills the process by design, so no check there.)
+                return self._process is not None and self._process.poll() is None
+            return True
 
 
 class HeadlessTidalPlayer:
@@ -259,6 +320,7 @@ class HeadlessTidalPlayer:
     MODE_BROWSE = "browse"
     MODE_QUEUE = "queue"
     MODE_PLAYLISTS = "playlists"
+    MODE_ADD_TO_PLAYLIST = "add_to_playlist"
 
     def __init__(self, quality: str = "HIGH"):
         self.console = Console()
@@ -287,6 +349,9 @@ class HeadlessTidalPlayer:
         self._browse_cursor = 0
         self._browse_loading = False
         self._browse_message = ""
+        # Set when browse is showing one of the user's own (editable) playlists
+        self._browse_playlist = None
+        self._browse_remove_busy = False
         # Queue view state
         self._queue_cursor = 0
         # Playlists state
@@ -294,6 +359,16 @@ class HeadlessTidalPlayer:
         self._playlists_cursor = 0
         self._playlists_loading = False
         self._playlists_message = ""
+        # Add-to-playlist picker state
+        self._editable_playlists: list = []
+        self._editable_playlists_time: float = 0.0
+        self._picker_track = None
+        self._picker_cursor = 0
+        self._picker_loading = False
+        self._picker_busy = False
+        # Transient toast message
+        self._toast = ""
+        self._toast_until = 0.0
         # Quit confirmation
         self._quit_pending = False
         # Logout confirmation
@@ -306,6 +381,11 @@ class HeadlessTidalPlayer:
         self._space_held = False
         # User display name (set after login)
         self._user_display_name = ""
+        # True while the restore-state thread is still fetching tracks
+        self._restore_pending = False
+        # True while _play_track is between killing the old player process
+        # and spawning the new one (guards the monitor's end-of-track check)
+        self._track_changing = False
         # Navigation
         self._nav_history = []
         # Quality
@@ -405,18 +485,49 @@ class HeadlessTidalPlayer:
                 pass
         threading.Thread(target=_run, daemon=True).start()
 
+    def _write_state_file(self, state: dict):
+        """Atomically write the state file (temp + rename, never torn)."""
+        STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, STATE_FILE)
+
+    def _merge_position_into_saved_state(self):
+        """Refresh only the position in the saved file, if the track matches."""
+        if self._current_track is None or not STATE_FILE.exists():
+            return
+        try:
+            data = json.loads(STATE_FILE.read_text())
+            ids = data.get("track_ids", [])
+            idx = data.get("queue_index", 0)
+            if ids and 0 <= idx < len(ids) and ids[idx] == self._current_track.id:
+                data["position"] = self._get_position()
+                self._write_state_file(data)
+        except Exception as e:
+            logger.debug("Failed to merge position into saved state: %s", e)
+
     def _save_state(self):
         """Save queue and playback state to disk for next session."""
+        # If the restore never finished attaching the queue, our in-memory
+        # state is incomplete — a full save would shrink the good file. Still
+        # refresh the position in case the user played the restored track.
+        if self._restore_pending and not self._queue:
+            self._merge_position_into_saved_state()
+            return
         try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+            track_ids = [t.id for t in self._queue]
+            queue_index = self._queue_index
+            if not track_ids and self._current_track is not None:
+                track_ids = [self._current_track.id]
+                queue_index = 0
             state = {
-                "track_ids": [t.id for t in self._queue],
-                "queue_index": self._queue_index,
+                "track_ids": track_ids,
+                "queue_index": queue_index,
                 "position": self._get_position(),
                 "search_history": self._search_history[:20],
             }
-            STATE_FILE.write_text(json.dumps(state))
-            os.chmod(STATE_FILE, 0o600)
+            self._write_state_file(state)
         except Exception as e:
             logger.debug("Failed to save player state: %s", e)
 
@@ -431,40 +542,72 @@ class HeadlessTidalPlayer:
         self._search_history = data.get("search_history", [])[:20]
         track_ids = data.get("track_ids", [])
         queue_index = data.get("queue_index", 0)
+        position = data.get("position", 0) or 0
         if not track_ids:
             return
 
+        self._restore_pending = True
+
         def _run():
             try:
+                # Fetch the current track first so it appears immediately,
+                # paused at its saved position, before the rest of the queue loads
+                idx = min(max(queue_index, 0), len(track_ids) - 1)
+                current = None
+                try:
+                    current = self.session.track(track_ids[idx])
+                except Exception:
+                    pass
+                if current is not None and not self._playing and self._current_track is None:
+                    duration = getattr(current, "duration", 0) or 0
+                    if 1 <= position < duration - 2:
+                        self._play_offset = position
+                    self._current_track = current
+
                 tracks = []
-                for tid in track_ids:
+                for i, tid in enumerate(track_ids):
+                    if i == idx and current is not None:
+                        tracks.append(current)
+                        continue
                     try:
                         t = self.session.track(tid)
                         if t:
                             tracks.append(t)
                     except Exception:
                         pass
-                if tracks:
+                # Don't clobber anything the user started while we were loading
+                # (playing the restored track itself is fine — attach its queue)
+                if tracks and self._current_track in (None, current):
                     self._queue = tracks
-                    idx = min(queue_index, len(tracks) - 1)
-                    self._queue_index = idx
-                    self._current_track = tracks[idx]
+                    try:
+                        self._queue_index = tracks.index(current) if current is not None else min(idx, len(tracks) - 1)
+                    except ValueError:
+                        self._queue_index = min(idx, len(tracks) - 1)
+                    if self._current_track is None:
+                        self._current_track = tracks[self._queue_index]
+                    # Latch: only a SUCCESSFUL attach re-enables full saves.
+                    # If restore failed, empty-queue saves stay suppressed so
+                    # they can't shrink the good file to a single track.
+                    self._restore_pending = False
             except Exception as e:
                 logger.debug("Failed to restore player state: %s", e)
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _play_track(self, track: tidalapi.Track):
-        """Play a track via the audio player."""
+    def _play_track(self, track: tidalapi.Track, seek: float = 0):
+        """Play a track via the audio player, optionally starting at an offset."""
+        self._track_changing = True
         try:
             url = track.get_url()
-            self.audio.play_url(url)
+            self.audio.play_url(url, seek=seek)
             self._current_track = track
             self._playing = True
             self._play_start_time = time.time()
-            self._play_offset = 0
+            self._play_offset = seek
         except Exception:
             self._playing = False
+        finally:
+            self._track_changing = False
 
     def _play_queue_index(self, index: int):
         """Play track at queue index."""
@@ -493,12 +636,25 @@ class HeadlessTidalPlayer:
         else:
             if self._current_track and self.audio and self.audio.is_paused:
                 # Resume from paused position
-                self.audio.resume()
-                self._playing = True
-                self._play_start_time = time.time()
+                if self.audio.resume():
+                    self._playing = True
+                    self._play_start_time = time.time()
+                else:
+                    # Player died while paused — restart from where we were
+                    self._start_current_from_position()
             elif self._current_track:
-                # No paused process — start fresh
-                self._play_track(self._current_track)
+                # No paused process — start fresh from the last known position
+                self._start_current_from_position()
+
+    def _start_current_from_position(self):
+        """(Re)start the current track from the last known position."""
+        seek = self._get_position()
+        duration = getattr(self._current_track, "duration", 0) or 0
+        # Clamp unconditionally: an unknown duration must not let a stale
+        # offset seek past EOF (mpv exits instantly on that)
+        if seek < 1 or seek >= duration - 2:
+            seek = 0
+        self._play_track(self._current_track, seek=seek)
 
     def _toggle_like(self):
         """Toggle like on current track."""
@@ -534,15 +690,37 @@ class HeadlessTidalPlayer:
         threading.Thread(target=_run, daemon=True).start()
 
     def _monitor_playback(self):
-        """Background thread to auto-advance when track ends."""
+        """Background thread: auto-advance, position resync, periodic save."""
+        last_save = time.time()
+        dead_polls = 0
         while self.running:
-            if self._playing and self.audio and not self.audio.is_paused and not self.audio.is_playing:
-                # Track ended (not paused), play next
+            if (self._playing and not self._track_changing and self.audio
+                    and not self.audio.is_paused and not self.audio.is_playing):
+                # Require two consecutive dead polls before advancing: a track
+                # change kills the old process before spawning the new one,
+                # and a single poll can land inside that window
+                dead_polls += 1
+            else:
+                dead_polls = 0
+            if dead_polls >= 2:
+                dead_polls = 0
                 if self._queue and self._queue_index < len(self._queue) - 1:
                     self._play_queue_index(self._queue_index + 1)
                 else:
                     self._playing = False
                     self._play_start_time = None
+                    self._play_offset = 0
+            elif self._playing and self.audio:
+                # Resync wall-clock position with mpv's real position so
+                # startup latency and drift never accumulate
+                pos = self.audio.get_time_pos()
+                if pos is not None:
+                    self._play_offset = pos
+                    self._play_start_time = time.time()
+            # Save state periodically so a crash doesn't lose the position
+            if time.time() - last_save > 10:
+                self._save_state()
+                last_save = time.time()
             time.sleep(0.5)
 
     # ── Display builders ──
@@ -806,6 +984,40 @@ class HeadlessTidalPlayer:
 
         return content
 
+    def _build_add_to_playlist_display(self) -> Text:
+        content = Text()
+        track_name = self._picker_track.name if self._picker_track is not None else "?"
+        content.append("   Add to playlist: ", style="bold magenta")
+        content.append(track_name, style="bold white")
+
+        if self._picker_loading:
+            content.append("\n\n   Loading playlists...", style="dim yellow")
+        elif self._editable_playlists:
+            total = len(self._editable_playlists)
+            page_start = (self._picker_cursor // PAGE_SIZE) * PAGE_SIZE
+            page_end = min(page_start + PAGE_SIZE, total)
+            content.append("\n", style="")
+            for i in range(page_start, page_end):
+                pl = self._editable_playlists[i]
+                content.append("\n")
+                if i == self._picker_cursor:
+                    content.append("  ▸ ", style="bold cyan")
+                else:
+                    content.append("    ", style="")
+                pl_name = pl.name if hasattr(pl, "name") else "?"
+                num_tracks = pl.num_tracks if hasattr(pl, "num_tracks") else ""
+                content.append(pl_name, style="bold white" if i == self._picker_cursor else "white")
+                if num_tracks != "":
+                    content.append(f"  {num_tracks} tracks", style="dim cyan")
+            if total > PAGE_SIZE:
+                page_num = (self._picker_cursor // PAGE_SIZE) + 1
+                total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+                content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+        else:
+            content.append("\n\n   No playlists you can edit", style="dim")
+
+        return content
+
     def _build_quit_confirm(self) -> Text:
         content = Text()
         content.append("\n   Quit player? ", style="bold yellow")
@@ -842,6 +1054,8 @@ class HeadlessTidalPlayer:
                 controls.append(" like  ", style="dim")
                 controls.append("[r]", style="bold")
                 controls.append(" radio  ", style="dim")
+                controls.append("[y]", style="bold")
+                controls.append(" add to playlist  ", style="dim")
                 controls.append("[q]", style="bold")
                 controls.append(" queue  ", style="dim")
                 controls.append("[p]", style="bold")
@@ -874,6 +1088,11 @@ class HeadlessTidalPlayer:
             controls.append(" pause/play  ", style="dim")
             controls.append("[a]", style="bold")
             controls.append(" play all  ", style="dim")
+            controls.append("[y]", style="bold")
+            controls.append(" add to playlist  ", style="dim")
+            if self._browse_playlist is not None:
+                controls.append("[x]", style="bold")
+                controls.append(" remove  ", style="dim")
             controls.append("[\u2190/Esc]", style="bold")
             controls.append(" back", style="dim")
         elif self._mode == self.MODE_QUEUE:
@@ -885,6 +1104,8 @@ class HeadlessTidalPlayer:
             controls.append(" pause/play  ", style="dim")
             controls.append("[x]", style="bold")
             controls.append(" remove  ", style="dim")
+            controls.append("[y]", style="bold")
+            controls.append(" add to playlist  ", style="dim")
             controls.append("[\u2190/Esc]", style="bold")
             controls.append(" back", style="dim")
         elif self._mode == self.MODE_PLAYLISTS:
@@ -896,9 +1117,18 @@ class HeadlessTidalPlayer:
             controls.append(" pause/play  ", style="dim")
             controls.append("[\u2190/Esc]", style="bold")
             controls.append(" back", style="dim")
+        elif self._mode == self.MODE_ADD_TO_PLAYLIST:
+            controls.append("   [Enter]", style="bold")
+            controls.append(" add  ", style="dim")
+            controls.append("[\u2191/\u2193]", style="bold")
+            controls.append(" navigate  ", style="dim")
+            controls.append("[\u2190/Esc]", style="bold")
+            controls.append(" cancel", style="dim")
 
         content = Text()
         content.append_text(player)
+        if time.time() < self._toast_until:
+            content.append(f"\n   {self._toast}", style="bold green")
 
         if self._mini_player:
             # Tiny mode: just the player line, no controls
@@ -923,6 +1153,8 @@ class HeadlessTidalPlayer:
                 content.append_text(self._build_queue_display())
             elif self._mode == self.MODE_PLAYLISTS:
                 content.append_text(self._build_playlists_display())
+            elif self._mode == self.MODE_ADD_TO_PLAYLIST:
+                content.append_text(self._build_add_to_playlist_display())
 
         if self._quit_pending:
             content.append_text(self._build_quit_confirm())
@@ -1060,6 +1292,7 @@ class HeadlessTidalPlayer:
     def _open_album(self, album):
         self._push_nav()
         self._mode = self.MODE_BROWSE
+        self._browse_playlist = None
         self._browse_title = album.name
         self._browse_tracks = []
         self._browse_cursor = -1
@@ -1082,6 +1315,7 @@ class HeadlessTidalPlayer:
     def _open_artist(self, artist):
         self._push_nav()
         self._mode = self.MODE_BROWSE
+        self._browse_playlist = None
         self._browse_title = f"{artist.name} - Top Tracks"
         self._browse_tracks = []
         self._browse_cursor = -1
@@ -1139,6 +1373,8 @@ class HeadlessTidalPlayer:
         """Open a playlist and show its tracks in browse mode."""
         self._push_nav()
         self._mode = self.MODE_BROWSE
+        # Removal is only offered on the user's own playlists
+        self._browse_playlist = playlist if isinstance(playlist, tidalapi.UserPlaylist) else None
         self._browse_title = playlist.name if hasattr(playlist, "name") else "Playlist"
         self._browse_tracks = []
         self._browse_cursor = -1
@@ -1183,6 +1419,97 @@ class HeadlessTidalPlayer:
         if self._queue_cursor >= len(self._queue) and self._queue:
             self._queue_cursor = len(self._queue) - 1
 
+    def _remove_from_browse_playlist(self):
+        """Remove the track under the cursor from the open (own) playlist."""
+        pl = self._browse_playlist
+        if pl is None or not self._browse_tracks or self._browse_cursor < 0:
+            return
+        if self._browse_remove_busy:
+            return  # previous removal still in flight — indices would shift
+        index = self._browse_cursor
+        track = self._browse_tracks[index]
+        self._browse_remove_busy = True
+
+        def _run():
+            try:
+                if pl.remove_by_index(index):
+                    remaining = [t for i, t in enumerate(self._browse_tracks) if i != index]
+                    self._browse_tracks = remaining
+                    if self._browse_cursor >= len(remaining):
+                        self._browse_cursor = len(remaining) - 1
+                    self._set_toast(f'Removed "{track.name}" from {pl.name}')
+                else:
+                    self._set_toast("Failed to remove from playlist")
+            except Exception:
+                self._set_toast("Failed to remove from playlist")
+            finally:
+                self._browse_remove_busy = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _set_toast(self, msg: str, seconds: float = 2.5):
+        """Show a transient message; the 4fps render loop expires it."""
+        self._toast = msg
+        self._toast_until = time.time() + seconds
+
+    def _target_track_for_picker(self):
+        """Resolve which track 'add to playlist' refers to in the current mode."""
+        if self._mode == self.MODE_QUEUE and self._queue and self._queue_cursor < len(self._queue):
+            return self._queue[self._queue_cursor]
+        if self._mode == self.MODE_BROWSE and self._browse_tracks and self._browse_cursor >= 0:
+            return self._browse_tracks[self._browse_cursor]
+        return self._current_track
+
+    def _open_playlist_picker(self):
+        """Open the add-to-playlist picker for the targeted track."""
+        track = self._target_track_for_picker()
+        if track is None:
+            self._set_toast("No track selected")
+            return
+        self._push_nav()
+        self._mode = self.MODE_ADD_TO_PLAYLIST
+        self._picker_track = track
+        self._picker_cursor = 0
+        # Reuse the cached list for a minute — listing re-fetches every playlist
+        if not self._editable_playlists or time.time() - self._editable_playlists_time > 60:
+            self._picker_loading = True
+
+            def _run():
+                try:
+                    playlists = self.session.user.playlists()
+                    self._editable_playlists = [
+                        p for p in (playlists or []) if isinstance(p, tidalapi.UserPlaylist)
+                    ]
+                    self._editable_playlists_time = time.time()
+                except Exception:
+                    pass
+                finally:
+                    self._picker_loading = False
+
+            threading.Thread(target=_run, daemon=True).start()
+
+    def _picker_add_to(self, playlist):
+        """Add the picked track to a playlist (network in background)."""
+        if self._picker_busy:
+            return
+        track = self._picker_track
+        self._picker_busy = True
+        self._go_back()
+
+        def _run():
+            try:
+                added = playlist.add([str(track.id)])  # server skips duplicates
+                if added:
+                    self._set_toast(f'Added to "{playlist.name}"')
+                else:
+                    self._set_toast(f'Already in "{playlist.name}"')
+            except Exception:
+                self._set_toast("Failed to add to playlist")
+            finally:
+                self._picker_busy = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
     # ── Key handlers ──
 
     def _handle_key(self, key: str):
@@ -1209,6 +1536,8 @@ class HeadlessTidalPlayer:
             self._handle_queue_key(key)
         elif self._mode == self.MODE_PLAYLISTS:
             self._handle_playlists_key(key)
+        elif self._mode == self.MODE_ADD_TO_PLAYLIST:
+            self._handle_add_to_playlist_key(key)
         else:
             self._handle_player_key(key)
 
@@ -1239,6 +1568,8 @@ class HeadlessTidalPlayer:
             self._toggle_like()
         elif key == "r":
             self._start_track_radio()
+        elif key == "y":
+            self._open_playlist_picker()
         elif key == "q":
             self._mini_player = False
             self._mode = self.MODE_QUEUE
@@ -1311,6 +1642,10 @@ class HeadlessTidalPlayer:
                 self._play_browse_track()
         elif key == "a":
             self._play_all_browse()
+        elif key == "y":
+            self._open_playlist_picker()
+        elif key == "x":
+            self._remove_from_browse_playlist()
 
     def _handle_queue_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:
@@ -1333,6 +1668,8 @@ class HeadlessTidalPlayer:
                 self._play_queue_index(self._queue_cursor)
         elif key == "x":
             self._remove_from_queue()
+        elif key == "y":
+            self._open_playlist_picker()
 
     def _handle_playlists_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:
@@ -1353,6 +1690,26 @@ class HeadlessTidalPlayer:
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
             if self._playlists:
                 self._open_playlist(self._playlists[self._playlists_cursor])
+
+    def _handle_add_to_playlist_key(self, key: str):
+        if key == KEY_ESC or key == KEY_LEFT:
+            self._go_back()
+            return
+        if key == " ":
+            if self._space_held:
+                return
+            self._toggle_play()
+            self._space_held = True
+            return
+        if key == KEY_UP:
+            if self._editable_playlists:
+                self._picker_cursor = max(0, self._picker_cursor - 1)
+        elif key == KEY_DOWN:
+            if self._editable_playlists:
+                self._picker_cursor = min(len(self._editable_playlists) - 1, self._picker_cursor + 1)
+        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
+            if self._editable_playlists and self._picker_cursor < len(self._editable_playlists):
+                self._picker_add_to(self._editable_playlists[self._picker_cursor])
 
     # ── Main loop ──
 
@@ -1398,6 +1755,16 @@ class HeadlessTidalPlayer:
         # Start playback monitor
         monitor = threading.Thread(target=self._monitor_playback, daemon=True)
         monitor.start()
+
+        # A closed terminal (SIGHUP) or kill (SIGTERM) should still exit the
+        # main loop cleanly so the finally block saves state and stops audio
+        def _on_signal(signum, frame):
+            self.running = False
+        for _sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(_sig, _on_signal)
+            except (ValueError, OSError):
+                pass
 
         import tty
         import termios
