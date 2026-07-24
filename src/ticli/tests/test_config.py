@@ -26,6 +26,16 @@ from ticli.utils.config import (
 )
 
 
+class _FakeAudio:
+    """Records volume changes the way a live AudioPlayer would receive them."""
+
+    def __init__(self):
+        self.volumes = []
+
+    def set_volume(self, value):
+        self.volumes.append(value)
+
+
 @pytest.fixture
 def config_file(tmp_path, monkeypatch):
     """Point the config module at a throwaway directory."""
@@ -41,6 +51,7 @@ class TestLoadConfig:
         assert cfg["quality"] == "HIGH"
         assert cfg["page_size"] == 15
         assert cfg["progress_bar_width"] == 50
+        assert cfg["volume"] == 100
 
     def test_defaults_when_file_corrupt(self, config_file):
         config_file.write_text("{not json at all")
@@ -116,6 +127,12 @@ class TestCoerce:
         assert coerce(spec, 5) == 20
         assert coerce(spec, 5000) == 120
 
+    def test_volume_clamped_to_bounds(self):
+        spec = get_spec("volume")
+        assert coerce(spec, -20) == 0
+        assert coerce(spec, 300) == 100
+        assert coerce(spec, 45) == 45
+
     def test_int_accepts_numeric_string(self):
         assert coerce(get_spec("page_size"), "22") == 22
 
@@ -148,6 +165,13 @@ class TestCycleValue:
         assert cycle_value(spec, 50, -1) == 48
         assert cycle_value(spec, 120, 1) == 120
         assert cycle_value(spec, 20, -1) == 20
+
+    def test_volume_steps_by_five_and_stops_at_bounds(self):
+        spec = get_spec("volume")
+        assert cycle_value(spec, 100, -1) == 95
+        assert cycle_value(spec, 95, 1) == 100
+        assert cycle_value(spec, 100, 1) == 100
+        assert cycle_value(spec, 0, -1) == 0
 
 
 class TestAtomicWrite:
@@ -210,6 +234,23 @@ class TestSettingsKeyHandler:
         p._handle_settings_key(player_mod.KEY_LEFT)
         assert p._bar_width == 48
         assert json.loads(config_file.read_text())["progress_bar_width"] == 48
+
+    def test_volume_change_applies_live_and_saves(self, config_file):
+        p = self._player()
+        p.audio = _FakeAudio()
+        p._settings_cursor = 3  # volume row
+        p._handle_settings_key(player_mod.KEY_LEFT)
+        assert p.config["volume"] == 95
+        assert p.audio.volumes == [95]  # pushed to the running player
+        assert json.loads(config_file.read_text())["volume"] == 95
+
+    def test_volume_change_without_audio_player(self, config_file):
+        """Settings can be edited before run() ever built an AudioPlayer."""
+        p = self._player()
+        p.audio = None
+        p._settings_cursor = 3
+        p._handle_settings_key(player_mod.KEY_LEFT)  # must not raise
+        assert p.config["volume"] == 95
 
     def test_clamped_edit_writes_nothing(self, config_file):
         p = self._player()

@@ -54,6 +54,16 @@ SETTINGS_SPEC: list[dict] = [
         "step": 2,
         "desc": "Width of the player progress bar, in characters.",
     },
+    {
+        "key": "volume",
+        "label": "Volume",
+        "kind": "int",
+        "default": 100,
+        "min": 0,
+        "max": 100,
+        "step": 5,
+        "desc": "Playback volume. Instant on mpv; ffplay takes it from the next track.",
+    },
 ]
 
 DEFAULTS = {spec["key"]: spec["default"] for spec in SETTINGS_SPEC}

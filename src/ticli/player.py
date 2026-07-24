@@ -80,6 +80,10 @@ MEDIA_KEY_ACTIONS = {
 }
 MEDIA_KEY_PROP = "user-data/ticli/media-key"
 
+# Going back this far into a track restarts it instead of skipping backwards —
+# the rule every other player uses, for ← and the PREV media key alike
+PREV_RESTART_SECONDS = 30
+
 
 def _find_audio_player():
     """Find an available audio player binary."""
@@ -99,8 +103,12 @@ class AudioPlayer:
     - ffplay: kills process on pause, restarts from cached local file on resume
     """
 
-    def __init__(self, player_cmd: str):
+    def __init__(self, player_cmd: str, volume: int = 100):
         self.player_cmd = player_cmd
+        # 0–100 for both backends. mpv takes it live over IPC, ffplay only at
+        # spawn — so every spawn passes it too, and ffplay picks up a change
+        # on the next track
+        self.volume = volume
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._paused = False
@@ -134,6 +142,7 @@ class AudioPlayer:
                 cmd = [
                     "mpv", "--no-video", "--really-quiet",
                     f"--input-ipc-server={self._ipc_path}",
+                    f"--volume={self.volume}",
                     url,
                 ]
                 if seek > 0:
@@ -150,7 +159,8 @@ class AudioPlayer:
                 )
                 # Always play from the URL here — the cache has only just
                 # started downloading, so it can't satisfy a seek yet
-                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
+                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                       "-volume", str(self.volume)]
                 if seek > 0:
                     cmd += ["-ss", str(seek)]
                 cmd.append(url)
@@ -163,7 +173,7 @@ class AudioPlayer:
     def _play_from_cache(self, seek: float):
         """Resume ffplay from local cached file at given position."""
         cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-               "-ss", str(seek), self._cache_file]
+               "-volume", str(self.volume), "-ss", str(seek), self._cache_file]
         self._process = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -281,6 +291,30 @@ class AudioPlayer:
         if reply and reply.get("error") == "success" and isinstance(reply.get("data"), (int, float)):
             return float(reply["data"])
         return None
+
+    def set_volume(self, value: int):
+        """Set playback volume (0–100). mpv applies it to the playing track
+        right away; ffplay can't be told mid-track, so it waits for the next
+        spawn — either way the stored value is what future tracks start at."""
+        with self._lock:
+            self.volume = value
+            if (self.player_cmd == "mpv" and self._ipc_path
+                    and self._process and self._process.poll() is None):
+                self._mpv_command({"command": ["set_property", "volume", value]})
+
+    def seek_to_start(self) -> bool:
+        """Jump the playing track back to 0:00 in place. True only if mpv
+        acknowledged the seek — every other case has to respawn instead."""
+        if self.player_cmd != "mpv":
+            return False
+        with self._lock:
+            if self._paused or not self._process or self._process.poll() is not None:
+                return False
+            if not self._mpv_command({"command": ["seek", 0, "absolute"]}):
+                return False
+            self._seek_offset = 0
+            self._play_start = time.time()
+            return True
 
     def _bind_media_keys(self) -> bool:
         """Point mpv's media keys at MEDIA_KEY_PROP so ticli handles them."""
@@ -695,9 +729,22 @@ class HeadlessTidalPlayer:
             self._play_queue_index(self._queue_index + 1)
 
     def _prev_track(self):
-        """Go to previous track in queue."""
+        """Go back: to the start of this track if we're already past
+        PREV_RESTART_SECONDS into it, otherwise to the previous track."""
+        if self._current_track is not None and self._get_position() > PREV_RESTART_SECONDS:
+            self._restart_current_track()
+            return
         if self._queue and self._queue_index > 0:
             self._play_queue_index(self._queue_index - 1)
+
+    def _restart_current_track(self):
+        """Send the current track back to 0:00 — a gapless mpv seek when the
+        process is alive and playing, a fresh spawn from 0 otherwise."""
+        if self._playing and self.audio and self.audio.seek_to_start():
+            self._play_offset = 0
+            self._play_start_time = time.time()
+            return
+        self._play_track(self._current_track, seek=0)
 
     def _toggle_play(self):
         """Toggle play/pause — pauses in place, resumes from same position."""
@@ -1140,6 +1187,12 @@ class HeadlessTidalPlayer:
                 f"\n   Overridden this run by --quality {self._quality_name}",
                 style="dim yellow",
             )
+        # Account lives here rather than on the player screen — it's a thing you
+        # look at when you're already in settings, not while listening
+        content.append("\n\n   Logged in as ", style="dim")
+        content.append(self._user_display_name or "—", style="bold")
+        content.append("   [o]", style="bold")
+        content.append(" log out", style="dim")
         return content
 
     def _build_quit_confirm(self) -> Text:
@@ -1186,13 +1239,8 @@ class HeadlessTidalPlayer:
                 controls.append(" playlists  ", style="dim")
                 controls.append("[c]", style="bold")
                 controls.append(" settings  ", style="dim")
-                controls.append("[o]", style="bold")
-                controls.append(" logout  ", style="dim")
                 controls.append("[Esc]", style="bold")
                 controls.append(" quit", style="dim")
-                if self._user_display_name:
-                    controls.append(f"\n   Logged in as ", style="dim")
-                    controls.append(self._user_display_name, style="bold")
         elif self._mode == self.MODE_SEARCH:
             controls.append("   [Enter/\u2192]", style="bold")
             controls.append(" search/open  ", style="dim")
@@ -1257,6 +1305,8 @@ class HeadlessTidalPlayer:
             controls.append(" change  ", style="dim")
             controls.append("[Space]", style="bold")
             controls.append(" pause/play  ", style="dim")
+            controls.append("[o]", style="bold")
+            controls.append(" log out  ", style="dim")
             controls.append("[Esc]", style="bold")
             controls.append(" back", style="dim")
 
@@ -1670,6 +1720,9 @@ class HeadlessTidalPlayer:
             self._page_size = value
         elif key == "progress_bar_width":
             self._bar_width = value
+        elif key == "volume":
+            if self.audio:
+                self.audio.set_volume(value)
 
     # ── Key handlers ──
 
@@ -1749,8 +1802,6 @@ class HeadlessTidalPlayer:
             self._mode = self.MODE_SETTINGS
             self._settings_cursor = 0
             self._nav_history.clear()
-        elif key == "o":
-            self._logout_pending = True
         elif key == KEY_ESC:
             self._quit_pending = True
 
@@ -1891,6 +1942,9 @@ class HeadlessTidalPlayer:
             self._toggle_play()
             self._space_held = True
             return
+        if key in ("o", "O"):
+            self._logout_pending = True
+            return
         if key == KEY_UP:
             self._settings_cursor = max(0, self._settings_cursor - 1)
         elif key == KEY_DOWN:
@@ -1929,7 +1983,7 @@ class HeadlessTidalPlayer:
         if not player_cmd:
             self.console.print("[red]No audio player found. Install mpv or ffplay.[/red]")
             return
-        self.audio = AudioPlayer(player_cmd)
+        self.audio = AudioPlayer(player_cmd, volume=self.config["volume"])
 
         # Login
         if not self._login():
