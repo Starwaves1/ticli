@@ -56,8 +56,7 @@ KEY_BACKSPACE = "\x7f"
 KEY_BACKSPACE2 = "\x08"
 
 from ticli.utils.credential_store import save_tokens, load_tokens
-
-PAGE_SIZE = 15
+from ticli.utils.config import SETTINGS_SPEC, cycle_value, load_config, save_config
 
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
@@ -321,13 +320,35 @@ class HeadlessTidalPlayer:
     MODE_QUEUE = "queue"
     MODE_PLAYLISTS = "playlists"
     MODE_ADD_TO_PLAYLIST = "add_to_playlist"
+    MODE_SETTINGS = "settings"
 
-    def __init__(self, quality: str = "HIGH"):
+    # Setting name → tidalapi quality, and the stream label shown to the user.
+    # Both are keyed by setting name so the player badge and the settings row
+    # can never disagree (HIGH and LOSSLESS share one tidalapi value).
+    QUALITY_MAP = {
+        "LOW": tidalapi.Quality.low_320k,
+        "HIGH": tidalapi.Quality.high_lossless,
+        "LOSSLESS": tidalapi.Quality.high_lossless,
+        "HIRES": tidalapi.Quality.hi_res_lossless,
+    }
+    QUALITY_LABELS = {
+        "LOW": "HIGH 320k",
+        "HIGH": "LOSSLESS",
+        "LOSSLESS": "LOSSLESS",
+        "HIRES": "HI-RES",
+    }
+
+    def __init__(self, quality: Optional[str] = None):
         self.console = Console()
         self.session = tidalapi.Session()
         self.audio = None  # set after finding player
         self.running = True
         self._mode = self.MODE_PLAYER
+        # Persisted user settings (see utils/config.py). Only the main thread
+        # mutates this dict; every edit is written through immediately.
+        self.config = load_config()
+        self._page_size = self.config["page_size"]
+        self._bar_width = self.config["progress_bar_width"]
         # Playback state
         self._current_track: Optional[tidalapi.Track] = None
         self._queue: list = []
@@ -366,6 +387,8 @@ class HeadlessTidalPlayer:
         self._picker_cursor = 0
         self._picker_loading = False
         self._picker_busy = False
+        # Settings page state
+        self._settings_cursor = 0
         # Transient toast message
         self._toast = ""
         self._toast_until = 0.0
@@ -388,14 +411,11 @@ class HeadlessTidalPlayer:
         self._track_changing = False
         # Navigation
         self._nav_history = []
-        # Quality
-        quality_map = {
-            "LOW": tidalapi.Quality.low_320k,
-            "HIGH": tidalapi.Quality.high_lossless,
-            "LOSSLESS": tidalapi.Quality.high_lossless,
-            "HIRES": tidalapi.Quality.hi_res_lossless,
-        }
-        self.session.audio_quality = quality_map.get(quality.upper(), tidalapi.Quality.high_lossless)
+        # Quality: an explicit --quality wins for this run only; it is never
+        # written back to config.json, so the saved default survives
+        name = (quality or self.config["quality"]).upper()
+        self._quality_name = name if name in self.QUALITY_MAP else "HIGH"
+        self.session.audio_quality = self.QUALITY_MAP[self._quality_name]
 
     def _get_user_display_name(self) -> str:
         """Get a display name for the logged-in user."""
@@ -776,7 +796,7 @@ class HeadlessTidalPlayer:
         pos_str = format_time(position)
         dur_str = format_time(duration) if duration > 0 else "--:--"
 
-        bar_width = 50
+        bar_width = self._bar_width
         filled = int(bar_width * min(progress_pct, 100) / 100)
         if duration > 0:
             bar = "\u2501" * filled + "\u2578" + "\u2500" * max(0, bar_width - filled - 1)
@@ -791,11 +811,7 @@ class HeadlessTidalPlayer:
         status_line = Text()
         if self._queue:
             status_line.append(f"   Queue: {self._queue_index + 1}/{len(self._queue)}", style="dim")
-        quality_label = {
-            tidalapi.Quality.low_320k: "HIGH 320k",
-            tidalapi.Quality.high_lossless: "LOSSLESS",
-            tidalapi.Quality.hi_res_lossless: "HI-RES",
-        }.get(self.session.audio_quality, "")
+        quality_label = self.QUALITY_LABELS.get(self._quality_name, "")
         if quality_label:
             status_line.append(f"   {quality_label}", style="dim cyan")
 
@@ -833,8 +849,9 @@ class HeadlessTidalPlayer:
             content.append(f"\n\n   {self._search_message}", style="dim green")
         elif self._search_results:
             total = len(self._search_results)
-            page_start = (self._search_cursor // PAGE_SIZE) * PAGE_SIZE
-            page_end = min(page_start + PAGE_SIZE, total)
+            page = self._page_size
+            page_start = (self._search_cursor // page) * page
+            page_end = min(page_start + page, total)
             content.append("\n", style="")
             for i in range(page_start, page_end):
                 item = self._search_results[i]
@@ -849,9 +866,9 @@ class HeadlessTidalPlayer:
                 content.append(f" {item['name']}", style="bold white" if i == self._search_cursor else "white")
                 if item.get("artist"):
                     content.append(f"  {item['artist']}", style="dim")
-            if total > PAGE_SIZE:
-                page_num = (self._search_cursor // PAGE_SIZE) + 1
-                total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            if total > page:
+                page_num = (self._search_cursor // page) + 1
+                total_pages = (total + page - 1) // page
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
                 content.append(f"  ({total} results)", style="dim")
         elif self._search_query:
@@ -869,9 +886,10 @@ class HeadlessTidalPlayer:
             content.append(f"\n\n   {self._browse_message}", style="dim green")
         elif self._browse_tracks:
             total = len(self._browse_tracks)
+            page = self._page_size
             # browse_cursor -1 = "Play All" row, 0..N-1 = tracks
-            page_start = max(0, ((self._browse_cursor - 1) // PAGE_SIZE) * PAGE_SIZE) if self._browse_cursor > 0 else 0
-            page_end = min(page_start + PAGE_SIZE, total)
+            page_start = max(0, ((self._browse_cursor - 1) // page) * page) if self._browse_cursor > 0 else 0
+            page_end = min(page_start + page, total)
             content.append(f"  ({total} tracks)", style="dim")
             content.append("\n", style="")
 
@@ -897,9 +915,9 @@ class HeadlessTidalPlayer:
                 if track.artists:
                     content.append(f"  {track.artists[0].name}", style="dim")
                 content.append(f"  {format_time(track.duration)}", style="dim cyan")
-            if total > PAGE_SIZE:
-                page_num = (max(0, self._browse_cursor - 1) // PAGE_SIZE) + 1 if self._browse_cursor > 0 else 1
-                total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            if total > page:
+                page_num = (max(0, self._browse_cursor - 1) // page) + 1 if self._browse_cursor > 0 else 1
+                total_pages = (total + page - 1) // page
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
 
         return content
@@ -911,8 +929,9 @@ class HeadlessTidalPlayer:
             content.append("\n\n   Queue is empty", style="dim")
         else:
             total = len(self._queue)
-            page_start = (self._queue_cursor // PAGE_SIZE) * PAGE_SIZE
-            page_end = min(page_start + PAGE_SIZE, total)
+            page = self._page_size
+            page_start = (self._queue_cursor // page) * page
+            page_end = min(page_start + page, total)
             content.append(f"  ({total} tracks)", style="dim")
             content.append("\n", style="")
             for i in range(page_start, page_end):
@@ -938,9 +957,9 @@ class HeadlessTidalPlayer:
                     content.append(f"  {t_artist}", style="dim")
                 if t_dur:
                     content.append(f"  {t_dur}", style="dim cyan")
-            if total > PAGE_SIZE:
-                page_num = (self._queue_cursor // PAGE_SIZE) + 1
-                total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            if total > page:
+                page_num = (self._queue_cursor // page) + 1
+                total_pages = (total + page - 1) // page
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
         return content
 
@@ -954,8 +973,9 @@ class HeadlessTidalPlayer:
             content.append(f"\n\n   {self._playlists_message}", style="dim green")
         elif self._playlists:
             total = len(self._playlists)
-            page_start = (self._playlists_cursor // PAGE_SIZE) * PAGE_SIZE
-            page_end = min(page_start + PAGE_SIZE, total)
+            page = self._page_size
+            page_start = (self._playlists_cursor // page) * page
+            page_end = min(page_start + page, total)
             content.append(f"  ({total})", style="dim")
             content.append("\n", style="")
             for i in range(page_start, page_end):
@@ -975,9 +995,9 @@ class HeadlessTidalPlayer:
                     content.append(f"  {num_tracks} tracks", style="dim cyan")
                 if creator:
                     content.append(f"  by {creator}", style="dim")
-            if total > PAGE_SIZE:
-                page_num = (self._playlists_cursor // PAGE_SIZE) + 1
-                total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            if total > page:
+                page_num = (self._playlists_cursor // page) + 1
+                total_pages = (total + page - 1) // page
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
         else:
             content.append("\n\n   No playlists found", style="dim")
@@ -994,8 +1014,9 @@ class HeadlessTidalPlayer:
             content.append("\n\n   Loading playlists...", style="dim yellow")
         elif self._editable_playlists:
             total = len(self._editable_playlists)
-            page_start = (self._picker_cursor // PAGE_SIZE) * PAGE_SIZE
-            page_end = min(page_start + PAGE_SIZE, total)
+            page = self._page_size
+            page_start = (self._picker_cursor // page) * page
+            page_end = min(page_start + page, total)
             content.append("\n", style="")
             for i in range(page_start, page_end):
                 pl = self._editable_playlists[i]
@@ -1009,13 +1030,47 @@ class HeadlessTidalPlayer:
                 content.append(pl_name, style="bold white" if i == self._picker_cursor else "white")
                 if num_tracks != "":
                     content.append(f"  {num_tracks} tracks", style="dim cyan")
-            if total > PAGE_SIZE:
-                page_num = (self._picker_cursor // PAGE_SIZE) + 1
-                total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            if total > page:
+                page_num = (self._picker_cursor // page) + 1
+                total_pages = (total + page - 1) // page
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
         else:
             content.append("\n\n   No playlists you can edit", style="dim")
 
+        return content
+
+    def _build_settings_display(self) -> Text:
+        content = Text()
+        content.append("   Settings", style="bold magenta")
+        content.append("\n", style="")
+
+        for i, spec in enumerate(SETTINGS_SPEC):
+            selected = (i == self._settings_cursor)
+            content.append("\n")
+            if selected:
+                content.append("  ▸ ", style="bold cyan")
+            else:
+                content.append("    ", style="")
+            content.append(f"{spec['label']:<20}", style="bold white" if selected else "white")
+            value = self.config.get(spec["key"], spec["default"])
+            # Chevrons on the selected row signal that ←/→ change it
+            if selected:
+                content.append(f"‹ {value} ›", style="bold cyan")
+            else:
+                content.append(f"  {value}", style="dim cyan")
+            if spec["key"] == "quality":
+                label = self.QUALITY_LABELS.get(str(value).upper(), "")
+                if label:
+                    content.append(f"  → {label}", style="dim")
+
+        spec = SETTINGS_SPEC[self._settings_cursor]
+        content.append(f"\n\n   {spec['desc']}", style="dim")
+        # A --quality flag beats the saved value for this run without changing it
+        if self._quality_name != self.config.get("quality"):
+            content.append(
+                f"\n   Overridden this run by --quality {self._quality_name}",
+                style="dim yellow",
+            )
         return content
 
     def _build_quit_confirm(self) -> Text:
@@ -1060,6 +1115,8 @@ class HeadlessTidalPlayer:
                 controls.append(" queue  ", style="dim")
                 controls.append("[p]", style="bold")
                 controls.append(" playlists  ", style="dim")
+                controls.append("[c]", style="bold")
+                controls.append(" settings  ", style="dim")
                 controls.append("[o]", style="bold")
                 controls.append(" logout  ", style="dim")
                 controls.append("[Esc]", style="bold")
@@ -1124,6 +1181,15 @@ class HeadlessTidalPlayer:
             controls.append(" navigate  ", style="dim")
             controls.append("[\u2190/Esc]", style="bold")
             controls.append(" cancel", style="dim")
+        elif self._mode == self.MODE_SETTINGS:
+            controls.append("   [\u2191/\u2193]", style="bold")
+            controls.append(" select  ", style="dim")
+            controls.append("[\u2190/\u2192]", style="bold")
+            controls.append(" change  ", style="dim")
+            controls.append("[Space]", style="bold")
+            controls.append(" pause/play  ", style="dim")
+            controls.append("[Esc]", style="bold")
+            controls.append(" back", style="dim")
 
         content = Text()
         content.append_text(player)
@@ -1155,6 +1221,8 @@ class HeadlessTidalPlayer:
                 content.append_text(self._build_playlists_display())
             elif self._mode == self.MODE_ADD_TO_PLAYLIST:
                 content.append_text(self._build_add_to_playlist_display())
+            elif self._mode == self.MODE_SETTINGS:
+                content.append_text(self._build_settings_display())
 
         if self._quit_pending:
             content.append_text(self._build_quit_confirm())
@@ -1510,6 +1578,30 @@ class HeadlessTidalPlayer:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _change_setting(self, step: int):
+        """Move the selected setting one step, apply it live, and persist it."""
+        spec = SETTINGS_SPEC[self._settings_cursor]
+        current = self.config.get(spec["key"], spec["default"])
+        value = cycle_value(spec, current, step)
+        if value == current:
+            return  # a number clamped at its bound — nothing to write
+        self.config[spec["key"]] = value
+        self._apply_setting(spec["key"], value)
+        # The file is <1 KB; writing inline keeps the setting safe from a crash
+        # and is invisible at the 4fps render loop
+        save_config(self.config)
+
+    def _apply_setting(self, key: str, value):
+        """Apply a setting to the running player. Sizes take effect on the next
+        render; quality takes effect on the next track (get_url sends it)."""
+        if key == "quality":
+            self._quality_name = value
+            self.session.audio_quality = self.QUALITY_MAP[value]
+        elif key == "page_size":
+            self._page_size = value
+        elif key == "progress_bar_width":
+            self._bar_width = value
+
     # ── Key handlers ──
 
     def _handle_key(self, key: str):
@@ -1538,6 +1630,8 @@ class HeadlessTidalPlayer:
             self._handle_playlists_key(key)
         elif self._mode == self.MODE_ADD_TO_PLAYLIST:
             self._handle_add_to_playlist_key(key)
+        elif self._mode == self.MODE_SETTINGS:
+            self._handle_settings_key(key)
         else:
             self._handle_player_key(key)
 
@@ -1581,6 +1675,11 @@ class HeadlessTidalPlayer:
             self._nav_history.clear()
             if not self._playlists and not self._playlists_loading:
                 self._load_playlists()
+        elif key == "c":
+            self._mini_player = False
+            self._mode = self.MODE_SETTINGS
+            self._settings_cursor = 0
+            self._nav_history.clear()
         elif key == "o":
             self._logout_pending = True
         elif key == KEY_ESC:
@@ -1711,6 +1810,27 @@ class HeadlessTidalPlayer:
             if self._editable_playlists and self._picker_cursor < len(self._editable_playlists):
                 self._picker_add_to(self._editable_playlists[self._picker_cursor])
 
+    def _handle_settings_key(self, key: str):
+        # ← is the value-decrease key here (the universal settings idiom), so
+        # Esc — or the "c" that opened the page — is what goes back
+        if key == KEY_ESC or key == "c":
+            self._mode = self.MODE_PLAYER
+            return
+        if key == " ":
+            if self._space_held:
+                return
+            self._toggle_play()
+            self._space_held = True
+            return
+        if key == KEY_UP:
+            self._settings_cursor = max(0, self._settings_cursor - 1)
+        elif key == KEY_DOWN:
+            self._settings_cursor = min(len(SETTINGS_SPEC) - 1, self._settings_cursor + 1)
+        elif key == KEY_LEFT:
+            self._change_setting(-1)
+        elif key in (KEY_RIGHT, KEY_ENTER, KEY_ENTER2):
+            self._change_setting(1)
+
     # ── Main loop ──
 
     def _drain_stdin(self, select_mod=None):
@@ -1807,7 +1927,7 @@ def main():
     import click
 
     @click.command()
-    @click.option("--quality", default="HIGH", type=click.Choice(["LOW", "HIGH", "LOSSLESS", "HIRES"], case_sensitive=False), help="Audio quality")
+    @click.option("--quality", default=None, type=click.Choice(["LOW", "HIGH", "LOSSLESS", "HIRES"], case_sensitive=False), help="Audio quality for this run (overrides the saved setting)")
     def headless(quality):
         """Launch Ticli terminal player."""
         HeadlessTidalPlayer(quality=quality).run()

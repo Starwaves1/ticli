@@ -4,7 +4,7 @@ import click
 
 
 @click.command()
-@click.option("--quality", default="HIGH", type=click.Choice(["LOW", "HIGH", "LOSSLESS", "HIRES"], case_sensitive=False), help="Audio quality")
+@click.option("--quality", default=None, type=click.Choice(["LOW", "HIGH", "LOSSLESS", "HIRES"], case_sensitive=False), help="Audio quality for this run (overrides the saved setting)")
 def cli(quality):
     """Ticli - Terminal music player for TIDAL."""
     from ticli.player import HeadlessTidalPlayer
