@@ -90,6 +90,9 @@ ticli --quality LOW        # 320kbps
 | `m` | Show more controls |
 | `esc` | Quit |
 
+On macOS (with mpv installed) the system media keys, AirPods taps and Control Center
+also drive play/pause, next and previous, and the current track shows up in Now Playing.
+
 #### Search
 
 | Key | Action |

@@ -39,6 +39,10 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
 
 - ffplay: kills process on pause (instant silence), caches audio to local temp file, restarts from cache on resume
 - mpv (if available): uses IPC socket for pause/resume
+- macOS media keys (mpv only): mpv registers with MPRemoteCommandCenter, so keyboard
+  media keys / AirPods taps / Control Center reach it. Ticli rebinds those keys over
+  IPC (`keybind`) to write `user-data/ticli/media-key`, which `_monitor_playback` polls
+  on its existing 0.5s tick. Gated on `IS_MACOS`; a silent no-op elsewhere and on ffplay.
 
 ### Key Files
 
