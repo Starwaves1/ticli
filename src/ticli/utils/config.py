@@ -45,6 +45,15 @@ QUALITY_MEANINGS = {
 # same stream. Applied once, on load; the next save stamps version 2.
 QUALITY_V1_RENAMES = {"LOW": "HIGH", "HIGH": "LOSSLESS"}
 
+# What each cache tier actually stores. Worth spelling out: only one of them
+# can reach the gigabyte budget, and only on the ffplay backend — mpv streams
+# straight from TIDAL and never writes a track to disk for us to keep.
+CACHE_MODE_MEANINGS = {
+    "OFF": "nothing on disk, every list waits on the network",
+    "METADATA": "playlists and track lists, a few MB",
+    "FULL": "metadata plus played tracks (ffplay backend)",
+}
+
 SETTINGS_SPEC: list[dict] = [
     {
         "key": "quality",
@@ -84,6 +93,25 @@ SETTINGS_SPEC: list[dict] = [
         "max": 100,
         "step": 5,
         "desc": "Playback volume. Instant on mpv; ffplay takes it from the next track.",
+    },
+    {
+        "key": "cache_mode",
+        "label": "Cache",
+        "kind": "choice",
+        "default": "METADATA",
+        "choices": ["OFF", "METADATA", "FULL"],
+        "value_desc": CACHE_MODE_MEANINGS,
+        "desc": "What Ticli keeps on disk. Metadata is what makes playlists open instantly.",
+    },
+    {
+        "key": "cache_budget_mb",
+        "label": "Cache budget",
+        "kind": "int",
+        "default": 1024,
+        "min": 0,
+        "max": 8192,
+        "step": 256,
+        "desc": "Disk the cache may use, in MB. Over budget, the least recently used files go first.",
     },
 ]
 

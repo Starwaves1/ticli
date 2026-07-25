@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 from pathlib import Path
@@ -57,6 +58,7 @@ KEY_BACKSPACE2 = "\x08"
 
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import SETTINGS_SPEC, cycle_value, load_config, save_config
+from ticli.utils.cache import MetadataCache
 
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
@@ -83,6 +85,13 @@ MEDIA_KEY_PROP = "user-data/ticli/media-key"
 # Going back this far into a track restarts it instead of skipping backwards —
 # the rule every other player uses, for ← and the PREV media key alike
 PREV_RESTART_SECONDS = 30
+
+# Next-track stream URL prefetch. Fired from the monitor's existing tick this
+# far before the end of a track, and thrown away if it isn't used almost at
+# once — TIDAL's URLs are signed and short-lived, so a stale one is worse than
+# no prefetch at all.
+PREFETCH_LEAD = 20
+PREFETCH_MAX_AGE = 90
 
 # Input / repaint timing. The idle poll doubles as the repaint tick, so it is
 # capped at the monitor thread's own 0.5s cadence — an idle player wakes twice
@@ -162,8 +171,11 @@ class AudioPlayer:
     - ffplay: kills process on pause, restarts from cached local file on resume
     """
 
-    def __init__(self, player_cmd: str, volume: int = 100):
+    def __init__(self, player_cmd: str, volume: int = 100, cache=None):
         self.player_cmd = player_cmd
+        # Shared MetadataCache — only consulted for where cached audio lives
+        # and whether this build is allowed to keep it. None = never keep.
+        self.cache = cache
         # 0–100 for both backends. mpv takes it live over IPC, ffplay only at
         # spawn — so every spawn passes it too, and ffplay picks up a change
         # on the next track
@@ -181,9 +193,56 @@ class AudioPlayer:
         # macOS media keys: rebound per mpv process, title shown in Now Playing
         self._media_keys_bound = False
         self._media_title: Optional[str] = None
+        # Set while the current track's download is worth keeping (FULL cache):
+        # the name it graduates to once ffmpeg exits cleanly
+        self._keep_file: Optional[str] = None
+        # True when _cache_file is already a kept track, so stop() must not
+        # delete it — the whole point of having cached it
+        self._cache_persistent = False
 
-    def play_url(self, url: str, seek: float = 0, title: Optional[str] = None):
-        """Play an audio URL, stopping any current playback."""
+    def _retain_cache_file(self):
+        """Graduate a finished download to its permanent name, then make the
+        cache fit its budget again. Called at end of track, never on a timer."""
+        try:
+            os.replace(self._cache_file, self._keep_file)
+        except OSError:
+            try:
+                os.unlink(self._cache_file)
+            except OSError:
+                pass
+            return
+        try:
+            self.cache.enforce_budget()
+        except Exception as e:  # a cache sweep must never break playback
+            logger.debug("Cache sweep failed: %s", e)
+
+    def _cached_audio_path(self, key) -> Optional[str]:
+        """Where a finished download of this track would live, or None when
+        audio caching is off (or there's nothing to key it by)."""
+        if not self.cache or not self.cache.keeps_audio or key in (None, ""):
+            return None
+        try:
+            return str(self.cache_audio_dir() / f"{key}.audio")
+        except OSError:
+            return None
+
+    def cache_audio_dir(self):
+        """The audio cache directory, created if needed. Private like the rest
+        of the cache — these are someone's listening habits."""
+        from ticli.utils import cache as cache_mod
+        cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = cache_mod.audio_dir()
+        path.mkdir(exist_ok=True, mode=0o700)
+        return path
+
+    def play_url(self, url: str, seek: float = 0, title: Optional[str] = None,
+                 cache_key=None):
+        """Play an audio URL, stopping any current playback.
+
+        With audio caching on, a track played before is already on disk, so
+        the URL is never touched — that path is the same one ffplay's own
+        pause/resume cache has always used, just named by track and kept.
+        """
         self.stop()
         with self._lock:
             self._paused = False
@@ -192,6 +251,15 @@ class AudioPlayer:
             self._media_keys_bound = False
             self._seek_offset = seek
             self._play_start = time.time()
+            kept = self._cached_audio_path(cache_key)
+            # A track played before is already whole on disk: play the file and
+            # never touch the network. Works on both backends, because only the
+            # source path changes.
+            have_kept = bool(kept) and os.path.exists(kept)
+            source = kept if have_kept else url
+            self._cache_persistent = have_kept
+            if have_kept:
+                self._cache_file = kept
             if self.player_cmd == "mpv":
                 self._ipc_path = f"/tmp/ticli-mpv-{os.getpid()}.sock"
                 try:
@@ -202,27 +270,37 @@ class AudioPlayer:
                     "mpv", "--no-video", "--really-quiet",
                     f"--input-ipc-server={self._ipc_path}",
                     f"--volume={self.volume}",
-                    url,
+                    source,
                 ]
                 if seek > 0:
                     cmd.insert(-1, f"--start={seek}")
             else:  # ffplay
                 self._ipc_path = None
-                # Download to temp file in background for instant resume
-                self._cache_file = f"/tmp/ticli-cache-{os.getpid()}.flac"
-                self._cache_process = subprocess.Popen(
-                    ["ffmpeg", "-y", "-loglevel", "quiet", "-i", url,
-                     "-c", "copy", self._cache_file],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                if not have_kept:
+                    # Download to temp file in background for instant resume.
+                    # With FULL caching that download is also what gets kept,
+                    # so it is written under its final name + ".part" and
+                    # renamed once ffmpeg exits cleanly.
+                    if kept:
+                        self._cache_file = kept + ".part"
+                        self._keep_file = kept
+                    else:
+                        self._cache_file = os.path.join(
+                            tempfile.gettempdir(), f"ticli-cache-{os.getpid()}.flac"
+                        )
+                    self._cache_process = subprocess.Popen(
+                        ["ffmpeg", "-y", "-loglevel", "quiet", "-i", url,
+                         "-c", "copy", self._cache_file],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
                 # Always play from the URL here — the cache has only just
                 # started downloading, so it can't satisfy a seek yet
                 cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
                        "-volume", str(self.volume)]
                 if seek > 0:
                     cmd += ["-ss", str(seek)]
-                cmd.append(url)
+                cmd.append(source)
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -414,17 +492,24 @@ class AudioPlayer:
                 except subprocess.TimeoutExpired:
                     self._process.kill()
                 self._process = None
-            # Stop cache download
+            # Stop cache download. A download that already finished cleanly is
+            # a whole track — with FULL caching it graduates to its final name
+            # and survives; anything partial or unwanted is deleted.
+            complete = self._cache_process is not None and self._cache_process.poll() == 0
             if self._cache_process and self._cache_process.poll() is None:
                 self._cache_process.terminate()
-                self._cache_process = None
-            # Clean up cache file
-            if self._cache_file:
+                complete = False
+            self._cache_process = None
+            if complete and self._keep_file:
+                self._retain_cache_file()
+            elif self._cache_file and not self._cache_persistent:
                 try:
                     os.unlink(self._cache_file)
                 except OSError:
                     pass
-                self._cache_file = None
+            self._cache_file = None
+            self._keep_file = None
+            self._cache_persistent = False
             self._paused = False
             self._play_start = None
             self._seek_offset = 0
@@ -495,6 +580,12 @@ class HeadlessTidalPlayer:
         self.config = load_config()
         self._page_size = self.config["page_size"]
         self._bar_width = self.config["progress_bar_width"]
+        # Disk cache. Nothing is read or written until a list actually asks
+        # for it, so building a player never touches the cache directory.
+        self._cache = MetadataCache(
+            mode=self.config["cache_mode"],
+            budget_mb=self.config["cache_budget_mb"],
+        )
         # Playback state
         self._current_track: Optional[tidalapi.Track] = None
         self._queue: list = []
@@ -550,6 +641,11 @@ class HeadlessTidalPlayer:
         self._last_toggle_key = 0.0
         # Last rendered frame, so an idle repaint can skip an identical write
         self._last_segments = None
+        # Self-pipe: a background thread with fresh data writes a byte, which
+        # wakes the input select immediately instead of leaving the new list
+        # to wait for the next idle tick. Costs nothing while nothing happens.
+        self._wake_r = None
+        self._wake_w = None
         # User display name (set after login)
         self._user_display_name = ""
         # True while the restore-state thread is still fetching tracks
@@ -559,6 +655,9 @@ class HeadlessTidalPlayer:
         self._track_changing = False
         # Bumped per play request so a stale one can't clobber a newer one
         self._play_gen = 0
+        # Next-track URL prefetch: the result, and the id we already asked for
+        self._prefetch = None
+        self._prefetch_id = None
         # Navigation
         self._nav_history = []
         # Quality: an explicit --quality wins for this run only; it is never
@@ -777,6 +876,7 @@ class HeadlessTidalPlayer:
         """
         self._track_changing = True
         self._play_gen = gen = self._play_gen + 1
+        self._prefetch_id = None  # re-arm the prefetch for this track's successor
         self._current_track = track
         self._playing = True
         self._play_start_time = None
@@ -784,14 +884,30 @@ class HeadlessTidalPlayer:
 
         def _run():
             try:
-                url = track.get_url()
+                # A row from the cache carries no stream URL — swap it for the
+                # real track before doing anything with it. Only reachable in
+                # the second or so before revalidation replaces the whole list.
+                real = self._resolve_track(track)
+                if real is None:
+                    if self._play_gen == gen:
+                        self._playing = False
+                    return
+                if real is not track:
+                    # Swap the queue's copy too, so a queue built from cached
+                    # rows only ever pays for one resolve per track
+                    queue = self._queue
+                    if track in queue:
+                        self._queue = [real if t is track else t for t in queue]
+                    if self._play_gen == gen:
+                        self._current_track = real
+                url = self._take_prefetched(real.id) or real.get_url()
                 # Superseded by a newer track, or paused while we were
                 # fetching — either way this start is no longer wanted
                 if self._play_gen != gen or not self._playing:
                     return
-                artist = ", ".join(a.name for a in track.artists) if track.artists else ""
-                title = f"{track.name} — {artist}" if artist else track.name
-                self.audio.play_url(url, seek=seek, title=title)
+                artist = ", ".join(a.name for a in real.artists) if real.artists else ""
+                title = f"{real.name} — {artist}" if artist else real.name
+                self.audio.play_url(url, seek=seek, title=title, cache_key=real.id)
                 if self._play_gen != gen:
                     return
                 self._playing = True
@@ -805,6 +921,60 @@ class HeadlessTidalPlayer:
                     self._track_changing = False
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _take_prefetched(self, track_id) -> Optional[str]:
+        """A stream URL fetched moments ago for this track, if there is one.
+        Consumed on use — a signed URL is worth having exactly once."""
+        prefetched = self._prefetch
+        self._prefetch = None
+        if not prefetched:
+            return None
+        pid, url, fetched_at = prefetched
+        if pid != track_id or time.time() - fetched_at > PREFETCH_MAX_AGE:
+            return None
+        return url
+
+    def _maybe_prefetch_next(self):
+        """Fetch the next track's stream URL just before we need it.
+
+        Called from the monitor's existing tick, so it costs no new wakeups,
+        and only inside the last PREFETCH_LEAD seconds of a track — which
+        both keeps the signed URL fresh and means a track you skip past
+        early never causes a request at all.
+        """
+        if self._prefetch_id is not None or not self._playing:
+            return
+        if not self._queue or self._queue_index >= len(self._queue) - 1:
+            return
+        duration = getattr(self._current_track, "duration", 0) or 0
+        if duration <= 0 or duration - self._get_position() > PREFETCH_LEAD:
+            return
+        nxt = self._queue[self._queue_index + 1]
+        track_id = getattr(nxt, "id", None)
+        if track_id is None:
+            return
+        self._prefetch_id = track_id  # latch, so the tick can't refire it
+
+        def _run():
+            try:
+                real = self._resolve_track(nxt)
+                if real is not None:
+                    self._prefetch = (real.id, real.get_url(), time.time())
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _resolve_track(self, track):
+        """Turn a cached row into a real tidalapi Track. Anything that already
+        is one is handed straight back, so this costs nothing on the normal
+        path. Network — callers must already be off the UI thread."""
+        if track is None or not getattr(track, "cached", False):
+            return track
+        try:
+            return self.session.track(track.id)
+        except Exception:
+            return None
 
     def _play_queue_index(self, index: int):
         """Play track at queue index."""
@@ -955,6 +1125,7 @@ class HeadlessTidalPlayer:
                 if pos is not None:
                     self._play_offset = pos
                     self._play_start_time = time.time()
+                self._maybe_prefetch_next()
             # Save state periodically so a crash doesn't lose the position
             if time.time() - last_save > 10:
                 self._save_state()
@@ -1689,47 +1860,88 @@ class HeadlessTidalPlayer:
         self._play_queue_index(0)
 
     def _load_playlists(self):
-        """Load user playlists in background."""
-        self._playlists_loading = True
-        self._playlists = []
+        """Show the cached playlist list at once, then replace it with the
+        live one. Cache never answers on its own: the fetch always runs, so a
+        playlist added elsewhere shows up one round trip after you look —
+        the same wait the list used to cost every single time."""
+        cached = self._cache.get_playlists()
+        self._playlists = cached or []
+        self._playlists_loading = not cached
         self._playlists_cursor = 0
         self._playlists_message = ""
 
         def _run():
             try:
                 playlists = self.session.user.playlists()
-                self._playlists = list(playlists) if playlists else []
-                if not self._playlists:
+                fresh = list(playlists) if playlists else []
+                self._playlists = fresh
+                if self._playlists_cursor >= len(fresh):
+                    self._playlists_cursor = max(0, len(fresh) - 1)
+                if not fresh:
                     self._playlists_message = "No playlists found"
+                self._cache.put_playlists(fresh, editable_type=tidalapi.UserPlaylist)
             except Exception:
-                self._playlists_message = "Failed to load playlists"
+                # Offline with a cached list is a usable player, not an error
+                if not self._playlists:
+                    self._playlists_message = "Failed to load playlists"
             finally:
                 self._playlists_loading = False
+                self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _open_playlist(self, playlist):
-        """Open a playlist and show its tracks in browse mode."""
+        """Open a playlist and show its tracks in browse mode.
+
+        Cached track rows paint immediately; the live fetch runs anyway and
+        overwrites them with real objects, which is also what turns the rows
+        back into something playable and (for your own playlists) editable.
+        """
         self._push_nav()
         self._mode = self.MODE_BROWSE
-        # Removal is only offered on the user's own playlists
+        playlist_id = str(getattr(playlist, "id", "") or "")
+        # Removal is only offered on the user's own playlists — and only once
+        # we hold the real object, so a cached row can't try to edit anything
         self._browse_playlist = playlist if isinstance(playlist, tidalapi.UserPlaylist) else None
         self._browse_title = playlist.name if hasattr(playlist, "name") else "Playlist"
-        self._browse_tracks = []
+        cached = self._cache.get_playlist_tracks(playlist_id) if playlist_id else None
+        self._browse_tracks = cached or []
         self._browse_cursor = -1
-        self._browse_loading = True
+        self._browse_loading = not cached
         self._browse_message = ""
+
+        title = self._browse_title
 
         def _run():
             try:
-                tracks = playlist.tracks()
-                self._browse_tracks = list(tracks) if tracks else []
-                if not self._browse_tracks:
+                live = playlist
+                if getattr(playlist, "cached", False):
+                    # Opened from a cached row: get the real playlist first, so
+                    # removal and playback have something to work with.
+                    # session.playlist() already hands back a UserPlaylist for
+                    # the ones you own.
+                    live = self.session.playlist(playlist_id)
+                    if isinstance(live, tidalapi.UserPlaylist):
+                        self._browse_playlist = live
+                tracks = list(live.tracks() or [])
+                if playlist_id:
+                    # Store even if the user walked away — the fetch is paid
+                    # for either way, and the next visit gets it for free
+                    self._cache.put_playlist_tracks(playlist_id, tracks)
+                # Don't stamp on a list the user has already navigated away from
+                if self._browse_title != title:
+                    return
+                self._browse_tracks = tracks
+                if self._browse_cursor >= len(tracks):
+                    self._browse_cursor = len(tracks) - 1
+                if not tracks:
                     self._browse_message = "Playlist is empty"
             except Exception:
-                self._browse_message = "Failed to load playlist"
+                if not self._browse_tracks:
+                    self._browse_message = "Failed to load playlist"
             finally:
                 self._browse_loading = False
+                self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1875,6 +2087,17 @@ class HeadlessTidalPlayer:
         elif key == "volume":
             if self.audio:
                 self.audio.set_volume(value)
+        elif key == "cache_mode":
+            self._cache.mode = value
+            if value == "OFF":
+                # Turning it off has to mean the disk is empty, not just unread
+                self._cache.clear()
+            else:
+                self._cache.enforce_budget()
+        elif key == "cache_budget_mb":
+            self._cache.budget_mb = value
+            # Lowering the budget evicts right now, not at some later write
+            self._cache.enforce_budget()
 
     # ── Key handlers ──
 
@@ -2094,7 +2317,17 @@ class HeadlessTidalPlayer:
         Taking the whole burst in one pass is what makes held arrow keys
         scroll smoothly — repeat arrives faster than one key per loop turn.
         """
-        if not select_mod.select([sys.stdin], [], [], timeout)[0]:
+        watch = [sys.stdin]
+        if self._wake_r is not None:
+            watch.append(self._wake_r)
+        ready = select_mod.select(watch, [], [], timeout)[0]
+        if self._wake_r is not None and self._wake_r in ready:
+            # Drain the whole backlog: many wakes still mean one repaint
+            try:
+                os.read(self._wake_r, 4096)
+            except OSError:
+                pass
+        if sys.stdin not in ready:
             return []
         data = os.read(sys.stdin.fileno(), 1024)
         if not data:
@@ -2103,6 +2336,17 @@ class HeadlessTidalPlayer:
         if _incomplete_escape(text) and select_mod.select([sys.stdin], [], [], ESC_TAIL_SECONDS)[0]:
             text += os.read(sys.stdin.fileno(), 16).decode("utf-8", errors="ignore")
         return _split_keys(text)
+
+    def _wake(self):
+        """Ask the main loop to repaint now. Safe from any thread, and a
+        no-op before the loop starts (or if the pipe couldn't be made) —
+        the idle tick still picks the change up, just later."""
+        if self._wake_w is None:
+            return
+        try:
+            os.write(self._wake_w, b"\x01")
+        except OSError:
+            pass
 
     def _repaint(self, live, force=False):
         """Push the current UI to the terminal.
@@ -2128,7 +2372,7 @@ class HeadlessTidalPlayer:
         if not player_cmd:
             self.console.print("[red]No audio player found. Install mpv or ffplay.[/red]")
             return
-        self.audio = AudioPlayer(player_cmd, volume=self.config["volume"])
+        self.audio = AudioPlayer(player_cmd, volume=self.config["volume"], cache=self._cache)
 
         # Login
         if not self._login():
@@ -2162,6 +2406,12 @@ class HeadlessTidalPlayer:
             self.console.print("[red]Player requires an interactive terminal.[/red]")
             return
 
+        try:
+            self._wake_r, self._wake_w = os.pipe()
+            os.set_blocking(self._wake_r, False)
+        except OSError:
+            self._wake_r = self._wake_w = None
+
         old_settings = termios.tcgetattr(sys.stdin)
         try:
             tty.setcbreak(sys.stdin.fileno())
@@ -2189,6 +2439,13 @@ class HeadlessTidalPlayer:
             self._save_state()
             if self.audio:
                 self.audio.stop()
+            for fd in (self._wake_r, self._wake_w):
+                try:
+                    if fd is not None:
+                        os.close(fd)
+                except OSError:
+                    pass
+            self._wake_r = self._wake_w = None
 
         self.console.print("[dim]Player closed.[/dim]")
 

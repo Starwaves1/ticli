@@ -12,6 +12,7 @@ Ticli: a terminal music player for TIDAL. Streams lossless/hi-res audio directly
   - `ticli/player.py` — Main player (TUI, audio, search, queue, playlists)
   - `ticli/cli.py` — Click CLI entry point
   - `ticli/utils/credential_store.py` — Secure OAuth token storage
+  - `ticli/utils/cache.py` — On-disk metadata/audio cache + budget
   - `ticli/tests/` — E2E tests
 
 ## Commands
@@ -44,6 +45,17 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
   IPC (`keybind`) to write `user-data/ticli/media-key`, which `_monitor_playback` polls
   on its existing 0.5s tick. Gated on `IS_MACOS`; a silent no-op elsewhere and on ffplay.
 
+### Caching
+
+`utils/cache.py` holds a metadata index (your playlists, and the tracks in
+each) in the OS's own cache directory — never in `~/.config/ticli`. Lists
+paint from it instantly, but it never answers alone: every read is paired
+with the live fetch, which replaces what was shown one round trip later.
+Cached rows are `CachedTrack` / `CachedPlaylist` records, not tidalapi
+objects; anything that needs the real thing resolves through the session
+first. The `cache_mode` / `cache_budget_mb` settings size it, and eviction
+runs after writes — never on a timer.
+
 ### Key Files
 
 | File | Purpose |
@@ -51,6 +63,7 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
 | `player.py` | Player TUI, audio control, search, queue, playlists (~1400 LOC) |
 | `cli.py` | CLI entry point |
 | `utils/credential_store.py` | OAuth token storage (keychain + fallback) |
+| `utils/cache.py` | Metadata cache, cached audio, budget + eviction |
 
 ## Testing
 
