@@ -84,6 +84,65 @@ MEDIA_KEY_PROP = "user-data/ticli/media-key"
 # the rule every other player uses, for ← and the PREV media key alike
 PREV_RESTART_SECONDS = 30
 
+# Input / repaint timing. The idle poll doubles as the repaint tick, so it is
+# capped at the monitor thread's own 0.5s cadence — an idle player wakes twice
+# a second and writes nothing unless the screen actually changed.
+IDLE_POLL_SECONDS = 0.5
+# Two space (or k) events closer together than this are terminal key repeat,
+# not two presses. Comfortably above every platform's repeat interval
+# (macOS 15ms floor, Linux 33ms default) and below a deliberate double tap.
+KEY_REPEAT_WINDOW = 0.15
+# How long to wait for the tail of an escape sequence that straddled a read.
+# Only a bare Esc ever pays it in full; kept generous so an arrow key over a
+# slow SSH link can't decode as Esc and quit the player.
+ESC_TAIL_SECONDS = 0.05
+
+
+def _split_keys(data: str) -> list:
+    """Split one raw stdin read into individual keys.
+
+    Key repeat delivers several keys per read, and arrows are multi-byte
+    escape sequences — so the split has to keep each sequence whole rather
+    than letting one arrow swallow the bytes of the next.
+    """
+    keys = []
+    i = 0
+    while i < len(data):
+        ch = data[i]
+        if ch != "\x1b":
+            keys.append(ch)
+            i += 1
+            continue
+        j = i + 1
+        if j < len(data) and data[j] in "[O":
+            j += 1
+            # Parameter bytes, then one final byte closes the sequence
+            while j < len(data) and data[j] in "0123456789;":
+                j += 1
+            if j < len(data):
+                j += 1
+            keys.append(data[i:j])
+            i = j
+        else:
+            # Bare Esc (or Alt-<key>, which the player doesn't bind)
+            keys.append("\x1b")
+            i += 1
+    return keys
+
+
+def _incomplete_escape(data: str) -> bool:
+    """True if the read ended mid escape sequence, so the tail is still in
+    flight — waiting for it stops an arrow key decoding as a bare Esc."""
+    i = data.rfind("\x1b")
+    if i < 0:
+        return False
+    tail = data[i:]
+    if len(tail) == 1:
+        return True
+    if tail[1] not in "[O":
+        return False
+    return all(c in "0123456789;" for c in tail[2:])
+
 
 def _find_audio_player():
     """Find an available audio player binary."""
@@ -487,8 +546,10 @@ class HeadlessTidalPlayer:
         self._mini_player = False
         # Show more controls
         self._show_more = False
-        # Space-held guard: prevents toggle-looping from key repeat
-        self._space_held = False
+        # Timestamp of the last play/pause key, for repeat suppression
+        self._last_toggle_key = 0.0
+        # Last rendered frame, so an idle repaint can skip an identical write
+        self._last_segments = None
         # User display name (set after login)
         self._user_display_name = ""
         # True while the restore-state thread is still fetching tracks
@@ -496,6 +557,8 @@ class HeadlessTidalPlayer:
         # True while _play_track is between killing the old player process
         # and spawning the new one (guards the monitor's end-of-track check)
         self._track_changing = False
+        # Bumped per play request so a stale one can't clobber a newer one
+        self._play_gen = 0
         # Navigation
         self._nav_history = []
         # Quality: an explicit --quality wins for this run only; it is never
@@ -703,21 +766,45 @@ class HeadlessTidalPlayer:
         threading.Thread(target=_run, daemon=True).start()
 
     def _play_track(self, track: tidalapi.Track, seek: float = 0):
-        """Play a track via the audio player, optionally starting at an offset."""
+        """Play a track via the audio player, optionally starting at an offset.
+
+        get_url() is a TIDAL round trip, so the whole start-up runs on a
+        daemon thread — the UI used to freeze for its duration on every skip.
+        The new track is shown straight away with its clock held at the seek
+        point; the clock starts when audio actually does. A generation counter
+        keeps a slow request from a track the user already skipped past from
+        landing on top of the newer one.
+        """
         self._track_changing = True
-        try:
-            url = track.get_url()
-            artist = ", ".join(a.name for a in track.artists) if track.artists else ""
-            title = f"{track.name} — {artist}" if artist else track.name
-            self.audio.play_url(url, seek=seek, title=title)
-            self._current_track = track
-            self._playing = True
-            self._play_start_time = time.time()
-            self._play_offset = seek
-        except Exception:
-            self._playing = False
-        finally:
-            self._track_changing = False
+        self._play_gen = gen = self._play_gen + 1
+        self._current_track = track
+        self._playing = True
+        self._play_start_time = None
+        self._play_offset = seek
+
+        def _run():
+            try:
+                url = track.get_url()
+                # Superseded by a newer track, or paused while we were
+                # fetching — either way this start is no longer wanted
+                if self._play_gen != gen or not self._playing:
+                    return
+                artist = ", ".join(a.name for a in track.artists) if track.artists else ""
+                title = f"{track.name} — {artist}" if artist else track.name
+                self.audio.play_url(url, seek=seek, title=title)
+                if self._play_gen != gen:
+                    return
+                self._playing = True
+                self._play_start_time = time.time()
+                self._play_offset = seek
+            except Exception:
+                if self._play_gen == gen:
+                    self._playing = False
+            finally:
+                if self._play_gen == gen:
+                    self._track_changing = False
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _play_queue_index(self, index: int):
         """Play track at queue index."""
@@ -747,6 +834,21 @@ class HeadlessTidalPlayer:
             self._play_start_time = time.time()
             return
         self._play_track(self._current_track, seek=0)
+
+    def _toggle_play_key(self):
+        """Play/pause from a keypress, on any screen.
+
+        Holding the key makes the terminal repeat it, so events closer
+        together than the repeat window count as one press. This replaces a
+        held-flag that only cleared on an idle poll — which meant a genuine
+        second press soon after the first was swallowed instead.
+        """
+        now = time.monotonic()
+        repeat = now - self._last_toggle_key < KEY_REPEAT_WINDOW
+        self._last_toggle_key = now
+        if repeat:
+            return
+        self._toggle_play()
 
     def _toggle_play(self):
         """Toggle play/pause — pauses in place, resumes from same position."""
@@ -1809,10 +1911,7 @@ class HeadlessTidalPlayer:
 
     def _handle_player_key(self, key: str):
         if key in (" ", "k"):
-            if self._space_held:
-                return  # Key is still held down — ignore repeats
-            self._toggle_play()
-            self._space_held = True
+            self._toggle_play_key()
         elif key == "n" or key == KEY_RIGHT:
             self._next_track()
         elif key == KEY_LEFT:
@@ -1861,10 +1960,7 @@ class HeadlessTidalPlayer:
             return
         if key == " " and self._search_results:
             # Space toggles play/pause when browsing search results
-            if self._space_held:
-                return
-            self._toggle_play()
-            self._space_held = True
+            self._toggle_play_key()
             return
         if key == KEY_UP:
             if self._search_results:
@@ -1893,10 +1989,7 @@ class HeadlessTidalPlayer:
             self._go_back()
             return
         if key == " ":
-            if self._space_held:
-                return
-            self._toggle_play()
-            self._space_held = True
+            self._toggle_play_key()
             return
         if key == KEY_UP:
             if self._browse_tracks:
@@ -1921,10 +2014,7 @@ class HeadlessTidalPlayer:
             self._mode = self.MODE_PLAYER
             return
         if key == " ":
-            if self._space_held:
-                return
-            self._toggle_play()
-            self._space_held = True
+            self._toggle_play_key()
             return
         if key == KEY_UP:
             if self._queue:
@@ -1945,10 +2035,7 @@ class HeadlessTidalPlayer:
             self._mode = self.MODE_PLAYER
             return
         if key == " ":
-            if self._space_held:
-                return
-            self._toggle_play()
-            self._space_held = True
+            self._toggle_play_key()
             return
         if key == KEY_UP:
             if self._playlists:
@@ -1965,10 +2052,7 @@ class HeadlessTidalPlayer:
             self._go_back()
             return
         if key == " ":
-            if self._space_held:
-                return
-            self._toggle_play()
-            self._space_held = True
+            self._toggle_play_key()
             return
         if key == KEY_UP:
             if self._editable_playlists:
@@ -1987,10 +2071,7 @@ class HeadlessTidalPlayer:
             self._mode = self.MODE_PLAYER
             return
         if key == " ":
-            if self._space_held:
-                return
-            self._toggle_play()
-            self._space_held = True
+            self._toggle_play_key()
             return
         if key in ("o", "O"):
             self._logout_pending = True
@@ -2006,25 +2087,39 @@ class HeadlessTidalPlayer:
 
     # ── Main loop ──
 
-    def _drain_stdin(self, select_mod=None):
-        """Discard all pending stdin input to prevent buffered key repeats."""
-        import select as _sel
-        # Wait briefly for in-flight key-repeat bytes, then drain everything
-        time.sleep(0.05)
-        while _sel.select([sys.stdin], [], [], 0)[0]:
-            os.read(sys.stdin.fileno(), 4096)
+    def _read_keys(self, select_mod, timeout=IDLE_POLL_SECONDS):
+        """Block until input arrives (or the idle timeout), then return every
+        key already buffered.
 
-    def _read_key(self, select_mod):
-        if not select_mod.select([sys.stdin], [], [], 0.25)[0]:
-            return None
-        ch = os.read(sys.stdin.fileno(), 1)
-        if not ch:
-            return None
-        # If escape byte, try to read the rest of the sequence (arrow keys etc.)
-        if ch == b"\x1b":
-            if select_mod.select([sys.stdin], [], [], 0.05)[0]:
-                ch += os.read(sys.stdin.fileno(), 7)
-        return ch.decode("utf-8", errors="ignore")
+        Taking the whole burst in one pass is what makes held arrow keys
+        scroll smoothly — repeat arrives faster than one key per loop turn.
+        """
+        if not select_mod.select([sys.stdin], [], [], timeout)[0]:
+            return []
+        data = os.read(sys.stdin.fileno(), 1024)
+        if not data:
+            return []
+        text = data.decode("utf-8", errors="ignore")
+        if _incomplete_escape(text) and select_mod.select([sys.stdin], [], [], ESC_TAIL_SECONDS)[0]:
+            text += os.read(sys.stdin.fileno(), 16).decode("utf-8", errors="ignore")
+        return _split_keys(text)
+
+    def _repaint(self, live, force=False):
+        """Push the current UI to the terminal.
+
+        Rich's Live only swaps the renderable on update(); the pixels change
+        on its own refresh thread, so a keypress could sit up to a quarter
+        second before anything moved. Painting inline with refresh=True makes
+        input land immediately. On an idle tick the write is skipped when the
+        render is identical to what is already on screen, so a player nobody
+        is touching costs one cheap render per poll and no terminal traffic.
+        """
+        display = self._build_display()
+        segments = tuple(self.console.render(display, self.console.options))
+        if not force and segments == self._last_segments:
+            return
+        self._last_segments = segments
+        live.update(display, refresh=True)
 
     def run(self):
         """Start the headless player."""
@@ -2072,20 +2167,22 @@ class HeadlessTidalPlayer:
             tty.setcbreak(sys.stdin.fileno())
             self.console.clear()
 
+            # auto_refresh off: repaints are driven by _repaint, immediately
+            # after input and otherwise only when the screen actually changed
             with Live(
                 self._build_display(),
                 console=self.console,
-                refresh_per_second=4,
+                auto_refresh=False,
                 screen=False,
             ) as live:
+                self._repaint(live, force=True)
                 while self.running:
-                    live.update(self._build_display())
-                    key = self._read_key(select)
-                    if key is not None:
+                    keys = self._read_keys(select)
+                    for key in keys:
                         self._handle_key(key)
-                    elif self._space_held:
-                        # No key this cycle — user released space
-                        self._space_held = False
+                        if not self.running:
+                            break
+                    self._repaint(live, force=bool(keys))
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
             # Save state before cleanup
