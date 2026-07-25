@@ -60,7 +60,15 @@ KEY_BACKSPACE = "\x7f"
 KEY_BACKSPACE2 = "\x08"
 
 from ticli.utils.credential_store import save_tokens, load_tokens
-from ticli.utils.config import SETTINGS_SPEC, cycle_value, load_config, save_config
+from ticli.utils.config import (
+    SETTINGS_SPEC,
+    coerce,
+    cycle_value,
+    display_value,
+    get_spec,
+    load_config,
+    save_config,
+)
 from ticli.utils.cache import MetadataCache
 
 STATE_DIR = Path.home() / ".config" / "ticli"
@@ -69,6 +77,13 @@ STATE_FILE = STATE_DIR / "player_state.json"
 AUDIO_PLAYERS = ["mpv", "ffplay"]
 
 IS_MACOS = sys.platform == "darwin"
+
+# What the volume setting is allowed to reach. Above 100 is software gain, so
+# the backends differ: mpv only exceeds unity when told a higher --volume-max
+# (its default ceiling is 130), while ffplay's -volume is documented 0=min
+# 100=max and clips there — so ffplay is given 100 and the setting says so.
+VOLUME_MAX = get_spec("volume")["max"]
+FFPLAY_VOLUME_MAX = 100
 
 # macOS media keys (keyboard, AirPods taps, Control Center): mpv registers with
 # MPRemoteCommandCenter and turns remote commands into these key names. We rebind
@@ -231,9 +246,9 @@ class AudioPlayer:
         # Shared MetadataCache — only consulted for where cached audio lives
         # and whether this build is allowed to keep it. None = never keep.
         self.cache = cache
-        # 0–100 for both backends. mpv takes it live over IPC, ffplay only at
-        # spawn — so every spawn passes it too, and ffplay picks up a change
-        # on the next track
+        # 0–VOLUME_MAX. mpv takes it live over IPC, ffplay only at spawn — so
+        # every spawn passes it too, and ffplay picks up a change on the next
+        # track. Above 100 only mpv can actually go (see _ffplay_volume)
         self.volume = volume
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
@@ -254,6 +269,22 @@ class AudioPlayer:
         # True when _cache_file is a kept track, so stop() must not delete it —
         # the whole point of having cached it
         self._cache_persistent = False
+
+    def volume_ceiling(self) -> int:
+        """The loudest this backend can actually be told to go.
+
+        Discovered from the backend rather than assumed: ffplay refuses
+        anything over 100 ("-volume=250 > 100, setting to 100", straight out
+        of ffplay.c), while mpv amplifies in software up to the --volume-max
+        every spawn passes it. The settings row clamps to this, so the number
+        on screen is always a number the user will actually hear.
+        """
+        return VOLUME_MAX if self.player_cmd == "mpv" else FFPLAY_VOLUME_MAX
+
+    def _ffplay_volume(self) -> int:
+        """What ffplay can be told. Its -volume is 0=min 100=max and clips
+        there, so amplification above unity is an mpv-only capability."""
+        return min(FFPLAY_VOLUME_MAX, max(0, int(self.volume)))
 
     def _sweep_cache(self):
         """Make the cache fit its budget again. Called when a download lands,
@@ -355,6 +386,11 @@ class AudioPlayer:
                 # a scratch copy for a player that has stopped does not.
                 _drop(path)
             if keep and os.path.exists(path):
+                # One more song on disk: the settings page's count is stale
+                try:
+                    self.cache.invalidate_audio_count()
+                except Exception:  # pragma: no cover - bookkeeping only
+                    pass
                 self._sweep_cache()
 
         threading.Thread(target=_run, daemon=True).start()
@@ -403,6 +439,9 @@ class AudioPlayer:
                 cmd = [
                     "mpv", "--no-video", "--really-quiet",
                     f"--input-ipc-server={self._ipc_path}",
+                    # --volume-max first: mpv refuses anything above it, and
+                    # its default ceiling (130) is below what the setting allows
+                    f"--volume-max={VOLUME_MAX}",
                     f"--volume={self.volume}",
                     source,
                 ]
@@ -414,7 +453,7 @@ class AudioPlayer:
                 # otherwise — a download that has only just started can't
                 # satisfy a seek yet
                 cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                       "-volume", str(self.volume)]
+                       "-volume", str(self._ffplay_volume())]
                 if seek > 0:
                     cmd += ["-ss", str(seek)]
                 cmd.append(source)
@@ -432,7 +471,8 @@ class AudioPlayer:
     def _play_from_cache(self, seek: float):
         """Resume ffplay from local cached file at given position."""
         cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-               "-volume", str(self.volume), "-ss", str(seek), self._cache_file]
+               "-volume", str(self._ffplay_volume()), "-ss", str(seek),
+               self._cache_file]
         self._process = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -552,7 +592,7 @@ class AudioPlayer:
         return None
 
     def set_volume(self, value: int):
-        """Set playback volume (0–100). mpv applies it to the playing track
+        """Set playback volume (0–VOLUME_MAX). mpv applies it to the playing track
         right away; ffplay can't be told mid-track, so it waits for the next
         spawn — either way the stored value is what future tracks start at."""
         with self._lock:
@@ -706,8 +746,9 @@ class HeadlessTidalPlayer:
         # Disk cache. Nothing is read or written until a list actually asks
         # for it, so building a player never touches the cache directory.
         self._cache = MetadataCache(
-            mode=self.config["cache_mode"],
-            budget_mb=self.config["cache_budget_mb"],
+            metadata=self.config["cache_metadata"],
+            songs=self.config["cache_songs"],
+            budget_gb=self.config["cache_budget_gb"],
         )
         # Playback state
         self._current_track: Optional[tidalapi.Track] = None
@@ -747,8 +788,11 @@ class HeadlessTidalPlayer:
         self._picker_cursor = 0
         self._picker_loading = False
         self._picker_busy = False
-        # Settings page state
+        # Settings page state. _settings_edit is the digits typed into a number
+        # row so far, or None when the arrows are just navigating; it is only
+        # ever replaced wholesale, never appended to in place
         self._settings_cursor = 0
+        self._settings_edit: Optional[str] = None
         # Transient toast message
         self._toast = ""
         self._toast_until = 0.0
@@ -756,6 +800,11 @@ class HeadlessTidalPlayer:
         self._quit_pending = False
         # Logout confirmation
         self._logout_pending = False
+        # Turning song caching off asks what to do with the files already
+        # there; clearing the cache is its own action with its own prompt.
+        # Neither touches the setting or the disk until the answer comes back
+        self._disable_songs_pending = False
+        self._clear_cache_pending = False
         # Mini player mode
         self._mini_player = False
         # Show more controls
@@ -1253,11 +1302,14 @@ class HeadlessTidalPlayer:
             if dead_polls >= 2:
                 dead_polls = 0
                 if (self.audio and self._current_track is not None
-                        and self.audio.source_vanished()):
+                        and self.audio.source_vanished()
+                        and self._track_has_time_left()):
                     # The cached file was deleted between "it exists" and the
                     # player opening it, so the player exited at once. Without
                     # this the track is silently skipped; start it again from
-                    # the network, where it was left.
+                    # the network, where it was left. A track that had already
+                    # finished playing needs no rescue — clearing the cache
+                    # mid-track leaves its file gone at the natural end too.
                     self._play_track(self._current_track, seek=self._get_position())
                 elif self._queue and self._queue_index < len(self._queue) - 1:
                     self._play_queue_index(self._queue_index + 1)
@@ -1282,6 +1334,15 @@ class HeadlessTidalPlayer:
             time.sleep(0.5)
 
     # ── Display builders ──
+
+    def _track_has_time_left(self, margin: float = 2.0) -> bool:
+        """Whether the current track stopped early enough to be worth
+        resuming. An unknown duration counts as "yes" — better one extra
+        respawn than a silently dropped track."""
+        duration = getattr(self._current_track, "duration", None) or 0
+        if duration <= 0:
+            return True
+        return self._get_position() < duration - margin
 
     def _get_position(self) -> float:
         if self._play_start_time and self._playing:
@@ -1591,18 +1652,41 @@ class HeadlessTidalPlayer:
                 content.append("    ", style="")
             content.append(f"{spec['label']:<20}", style="bold white" if selected else "white")
             value = self.config.get(spec["key"], spec["default"])
-            # Chevrons on the selected row signal that ←/→ change it
-            if selected:
-                content.append(f"‹ {value} ›", style="bold cyan")
+            editing = selected and self._settings_edit is not None
+            if editing:
+                # A visible caret, so typing never looks like navigating
+                content.append(f"‹ {self._settings_edit}▏›", style="bold yellow")
+            elif selected:
+                # Chevrons on the selected row signal that ←/→ change it
+                content.append(f"‹ {display_value(spec, value)} ›", style="bold cyan")
             else:
-                content.append(f"  {value}", style="dim cyan")
+                content.append(f"  {display_value(spec, value)}", style="dim cyan")
             # A choice value on its own says nothing about what you'll hear —
             # spell the stream out next to it
             meaning = spec.get("value_desc", {}).get(str(value).upper(), "")
             if meaning:
                 content.append(f"  {meaning}", style="dim")
+            if spec["key"] == "cache_songs":
+                # Tiny status: what the toggle is actually holding right now
+                songs = self._cache.audio_count()
+                content.append(
+                    f"  {songs} song{'' if songs == 1 else 's'} on disk", style="dim")
+            if spec["key"] == "volume":
+                # Deliberately blue, not dim: past unity mpv is amplifying a
+                # finished master, and that is a thing to notice, not to skim
+                if not editing and int(value) >= 105:
+                    content.append("  louder than the master — quality suffers", style="blue")
+                ceiling = self.audio.volume_ceiling() if self.audio else VOLUME_MAX
+                if ceiling < spec["max"]:
+                    content.append(
+                        f"  {self.audio.player_cmd} caps at {ceiling}%", style="blue")
 
         spec = SETTINGS_SPEC[self._settings_cursor]
+        if self._settings_edit is not None:
+            content.append(
+                "\n\n   Typing a number — Enter or Esc saves it, Backspace deletes",
+                style="dim",
+            )
         content.append(f"\n\n   {spec['desc']}", style="dim")
         # The whole ladder, so ←/→ lands somewhere you already understand.
         # Fits 80 columns for the four quality tiers.
@@ -1624,9 +1708,16 @@ class HeadlessTidalPlayer:
                 f"\n   Overridden this run by --quality {self._quality_name}",
                 style="dim yellow",
             )
+        # Shown like logout, for the same reason: an action the page offers,
+        # which the value table above has no way to express
+        songs = self._cache.audio_count()
+        content.append(
+            f"\n\n   {songs} song{'' if songs == 1 else 's'} cached", style="dim")
+        content.append("   [x]", style="bold")
+        content.append(" clear cache", style="dim")
         # Account lives here rather than on the player screen — it's a thing you
         # look at when you're already in settings, not while listening
-        content.append("\n\n   Logged in as ", style="dim")
+        content.append("\n   Logged in as ", style="dim")
         content.append(self._user_display_name or "—", style="bold")
         content.append("   [o]", style="bold")
         content.append(" log out", style="dim")
@@ -1644,6 +1735,29 @@ class HeadlessTidalPlayer:
         content = Text()
         content.append("\n   Log out and clear saved tokens? ", style="bold yellow")
         content.append("Press ", style="dim")
+        content.append("y", style="bold")
+        content.append(" to confirm, any other key to cancel", style="dim")
+        return content
+
+    def _build_disable_songs_confirm(self) -> Text:
+        """Disabling and clearing are separate: you can stop caching and keep
+        what you already have."""
+        content = Text()
+        content.append("\n   Clear cached songs as well? ", style="bold yellow")
+        content.append("y", style="bold")
+        content.append(" clear, ", style="dim")
+        content.append("n", style="bold")
+        content.append(" keep them, ", style="dim")
+        content.append("Esc", style="bold")
+        content.append(" cancel", style="dim")
+        return content
+
+    def _build_clear_cache_confirm(self) -> Text:
+        content = Text()
+        songs = self._cache.audio_count()
+        content.append(
+            f"\n   Delete {songs} cached song{'' if songs == 1 else 's'}? ",
+            style="bold yellow")
         content.append("y", style="bold")
         content.append(" to confirm, any other key to cancel", style="dim")
         return content
@@ -1742,6 +1856,9 @@ class HeadlessTidalPlayer:
             controls.append(" change  ", style="dim")
             controls.append("[Space]", style="bold")
             controls.append(" pause/play  ", style="dim")
+            # No [x] here on purpose: this row already fills 74 columns, which
+            # is exactly the panel's inner width at an 80-column terminal, and
+            # clear cache has its own line above (the way logout does)
             controls.append("[o]", style="bold")
             controls.append(" log out  ", style="dim")
             controls.append("[Esc]", style="bold")
@@ -1784,6 +1901,10 @@ class HeadlessTidalPlayer:
             content.append_text(self._build_quit_confirm())
         elif self._logout_pending:
             content.append_text(self._build_logout_confirm())
+        elif self._disable_songs_pending:
+            content.append_text(self._build_disable_songs_confirm())
+        elif self._clear_cache_pending:
+            content.append_text(self._build_clear_cache_confirm())
 
         content.append("\n\n")
         content.append_text(controls)
@@ -2208,11 +2329,16 @@ class HeadlessTidalPlayer:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _change_setting(self, step: int):
-        """Move the selected setting one step, apply it live, and persist it."""
-        spec = SETTINGS_SPEC[self._settings_cursor]
+    def _setting_ceiling(self, spec: dict) -> int:
+        """A row's usable maximum. Normally the spec's, except for volume,
+        where it is whatever the running backend can really reach."""
+        if spec["key"] == "volume" and self.audio:
+            return min(spec["max"], self.audio.volume_ceiling())
+        return spec["max"]
+
+    def _set_setting(self, spec: dict, value):
+        """Write one setting: apply it live, then persist it."""
         current = self.config.get(spec["key"], spec["default"])
-        value = cycle_value(spec, current, step)
         if value == current:
             return  # a number clamped at its bound — nothing to write
         self.config[spec["key"]] = value
@@ -2220,6 +2346,56 @@ class HeadlessTidalPlayer:
         # The file is <1 KB; writing inline keeps the setting safe from a crash
         # and is invisible at the 4fps render loop
         save_config(self.config)
+
+    def _change_setting(self, step: int):
+        """Move the selected setting one step, apply it live, and persist it."""
+        spec = SETTINGS_SPEC[self._settings_cursor]
+        current = self.config.get(spec["key"], spec["default"])
+        value = cycle_value(spec, current, step)
+        if spec["kind"] == "int":
+            value = min(value, self._setting_ceiling(spec))
+        if spec["key"] == "cache_songs" and value is False:
+            # Ask what happens to the files already there. Nothing changes yet
+            self._disable_songs_pending = True
+            return
+        self._set_setting(spec, value)
+
+    def _begin_setting_edit(self, digit: str) -> bool:
+        """Start typing a number into the selected row. False if that row isn't
+        a number — a digit on a choice row means nothing."""
+        if SETTINGS_SPEC[self._settings_cursor]["kind"] != "int":
+            return False
+        self._settings_edit = digit
+        return True
+
+    def _commit_setting_edit(self):
+        """Leave the textbox. Whatever is in it is saved and applied right
+        there — there is no separate confirm step, so Esc and Enter and
+        arrowing away all mean the same thing. An empty box reverts (typing
+        nothing must not be read as zero), and anything out of range clamps
+        to the row's bounds."""
+        typed, self._settings_edit = self._settings_edit, None
+        if not typed:
+            return
+        spec = SETTINGS_SPEC[self._settings_cursor]
+        value = min(coerce(spec, int(typed)), self._setting_ceiling(spec))
+        self._set_setting(spec, value)
+
+    def _clear_cached_songs(self):
+        """Delete the cached tracks and say what really happened.
+
+        Inline, not on a thread: a full 2 GB budget is on the order of a
+        hundred unlinks. A track playing from one of these files keeps
+        playing — the file is unlinked, not closed (and if the player had not
+        opened it yet, _monitor_playback restarts it from the network).
+        """
+        removed, kept = self._cache.clear_audio()
+        if kept:
+            # Honest rather than silent: on Windows a file open without
+            # delete-sharing cannot be removed at all
+            self._set_toast(f"Cleared {removed} songs, {kept} still in use")
+        else:
+            self._set_toast(f"Cleared {removed} song{'' if removed == 1 else 's'}")
 
     def _apply_setting(self, key: str, value):
         """Apply a setting to the running player. Sizes take effect on the next
@@ -2234,15 +2410,22 @@ class HeadlessTidalPlayer:
         elif key == "volume":
             if self.audio:
                 self.audio.set_volume(value)
-        elif key == "cache_mode":
-            self._cache.mode = value
-            if value == "OFF":
+        elif key == "cache_metadata":
+            self._cache.metadata = value
+            if not value:
                 # Turning it off has to mean the disk is empty, not just unread
-                self._cache.clear()
-            else:
+                self._cache.clear_metadata()
+        elif key == "cache_songs":
+            # Only stops keeping new ones. What is already on disk is the
+            # user's to keep or clear — see the prompt in _handle_key
+            self._cache.songs = value
+            if value:
+                # Nothing is downloaded yet, but the count on screen has to
+                # match the directory either way
+                self._cache.invalidate_audio_count()
                 self._cache.enforce_budget()
-        elif key == "cache_budget_mb":
-            self._cache.budget_mb = value
+        elif key == "cache_budget_gb":
+            self._cache.budget_gb = value
             # Lowering the budget evicts right now, not at some later write
             self._cache.enforce_budget()
 
@@ -2262,6 +2445,24 @@ class HeadlessTidalPlayer:
             if key == "y" or key == "Y":
                 self._logout()
             self._logout_pending = False
+            return
+
+        # Three answers, because disabling and clearing are different things:
+        # yes stops caching and deletes, no stops caching and keeps the files,
+        # Esc (or anything unrecognised) leaves the setting alone entirely
+        if self._disable_songs_pending:
+            self._disable_songs_pending = False
+            if key in ("y", "Y", KEY_ENTER, KEY_ENTER2):
+                self._set_setting(get_spec("cache_songs"), False)
+                self._clear_cached_songs()
+            elif key in ("n", "N"):
+                self._set_setting(get_spec("cache_songs"), False)
+            return
+
+        if self._clear_cache_pending:
+            self._clear_cache_pending = False
+            if key in ("y", "Y", KEY_ENTER, KEY_ENTER2):
+                self._clear_cached_songs()
             return
 
         if self._mode == self.MODE_SEARCH:
@@ -2320,6 +2521,9 @@ class HeadlessTidalPlayer:
             self._mini_player = False
             self._mode = self.MODE_SETTINGS
             self._settings_cursor = 0
+            self._settings_edit = None
+            # The song count could have moved since the page was last open
+            self._cache.invalidate_audio_count()
             self._nav_history.clear()
         elif key == KEY_ESC:
             self._quit_pending = True
@@ -2435,6 +2639,25 @@ class HeadlessTidalPlayer:
                 self._picker_add_to(self._editable_playlists[self._picker_cursor])
 
     def _handle_settings_key(self, key: str):
+        # Typing a number into a row: digits extend it, Backspace shortens it,
+        # and anything that means "leave" saves what is there on the way out
+        if self._settings_edit is not None:
+            if key.isdigit():
+                # Four digits is more than any row's ceiling needs
+                if len(self._settings_edit) < 4:
+                    self._settings_edit = self._settings_edit + key
+                return
+            if key in (KEY_BACKSPACE, KEY_BACKSPACE2):
+                self._settings_edit = self._settings_edit[:-1]
+                return
+            self._commit_setting_edit()
+            # Esc left the textbox, not the page — a second Esc leaves the page
+            if key == KEY_ESC or key in (KEY_ENTER, KEY_ENTER2, KEY_LEFT, KEY_RIGHT):
+                return
+            # Up/Down fall through: committing and moving on is one gesture
+        elif key.isdigit() and self._begin_setting_edit(key):
+            return
+
         # ← is the value-decrease key here (the universal settings idiom), so
         # Esc — or the "c" that opened the page — is what goes back
         if key == KEY_ESC or key == "c":
@@ -2445,6 +2668,11 @@ class HeadlessTidalPlayer:
             return
         if key in ("o", "O"):
             self._logout_pending = True
+            return
+        # Clearing the cache is an action, not a value, so it lives outside
+        # SETTINGS_SPEC as a keybinding — the same reason logout does
+        if key in ("x", "X"):
+            self._clear_cache_pending = True
             return
         if key == KEY_UP:
             self._settings_cursor = max(0, self._settings_cursor - 1)

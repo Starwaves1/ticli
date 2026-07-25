@@ -39,10 +39,9 @@ logger = logging.getLogger(__name__)
 
 CACHE_VERSION = 1
 
-# Cache modes, cheapest first. Rows in SETTINGS_SPEC; meaning enforced here.
-MODE_OFF = "OFF"
-MODE_METADATA = "METADATA"
-MODE_FULL = "FULL"
+# The budget is a whole number of gigabytes on the settings page and bytes
+# everywhere below it. Read at call time, so a test can shrink a gigabyte.
+BYTES_PER_GB = 1024 ** 3
 
 # Beyond this an entry is treated as absent. Only reachable by being offline
 # (or not opening a playlist) for a month — every visit rewrites the entry.
@@ -50,6 +49,42 @@ MAX_AGE_SECONDS = 30 * 24 * 3600
 
 # Index keys. Flat strings so the file stays greppable by hand.
 KEY_PLAYLISTS = "playlists"
+
+# What ticli itself writes into the audio directory: "{track_id}{ext}" once a
+# track is whole, "{track_id}{ext}.part" while it is still arriving. Every
+# extension AudioPlayer can produce is here (player._audio_extension owns that
+# list; test_cache pins the two together). The rule matters because deleting
+# cached songs deletes an explicit list of files ticli owns — the cache
+# directory is a shared place, and anything else in it is somebody else's.
+AUDIO_EXTENSIONS = (".m4a", ".mp3", ".aac", ".flac", ".ogg", ".wav")
+
+
+def is_owned_audio(name: str) -> bool:
+    """Whether a filename is one ticli wrote."""
+    stem = name[:-len(".part")] if name.endswith(".part") else name
+    root, ext = os.path.splitext(stem)
+    return bool(root) and root.isdigit() and ext.lower() in AUDIO_EXTENSIONS
+
+
+def owned_audio_files() -> list:
+    """Every cached track (and half-written track) ticli owns, by exact path.
+
+    Built by name, never by wiping the directory: a file in there that ticli
+    did not create must survive anything this module does.
+    """
+    files = []
+    try:
+        entries = list(audio_dir().iterdir())
+    except OSError:
+        return files
+    for path in entries:
+        try:
+            # A path that has become a directory is not a track ticli wrote
+            if is_owned_audio(path.name) and path.is_file():
+                files.append(path)
+        except OSError:
+            continue
+    return files
 
 
 def _default_cache_dir() -> Path:
@@ -169,20 +204,29 @@ class MetadataCache:
     can never see a half-written dict.
     """
 
-    def __init__(self, mode: str = MODE_METADATA, budget_mb: int = 1024):
-        self.mode = mode
-        self.budget_mb = budget_mb
+    def __init__(self, metadata: bool = True, songs: bool = True, budget_gb: int = 2):
+        # Two independent switches, not one ladder: keeping lists on disk and
+        # keeping tracks on disk are different sizes of promise
+        self.metadata = metadata
+        self.songs = songs
+        self.budget_gb = budget_gb
         self._index = None  # loaded from disk on first use
+        self._audio_count = None  # counted on demand, remembered until it moves
 
     # ── plumbing ──
 
     @property
     def enabled(self) -> bool:
-        return self.mode != MODE_OFF
+        """Whether the metadata index may be read or written."""
+        return bool(self.metadata)
 
     @property
     def keeps_audio(self) -> bool:
-        return self.mode == MODE_FULL
+        return bool(self.songs)
+
+    @property
+    def budget_bytes(self) -> int:
+        return max(0, int(self.budget_gb)) * BYTES_PER_GB
 
     def _load(self) -> dict:
         """Read the index. Missing, corrupt or from a future version → empty,
@@ -249,19 +293,68 @@ class MetadataCache:
 
     def clear(self) -> None:
         """Drop everything — the metadata index and any cached audio."""
+        self.clear_metadata()
+        self.clear_audio()
+
+    def clear_metadata(self) -> None:
+        """Forget the index. Turning metadata caching off has to mean the disk
+        is empty, not just unread."""
         self._index = {}
         try:
             index_file().unlink()
         except OSError:
             pass
-        try:
-            for entry in audio_dir().iterdir():
-                try:
-                    entry.unlink()
-                except OSError:
-                    pass
-        except OSError:
-            pass
+
+    def clear_audio(self) -> tuple:
+        """Delete the cached tracks, by exact path, one at a time.
+
+        Clearing the cache clears it: nothing is skipped for being in use.
+        On POSIX, unlinking a file another process has open succeeds and that
+        process keeps its descriptor, so the track playing from a file that
+        has just been deleted plays on to its end (verified with mpv). If the
+        player does re-open it — the race where it had not opened it yet — it
+        exits at once and AudioPlayer.source_vanished / _monitor_playback
+        restart the track from the network where it left off. Windows is
+        stricter: a file open without delete-sharing raises instead, and that
+        file is reported as kept rather than silently forgotten.
+
+        Never a directory wipe: the list is the files ticli wrote (see
+        owned_audio_files), so an unrelated file sharing the directory is
+        left alone. Anything that can't be removed — already gone, no
+        permission, turned into a directory — is skipped rather than aborting
+        the rest, and the count is recomputed from what is really left.
+        Returns (deleted, kept).
+        """
+        removed = kept = 0
+        for path in owned_audio_files():
+            try:
+                path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass  # already gone is the state we wanted
+            except OSError as e:
+                logger.debug("Could not delete cached track %s: %s", path, e)
+                kept += 1
+        self._audio_count = None  # recount from disk, not from intent
+        return removed, kept
+
+    # ── how much is on disk ──
+
+    def audio_count(self) -> int:
+        """How many whole tracks are cached.
+
+        Counted once and remembered: the settings page repaints far more often
+        than the directory changes, and everything that can change it says so
+        (see invalidate_audio_count). Half-written ".part" files aren't songs.
+        """
+        if self._audio_count is None:
+            self._audio_count = sum(
+                1 for p in owned_audio_files() if p.suffix != ".part")
+        return self._audio_count
+
+    def invalidate_audio_count(self) -> None:
+        """Something added to or removed from the audio directory."""
+        self._audio_count = None
 
     # ── typed access ──
 
@@ -318,20 +411,19 @@ class MetadataCache:
         Called after every write, so nothing schedules a sweep — being over
         budget is an event, not a state to poll for.
         """
-        budget = max(0, int(self.budget_mb)) * 1024 * 1024
+        budget = self.budget_bytes
         freed = 0
 
+        # Only ticli's own files are ever evicted — the budget is about what
+        # ticli put there, and a stranger's file in the same directory is not
+        # ours to reclaim
         files = []
-        try:
-            for entry in audio_dir().iterdir():
-                try:
-                    stat = entry.stat()
-                except OSError:
-                    continue
-                if entry.is_file():
-                    files.append((stat.st_atime, stat.st_size, entry))
-        except OSError:
-            pass
+        for entry in owned_audio_files():
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            files.append((stat.st_atime, stat.st_size, entry))
         files.sort()
 
         total = self.total_bytes()
@@ -344,6 +436,7 @@ class MetadataCache:
                 continue
             total -= size
             freed += size
+            self._audio_count = None  # a song just left the directory
 
         if total <= budget:
             return freed

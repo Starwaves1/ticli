@@ -53,10 +53,27 @@ paint from it instantly, but it never answers alone: every read is paired
 with the live fetch, which replaces what was shown one round trip later.
 Cached rows are `CachedTrack` / `CachedPlaylist` records, not tidalapi
 objects; anything that needs the real thing resolves through the session
-first. The `cache_mode` / `cache_budget_mb` settings size it, and eviction
-runs after writes — never on a timer.
+first. Two independent settings gate it — `cache_metadata` (the index) and
+`cache_songs` (whole tracks) — and `cache_budget_gb` sizes it in whole
+gigabytes; eviction runs after writes, never on a timer. Disabling and
+clearing are separate: turning `cache_songs` off asks `Clear cached
+songs as well?` (y clear, n keep them, Esc cancel) and touches neither
+the setting nor the disk until that is answered. Clearing is also its
+own action — `[x]` on the settings page, a keybinding outside
+`SETTINGS_SPEC` for the same reason logout is, with its own
+confirmation. A clear really clears: files in use are unlinked too. On
+POSIX the playing process keeps its descriptor and plays on (verified
+with mpv); if it had not opened the file yet it exits at once and
+`AudioPlayer.source_vanished` + `_monitor_playback` restart the track
+from the network where it left off (`_track_has_time_left` keeps that
+from firing on a track that had already finished). On Windows a file
+open without delete-sharing cannot be unlinked; those are counted and
+reported in the toast rather than passed over silently. Deletion and
+eviction only ever unlink files ticli itself wrote (`is_owned_audio` /
+`owned_audio_files`: `{track_id}{ext}` and `.part`) — never the
+directory — so anything else living there survives.
 
-FULL mode also keeps the audio. TIDAL serves a track as one contiguous,
+`cache_songs` also keeps the audio. TIDAL serves a track as one contiguous,
 unencrypted HTTP file, so `AudioPlayer._start_download` fetches it with a
 plain `requests` GET on a daemon thread while the player streams the same
 URL — no ffmpeg, and identical on mpv and ffplay because the download no

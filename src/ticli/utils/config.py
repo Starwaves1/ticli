@@ -18,7 +18,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 CONFIG_DIR = Path.home() / ".config" / "ticli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -45,15 +45,18 @@ QUALITY_MEANINGS = {
 # same stream. Applied once, on load; the next save stamps version 2.
 QUALITY_V1_RENAMES = {"LOW": "HIGH", "HIGH": "LOSSLESS"}
 
-# What each cache tier actually stores. Worth spelling out: only one of them
-# can reach the gigabyte budget. FULL fetches the track itself over plain HTTP
-# alongside playback, so it is the same on mpv and ffplay — nothing about it
-# depends on which player is running.
-CACHE_MODE_MEANINGS = {
-    "OFF": "nothing on disk, every list waits on the network",
-    "METADATA": "playlists and track lists, a few MB",
-    "FULL": "metadata plus every track you play, up to the budget",
+# v2 kept one three-way cache setting; v3 splits it into the two independent
+# things it was always describing — an index of your lists, and the tracks
+# themselves. FULL meant both, METADATA meant lists only, OFF meant neither.
+CACHE_MODE_V2_SPLIT = {
+    "OFF": (False, False),
+    "METADATA": (True, False),
+    "FULL": (True, True),
 }
+
+# The budget was in MB until v3 and is in whole GB now. Only the unit the user
+# types changed — cache.py still does its arithmetic in bytes.
+BYTES_PER_GB = 1024 ** 3
 
 SETTINGS_SPEC: list[dict] = [
     {
@@ -91,28 +94,35 @@ SETTINGS_SPEC: list[dict] = [
         "kind": "int",
         "default": 100,
         "min": 0,
-        "max": 100,
+        "max": 250,
         "step": 5,
+        "unit": "%",
         "desc": "Playback volume. Instant on mpv; ffplay takes it from the next track.",
     },
     {
-        "key": "cache_mode",
-        "label": "Cache",
-        "kind": "choice",
-        "default": "METADATA",
-        "choices": ["OFF", "METADATA", "FULL"],
-        "value_desc": CACHE_MODE_MEANINGS,
-        "desc": "What Ticli keeps on disk. Metadata is what makes playlists open instantly.",
+        "key": "cache_metadata",
+        "label": "Cache metadata",
+        "kind": "bool",
+        "default": True,
+        "desc": "Keep playlists and track lists on disk. This is what makes lists open instantly.",
     },
     {
-        "key": "cache_budget_mb",
+        "key": "cache_songs",
+        "label": "Cache songs",
+        "kind": "bool",
+        "default": True,
+        "desc": "Keep every track you play on disk, so playing it again never touches the network.",
+    },
+    {
+        "key": "cache_budget_gb",
         "label": "Cache budget",
         "kind": "int",
-        "default": 1024,
+        "default": 2,
         "min": 0,
-        "max": 8192,
-        "step": 256,
-        "desc": "Disk the cache may use, in MB. Over budget, the least recently used files go first.",
+        "max": 64,
+        "step": 1,
+        "unit": "GB",
+        "desc": "Disk the cache may use, in GB. Over budget, the least recently used files go first.",
     },
 ]
 
@@ -136,6 +146,15 @@ def coerce(spec: dict, value):
             return spec["default"]
         upper = value.upper()
         return upper if upper in spec["choices"] else spec["default"]
+    if spec["kind"] == "bool":
+        if isinstance(value, bool):
+            return value
+        # A hand-edited config may say "true" / 0; anything else isn't an answer
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        if isinstance(value, int):
+            return bool(value)
+        return spec["default"]
     if spec["kind"] == "int":
         # bool is an int subclass — True/False are not meaningful sizes
         if isinstance(value, bool):
@@ -152,12 +171,24 @@ def cycle_value(spec: dict, value, step: int):
     """Value one step away, for the settings page: choices wrap around,
     numbers step by spec['step'] and stop at their bounds."""
     current = coerce(spec, value)
+    if spec["kind"] == "bool":
+        # Two values: either direction is the other one
+        return not current
     if spec["kind"] == "choice":
         index = spec["choices"].index(current)
         return spec["choices"][(index + step) % len(spec["choices"])]
     if spec["kind"] == "int":
         return coerce(spec, current + step * spec.get("step", 1))
     return current
+
+
+def display_value(spec: dict, value) -> str:
+    """How a value reads on the settings page: booleans as words, sizes with
+    the unit the user is actually typing in."""
+    if spec["kind"] == "bool":
+        return "On" if coerce(spec, value) else "Off"
+    unit = spec.get("unit", "")
+    return f"{value}{'' if unit == '%' else ' '}{unit}" if unit else str(value)
 
 
 def _migrate(cfg: dict) -> dict:
@@ -171,6 +202,23 @@ def _migrate(cfg: dict) -> dict:
         quality = cfg.get("quality")
         if isinstance(quality, str):
             cfg["quality"] = QUALITY_V1_RENAMES.get(quality.upper(), quality)
+    if version < 3:
+        # One cache choice became two booleans, and MB became GB. Both are
+        # written back into cfg — load_config reads the migrated dict, not the
+        # raw file, so what is set here is what the user ends up with.
+        mode = cfg.get("cache_mode")
+        if isinstance(mode, str):
+            metadata, songs = CACHE_MODE_V2_SPLIT.get(
+                mode.upper(), (True, True))
+            cfg["cache_metadata"] = metadata
+            cfg["cache_songs"] = songs
+        cfg.pop("cache_mode", None)
+        megabytes = cfg.pop("cache_budget_mb", None)
+        if isinstance(megabytes, (int, float)) and not isinstance(megabytes, bool):
+            # Round rather than truncate: a 1.5 GB budget becomes 2 GB, and any
+            # budget the user actually set stays at least 1 GB rather than 0
+            gigabytes = round(megabytes / 1024)
+            cfg["cache_budget_gb"] = gigabytes if gigabytes else (1 if megabytes > 0 else 0)
     cfg["version"] = CONFIG_VERSION
     return cfg
 

@@ -29,11 +29,24 @@ from ticli.utils.config import (
 class _FakeAudio:
     """Records volume changes the way a live AudioPlayer would receive them."""
 
-    def __init__(self):
+    player_cmd = "mpv"
+
+    def __init__(self, ceiling=None):
         self.volumes = []
+        self._ceiling = ceiling if ceiling is not None else player_mod.VOLUME_MAX
 
     def set_volume(self, value):
         self.volumes.append(value)
+
+    def volume_ceiling(self):
+        return self._ceiling
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path, monkeypatch):
+    """The settings page counts cached songs, so keep it off the real cache."""
+    from ticli.utils import cache as cache_mod
+    monkeypatch.setattr(cache_mod, "CACHE_DIR", tmp_path / "cache")
 
 
 @pytest.fixture
@@ -133,6 +146,92 @@ class TestMigration:
         assert load_config()["quality"] == "HIGH"
 
 
+class TestCacheMigrationV2:
+    """v2's single cache choice became two booleans, and its MB budget became
+    whole GB. Everything here goes through a written v2 file, because the bug
+    the v1 migration shipped with was invisible to a unit test of _migrate:
+    the value was computed and then thrown away by the loop that followed."""
+
+    def _v2(self, config_file, **extra):
+        config_file.write_text(json.dumps({"version": 2, **extra}))
+        return load_config()
+
+    def test_full_becomes_both_switches_on(self, config_file):
+        cfg = self._v2(config_file, cache_mode="FULL")
+        assert cfg["cache_metadata"] is True
+        assert cfg["cache_songs"] is True
+
+    def test_metadata_becomes_lists_only(self, config_file):
+        cfg = self._v2(config_file, cache_mode="METADATA")
+        assert cfg["cache_metadata"] is True
+        assert cfg["cache_songs"] is False
+
+    def test_off_becomes_both_switches_off(self, config_file):
+        cfg = self._v2(config_file, cache_mode="OFF")
+        assert cfg["cache_metadata"] is False
+        assert cfg["cache_songs"] is False
+
+    def test_the_old_key_is_gone_after_a_save(self, config_file):
+        self._v2(config_file, cache_mode="METADATA")
+        save_config(load_config())
+        saved = json.loads(config_file.read_text())
+        assert "cache_mode" not in saved and "cache_budget_mb" not in saved
+        assert saved["version"] == 3
+
+    def test_the_budget_becomes_whole_gigabytes(self, config_file):
+        assert self._v2(config_file, cache_budget_mb=1536)["cache_budget_gb"] == 2
+        assert self._v2(config_file, cache_budget_mb=4096)["cache_budget_gb"] == 4
+
+    def test_a_small_budget_rounds_up_rather_than_to_nothing(self, config_file):
+        """Truncating 200 MB to 0 GB would silently turn the cache off."""
+        assert self._v2(config_file, cache_budget_mb=200)["cache_budget_gb"] == 1
+
+    def test_a_zero_budget_stays_zero(self, config_file):
+        assert self._v2(config_file, cache_budget_mb=0)["cache_budget_gb"] == 0
+
+    def test_a_junk_budget_falls_back_to_the_default(self, config_file):
+        cfg = self._v2(config_file, cache_budget_mb="lots")
+        assert cfg["cache_budget_gb"] == DEFAULTS["cache_budget_gb"]
+
+    def test_migration_is_idempotent(self, config_file):
+        self._v2(config_file, cache_mode="METADATA", cache_budget_mb=1536)
+        save_config(load_config())
+        cfg = load_config()
+        assert (cfg["cache_metadata"], cfg["cache_songs"], cfg["cache_budget_gb"]) == (
+            True, False, 2)
+
+    def test_a_v1_file_gets_both_migrations(self, config_file):
+        config_file.write_text(json.dumps(
+            {"version": 1, "quality": "LOW", "cache_mode": "FULL", "cache_budget_mb": 512}))
+        cfg = load_config()
+        assert cfg["quality"] == "HIGH"  # v1 rename still applies
+        assert cfg["cache_songs"] is True
+        assert cfg["cache_budget_gb"] == 1
+
+
+class TestBooleanSettings:
+    def test_a_bool_row_takes_only_real_booleans(self):
+        spec = get_spec("cache_songs")
+        assert coerce(spec, False) is False
+        assert coerce(spec, "true") is True
+        assert coerce(spec, 0) is False
+        assert coerce(spec, "maybe") is spec["default"]
+
+    def test_either_direction_toggles(self):
+        spec = get_spec("cache_metadata")
+        assert cycle_value(spec, True, 1) is False
+        assert cycle_value(spec, True, -1) is False
+        assert cycle_value(spec, False, 1) is True
+
+    def test_a_bool_reads_as_a_word(self):
+        assert config_mod.display_value(get_spec("cache_songs"), True) == "On"
+        assert config_mod.display_value(get_spec("cache_songs"), False) == "Off"
+
+    def test_sizes_carry_their_unit(self):
+        assert config_mod.display_value(get_spec("cache_budget_gb"), 2) == "2 GB"
+        assert config_mod.display_value(get_spec("volume"), 150) == "150%"
+
+
 class TestQualityTiers:
     """The player's map is the only place setting names meet tidalapi."""
 
@@ -207,7 +306,7 @@ class TestCoerce:
     def test_volume_clamped_to_bounds(self):
         spec = get_spec("volume")
         assert coerce(spec, -20) == 0
-        assert coerce(spec, 300) == 100
+        assert coerce(spec, 300) == 250  # amplification tops out at 250%
         assert coerce(spec, 45) == 45
 
     def test_int_accepts_numeric_string(self):
@@ -263,7 +362,8 @@ class TestCycleValue:
         spec = get_spec("volume")
         assert cycle_value(spec, 100, -1) == 95
         assert cycle_value(spec, 95, 1) == 100
-        assert cycle_value(spec, 100, 1) == 100
+        assert cycle_value(spec, 100, 1) == 105  # above unity is allowed now
+        assert cycle_value(spec, 250, 1) == 250
         assert cycle_value(spec, 0, -1) == 0
 
 
@@ -371,6 +471,205 @@ class TestSettingsKeyHandler:
         assert "Settings" in text
         for spec in SETTINGS_SPEC:
             assert spec["label"] in text
+
+
+def _row(key):
+    return [spec["key"] for spec in SETTINGS_SPEC].index(key)
+
+
+class TestNumericEntry:
+    """Typing a number into a row. Leaving the box is what saves it — there
+    is no separate confirm step, so every way out means the same thing."""
+
+    def _player(self, key="page_size"):
+        p = HeadlessTidalPlayer()
+        p._mode = p.MODE_SETTINGS
+        p._settings_cursor = _row(key)
+        return p
+
+    def _type(self, p, keys):
+        for key in keys:
+            p._handle_settings_key(key)
+
+    def test_a_digit_starts_typing_instead_of_navigating(self, config_file):
+        p = self._player()
+        self._type(p, "2")
+        assert p._settings_edit == "2"
+        assert p.config["page_size"] == 15, "nothing is written until you leave"
+
+    def test_digits_append_and_enter_saves(self, config_file):
+        p = self._player()
+        self._type(p, "22")
+        p._handle_settings_key(player_mod.KEY_ENTER)
+        assert p._settings_edit is None
+        assert p.config["page_size"] == 22
+        assert json.loads(config_file.read_text())["page_size"] == 22
+
+    def test_backspace_deletes(self, config_file):
+        p = self._player()
+        self._type(p, "39")
+        p._handle_settings_key(player_mod.KEY_BACKSPACE)
+        self._type(p, "0")
+        p._handle_settings_key(player_mod.KEY_ENTER)
+        assert p.config["page_size"] == 30
+
+    def test_esc_saves_and_stays_on_the_page(self, config_file):
+        """The spec says leaving the textbox saves. Esc is leaving the box,
+        not the page — a second Esc is what goes back."""
+        p = self._player()
+        self._type(p, "20")
+        p._handle_settings_key(player_mod.KEY_ESC)
+        assert p.config["page_size"] == 20
+        assert p._mode == p.MODE_SETTINGS
+
+        p._handle_settings_key(player_mod.KEY_ESC)
+        assert p._mode == p.MODE_PLAYER
+
+    def test_arrowing_away_saves_and_moves(self, config_file):
+        p = self._player()
+        self._type(p, "20")
+        p._handle_settings_key(player_mod.KEY_DOWN)
+        assert p.config["page_size"] == 20
+        assert p._settings_cursor == _row("progress_bar_width")
+
+    def test_out_of_range_clamps_to_the_bound(self, config_file):
+        p = self._player()
+        self._type(p, "999")
+        p._handle_settings_key(player_mod.KEY_ENTER)
+        assert p.config["page_size"] == get_spec("page_size")["max"]
+
+    def test_below_range_clamps_to_the_bound(self, config_file):
+        p = self._player()
+        self._type(p, "1")
+        p._handle_settings_key(player_mod.KEY_ENTER)
+        assert p.config["page_size"] == get_spec("page_size")["min"]
+
+    def test_an_empty_box_reverts_rather_than_writing_zero(self, config_file):
+        p = self._player()
+        self._type(p, "2")
+        p._handle_settings_key(player_mod.KEY_BACKSPACE)
+        assert p._settings_edit == ""
+        p._handle_settings_key(player_mod.KEY_ENTER)
+        assert p.config["page_size"] == 15
+        assert not config_file.exists(), "an empty entry must not write anything"
+
+    def test_a_digit_on_a_choice_row_is_ignored(self, config_file):
+        p = self._player("quality")
+        self._type(p, "3")
+        assert p._settings_edit is None
+        assert p.config["quality"] == "LOSSLESS"
+
+    def test_arrows_still_step_when_not_typing(self, config_file):
+        p = self._player()
+        p._handle_settings_key(player_mod.KEY_RIGHT)
+        assert p.config["page_size"] == 16
+        p._handle_settings_key(player_mod.KEY_LEFT)
+        assert p.config["page_size"] == 15
+
+    def test_the_screen_shows_that_you_are_typing(self, config_file):
+        p = self._player()
+        self._type(p, "2")
+        text = p._build_settings_display().plain
+        assert "‹ 2▏›" in text
+        assert "Typing a number" in text
+
+    def test_the_budget_is_typed_in_gigabytes(self, config_file):
+        p = self._player("cache_budget_gb")
+        self._type(p, "5")
+        p._handle_settings_key(player_mod.KEY_ENTER)
+        assert p.config["cache_budget_gb"] == 5
+        assert p._cache.budget_gb == 5
+        assert p._cache.budget_bytes == 5 * 1024 ** 3
+
+
+class TestVolumeAboveUnity:
+    def _player(self, audio=None):
+        p = HeadlessTidalPlayer()
+        p._mode = p.MODE_SETTINGS
+        p._settings_cursor = _row("volume")
+        p.audio = audio
+        return p
+
+    def test_mpv_may_be_taken_to_250(self, config_file):
+        p = self._player(_FakeAudio())
+        for _ in range(40):
+            p._handle_settings_key(player_mod.KEY_RIGHT)
+        assert p.config["volume"] == 250
+        assert p.audio.volumes[-1] == 250
+
+    def test_ffplay_is_capped_at_what_it_can_do(self, config_file):
+        """ffplay's -volume is 0=min 100=max and it says so on stderr, so the
+        row must stop there rather than pretend."""
+        audio = _FakeAudio(ceiling=100)
+        audio.player_cmd = "ffplay"
+        p = self._player(audio)
+        for _ in range(40):
+            p._handle_settings_key(player_mod.KEY_RIGHT)
+        assert p.config["volume"] == 100
+
+    def test_typing_a_number_respects_the_backend_ceiling(self, config_file):
+        audio = _FakeAudio(ceiling=100)
+        audio.player_cmd = "ffplay"
+        p = self._player(audio)
+        for digit in "250":
+            p._handle_settings_key(digit)
+        p._handle_settings_key(player_mod.KEY_ENTER)
+        assert p.config["volume"] == 100
+
+    def test_the_value_reads_as_a_percentage(self, config_file):
+        p = self._player(_FakeAudio())
+        assert "100%" in p._build_settings_display().plain
+
+    def test_the_caution_starts_at_105(self, config_file):
+        p = self._player(_FakeAudio())
+        p.config["volume"] = 100
+        assert "quality suffers" not in p._build_settings_display().plain
+        p.config["volume"] = 105
+        assert "quality suffers" in p._build_settings_display().plain
+
+    def test_the_caution_is_blue_not_dim(self, config_file):
+        """Deliberately louder than the page's dim idiom — the owner asked for
+        it to be noticed."""
+        p = self._player(_FakeAudio())
+        p.config["volume"] = 150
+        rendered = p._build_settings_display()
+        styles = {str(span.style) for span in rendered.spans
+                  if "quality suffers" in rendered.plain[span.start:span.end]}
+        assert styles == {"blue"}
+
+    def test_ffplay_says_it_caps(self, config_file):
+        audio = _FakeAudio(ceiling=100)
+        audio.player_cmd = "ffplay"
+        p = self._player(audio)
+        assert "ffplay caps at 100%" in p._build_settings_display().plain
+
+    def test_ffplay_is_never_handed_more_than_it_takes(self):
+        from ticli.player import AudioPlayer
+        assert AudioPlayer("ffplay", volume=250)._ffplay_volume() == 100
+        assert AudioPlayer("ffplay", volume=80)._ffplay_volume() == 80
+        assert AudioPlayer("mpv", volume=250).volume_ceiling() == 250
+        assert AudioPlayer("ffplay", volume=250).volume_ceiling() == 100
+
+    def test_mpv_is_spawned_with_a_ceiling_it_can_reach(self, monkeypatch):
+        """mpv refuses a volume above --volume-max, whose default (130) is
+        below what the setting allows."""
+        from ticli.player import AudioPlayer
+
+        spawned = {}
+
+        class _Proc:
+            def __init__(self, cmd, **kw):
+                spawned["cmd"] = cmd
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(player_mod.subprocess, "Popen", _Proc)
+        audio = AudioPlayer("mpv", volume=250)
+        monkeypatch.setattr(audio, "_start_download", lambda *a: None)
+        audio.play_url("https://cdn.example/t.mp4")
+        assert f"--volume-max={player_mod.VOLUME_MAX}" in spawned["cmd"]
+        assert "--volume=250" in spawned["cmd"]
 
 
 class TestConfiguredValuesUsed:
