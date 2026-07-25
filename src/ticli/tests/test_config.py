@@ -643,6 +643,10 @@ class TestVolumeAboveUnity:
         p = self._player(audio)
         assert "ffplay caps at 100%" in p._build_settings_display().plain
 
+    def test_mpv_says_nothing_because_it_caps_at_nothing(self, config_file):
+        p = self._player(_FakeAudio())
+        assert "caps at" not in p._build_settings_display().plain
+
     def test_ffplay_is_never_handed_more_than_it_takes(self):
         from ticli.player import AudioPlayer
         assert AudioPlayer("ffplay", volume=250)._ffplay_volume() == 100
@@ -670,6 +674,162 @@ class TestVolumeAboveUnity:
         audio.play_url("https://cdn.example/t.mp4")
         assert f"--volume-max={player_mod.VOLUME_MAX}" in spawned["cmd"]
         assert "--volume=250" in spawned["cmd"]
+
+
+class TestVolumeCeilingIsDurable:
+    """The volume and the backend are chosen independently — the setting is
+    saved on one run and the backend is discovered on the next. These are the
+    ways the two can disagree."""
+
+    def _player(self, audio=None):
+        p = HeadlessTidalPlayer()
+        p._mode = p.MODE_SETTINGS
+        p._settings_cursor = _row("volume")
+        p.audio = audio
+        return p
+
+    def test_the_ceiling_comes_from_the_running_backend_not_the_platform(self, monkeypatch):
+        """Same mpv, same answer, whichever OS it is running on — nothing here
+        predicts a platform, so Linux and macOS need no separate branch."""
+        from ticli.player import AudioPlayer
+        for platform in ("darwin", "linux", "win32"):
+            monkeypatch.setattr(player_mod.sys, "platform", platform)
+            assert AudioPlayer("mpv", volume=100).volume_ceiling() == 250, platform
+            assert AudioPlayer("ffplay", volume=100).volume_ceiling() == 100, platform
+
+    def test_an_unknown_backend_gets_unity_not_the_higher_number(self):
+        """A backend added later, or a mangled player_cmd: guessing high would
+        apply a volume the backend then quietly reinterprets."""
+        from ticli.player import AudioPlayer
+        assert AudioPlayer("vlc", volume=250).volume_ceiling() == 100
+        assert AudioPlayer("", volume=250).volume_ceiling() == 100
+
+    @pytest.mark.parametrize("answer", [
+        RuntimeError("no idea"),   # raised
+        None,                      # not a number
+        "loud",                    # not a number either
+    ])
+    def test_a_backend_that_cannot_answer_gets_unity(self, answer, config_file):
+        """Durability over cleverness — a ceiling that can't be established is
+        not a licence to amplify, and a settings row is never worth a crash."""
+        class _Broken:
+            player_cmd = "mpv"
+
+            def volume_ceiling(self):
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+
+            def set_volume(self, value):
+                pass
+
+        p = self._player(_Broken())
+        assert p._setting_ceiling(get_spec("volume")) == 100
+        assert "100%" in p._build_settings_display().plain
+
+    def test_a_backend_with_no_ceiling_method_at_all_gets_unity(self, config_file):
+        p = self._player(type("_Old", (), {"player_cmd": "mpv"})())
+        assert p._setting_ceiling(get_spec("volume")) == 100
+
+    def test_no_backend_yet_means_unity(self, config_file):
+        p = self._player(None)
+        assert p._setting_ceiling(get_spec("volume")) == 100
+
+    def test_a_saved_250_is_clamped_when_only_ffplay_is_there(self, config_file):
+        """The config was written next to mpv. mpv is gone. Neither fail nor
+        send 250 — come back at 100, on screen and in the file."""
+        save_config({**DEFAULTS, "volume": 250})
+        audio = _FakeAudio(ceiling=100)
+        audio.player_cmd = "ffplay"
+        p = self._player(audio)
+        assert p.config["volume"] == 250, "it is still what the file says"
+
+        p._clamp_volume_to_backend()
+
+        assert p.config["volume"] == 100
+        assert audio.volumes == [100], "the backend is told the clamped value"
+        assert json.loads(config_file.read_text())["volume"] == 100
+        assert "100%" in p._build_settings_display().plain
+
+    def test_the_clamp_leaves_a_reachable_value_alone(self, config_file):
+        save_config({**DEFAULTS, "volume": 250})
+        p = self._player(_FakeAudio())  # mpv
+
+        p._clamp_volume_to_backend()
+
+        assert p.config["volume"] == 250
+        assert p.audio.volumes == [250]
+
+    def test_the_clamp_repairs_a_hand_edited_out_of_range_value(self, config_file):
+        config_file.write_text(json.dumps({"version": 3, "volume": 9000}))
+        p = self._player(_FakeAudio())
+        assert p.config["volume"] == 250, "load_config clamps to the spec max"
+
+        p._clamp_volume_to_backend()
+
+        assert p.config["volume"] == 250
+        assert p.audio.volumes == [250]
+
+    def test_run_clamps_before_anything_plays(self, config_file, monkeypatch):
+        """The whole point of doing it in run(): the backend is only known
+        there, and nothing must have been played at the stale volume yet."""
+        save_config({**DEFAULTS, "volume": 250})
+        monkeypatch.setattr(player_mod, "_find_audio_player", lambda: "ffplay")
+        p = HeadlessTidalPlayer()
+        monkeypatch.setattr(p, "_login", lambda: False)  # stop run() right after
+
+        p.run()
+
+        assert p.config["volume"] == 100
+        assert p.audio.volume == 100, "never handed the out-of-range value"
+        assert json.loads(config_file.read_text())["volume"] == 100
+
+    def test_switching_back_to_mpv_does_not_resurrect_the_old_value(self, config_file):
+        """Clamping is destructive on purpose: the file holds one number, and
+        it is the one that was really applied."""
+        save_config({**DEFAULTS, "volume": 250})
+        ffplay = _FakeAudio(ceiling=100)
+        ffplay.player_cmd = "ffplay"
+        p = self._player(ffplay)
+        p._clamp_volume_to_backend()
+
+        later = self._player(_FakeAudio())  # mpv is back next run
+        later._clamp_volume_to_backend()
+
+        assert later.config["volume"] == 100
+        assert later.audio.volumes == [100]
+
+    def test_the_two_blue_notes_can_never_appear_together(self, config_file):
+        """The caution needs >=105 and the cap note needs a backend that stops
+        at 100 — the clamp makes those mutually exclusive, which is what keeps
+        the row inside 80 columns."""
+        from rich.console import Console
+
+        for cmd, ceiling, volume in (("mpv", 250, 250), ("ffplay", 100, 250)):
+            audio = _FakeAudio(ceiling=ceiling)
+            audio.player_cmd = cmd
+            p = self._player(audio)
+            p.config["volume"] = volume
+            p._clamp_volume_to_backend()
+            rendered = p._build_settings_display().plain
+            assert not ("quality suffers" in rendered and "caps at" in rendered), cmd
+            console = Console(width=80)
+            with console.capture() as cap:
+                console.print(p._build_display())
+            assert all(len(line) <= 80 for line in cap.get().splitlines()), cmd
+
+    def test_the_row_never_shows_a_value_the_backend_cannot_reach(self, config_file):
+        audio = _FakeAudio(ceiling=100)
+        audio.player_cmd = "ffplay"
+        p = self._player(audio)
+        p._clamp_volume_to_backend()
+        for _ in range(40):
+            p._handle_settings_key(player_mod.KEY_RIGHT)
+        rendered = p._build_settings_display().plain
+        assert "100%" in rendered
+        assert "250%" not in rendered
+        assert "ffplay caps at 100%" in rendered
+        assert max(audio.volumes) == 100
 
 
 class TestConfiguredValuesUsed:

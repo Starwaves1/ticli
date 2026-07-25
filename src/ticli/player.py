@@ -69,7 +69,7 @@ from ticli.utils.config import (
     load_config,
     save_config,
 )
-from ticli.utils.cache import MetadataCache
+from ticli.utils.cache import MetadataCache, format_gb
 
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
@@ -84,6 +84,22 @@ IS_MACOS = sys.platform == "darwin"
 # 100=max and clips there — so ffplay is given 100 and the setting says so.
 VOLUME_MAX = get_spec("volume")["max"]
 FFPLAY_VOLUME_MAX = 100
+
+# Unity: no gain, every backend can do it, and it is what a track was mastered
+# at. The answer whenever the real ceiling can't be established — an unknown
+# backend, or none running yet — because guessing high would apply a volume the
+# backend then reinterprets, and the number on screen would be a lie.
+SAFE_VOLUME_CEILING = 100
+
+# The ceiling each backend can actually be driven to, by backend name. mpv
+# amplifies in software up to the --volume-max every spawn passes it; ffplay
+# clips at 100. Keyed by name rather than branched on so an unrecognised
+# backend has one obvious answer (SAFE_VOLUME_CEILING) instead of falling into
+# whichever branch happened to be the else.
+BACKEND_VOLUME_CEILINGS = {
+    "mpv": VOLUME_MAX,
+    "ffplay": FFPLAY_VOLUME_MAX,
+}
 
 # macOS media keys (keyboard, AirPods taps, Control Center): mpv registers with
 # MPRemoteCommandCenter and turns remote commands into these key names. We rebind
@@ -273,13 +289,17 @@ class AudioPlayer:
     def volume_ceiling(self) -> int:
         """The loudest this backend can actually be told to go.
 
-        Discovered from the backend rather than assumed: ffplay refuses
-        anything over 100 ("-volume=250 > 100, setting to 100", straight out
-        of ffplay.c), while mpv amplifies in software up to the --volume-max
-        every spawn passes it. The settings row clamps to this, so the number
-        on screen is always a number the user will actually hear.
+        Discovered from the running backend rather than assumed per platform:
+        ffplay refuses anything over 100 ("-volume=250 > 100, setting to 100",
+        straight out of ffplay.c), while mpv amplifies in software up to the
+        --volume-max every spawn passes it. mpv-on-Linux and mpv-on-macOS are
+        the same answer, so nothing here has to predict an OS.
+
+        Anything unrecognised — a backend added later, a mangled player_cmd —
+        gets unity, never the higher number: a ceiling guessed too high shows
+        the user a volume they will not hear.
         """
-        return VOLUME_MAX if self.player_cmd == "mpv" else FFPLAY_VOLUME_MAX
+        return BACKEND_VOLUME_CEILINGS.get(self.player_cmd, SAFE_VOLUME_CEILING)
 
     def _ffplay_volume(self) -> int:
         """What ffplay can be told. Its -volume is 0=min 100=max and clips
@@ -1676,8 +1696,11 @@ class HeadlessTidalPlayer:
                 # finished master, and that is a thing to notice, not to skim
                 if not editing and int(value) >= 105:
                     content.append("  louder than the master — quality suffers", style="blue")
-                ceiling = self.audio.volume_ceiling() if self.audio else VOLUME_MAX
-                if ceiling < spec["max"]:
+                # The ceiling in effect, not the spec's — the row must never
+                # advertise a number this backend cannot reach. Named, so the
+                # limit reads as a fact about ffplay rather than a mystery
+                ceiling = self._setting_ceiling(spec)
+                if self.audio and ceiling < spec["max"]:
                     content.append(
                         f"  {self.audio.player_cmd} caps at {ceiling}%", style="blue")
 
@@ -1710,9 +1733,12 @@ class HeadlessTidalPlayer:
             )
         # Shown like logout, for the same reason: an action the page offers,
         # which the value table above has no way to express
+        # Bare gigabytes, not "x / y GB": the budget is its own row above and
+        # can be 0, which would read as a broken fraction down here
         songs = self._cache.audio_count()
         content.append(
-            f"\n\n   {songs} song{'' if songs == 1 else 's'} cached", style="dim")
+            f"\n\n   {songs} song{'' if songs == 1 else 's'} cached"
+            f" · {format_gb(self._cache.disk_bytes())}", style="dim")
         content.append("   [x]", style="bold")
         content.append(" clear cache", style="dim")
         # Account lives here rather than on the player screen — it's a thing you
@@ -2331,10 +2357,42 @@ class HeadlessTidalPlayer:
 
     def _setting_ceiling(self, spec: dict) -> int:
         """A row's usable maximum. Normally the spec's, except for volume,
-        where it is whatever the running backend can really reach."""
-        if spec["key"] == "volume" and self.audio:
-            return min(spec["max"], self.audio.volume_ceiling())
-        return spec["max"]
+        where it is whatever the running backend can really reach.
+
+        With no backend yet, unity — the value every backend can do. Erring
+        high here would let a config be saved that the audio player then
+        quietly reinterprets, which is the exact drift this exists to stop.
+        """
+        if spec["key"] != "volume":
+            return spec["max"]
+        if not self.audio:
+            return min(spec["max"], SAFE_VOLUME_CEILING)
+        try:
+            ceiling = int(self.audio.volume_ceiling())
+        except Exception:
+            # For any reason at all: a backend that can't answer is not a
+            # licence to amplify, and a settings row is never worth a crash
+            ceiling = SAFE_VOLUME_CEILING
+        return max(spec["min"], min(spec["max"], ceiling))
+
+    def _clamp_volume_to_backend(self):
+        """Bring the saved volume inside what the running backend can do.
+
+        Called once the backend is known, because the two are chosen
+        independently: a config written while mpv was installed is read on the
+        next run whether or not mpv is still there. The clamp is written back
+        to disk as well as applied, so the number on the settings page, the
+        number in the file and the number the user hears are one number.
+        """
+        spec = get_spec("volume")
+        ceiling = self._setting_ceiling(spec)
+        wanted = coerce(spec, self.config.get("volume", spec["default"]))
+        allowed = min(wanted, ceiling)
+        if allowed != self.config.get("volume"):
+            self.config["volume"] = allowed
+            save_config(self.config)
+        if self.audio:
+            self.audio.set_volume(allowed)
 
     def _set_setting(self, spec: dict, value):
         """Write one setting: apply it live, then persist it."""
@@ -2748,6 +2806,9 @@ class HeadlessTidalPlayer:
             self.console.print("[red]No audio player found. Install mpv or ffplay.[/red]")
             return
         self.audio = AudioPlayer(player_cmd, volume=self.config["volume"], cache=self._cache)
+        # The backend is only known now, and the saved volume may predate it —
+        # 250% written next to mpv, read on a machine that only has ffplay
+        self._clamp_volume_to_backend()
 
         # Login
         if not self._login():

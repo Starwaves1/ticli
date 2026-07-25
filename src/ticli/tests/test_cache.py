@@ -1033,7 +1033,8 @@ class TestClearCacheAction:
         self._song()
         p._cache.invalidate_audio_count()
         rendered = p._build_settings_display().plain
-        assert "1 song cached   [x] clear cache" in rendered  # like "[o] log out"
+        # like "[o] log out", with what the cache is actually costing
+        assert "1 song cached · 0.000 GB   [x] clear cache" in rendered
 
     def test_the_footer_still_fits_eighty_columns(self):
         """The settings footer is already exactly as wide as the panel allows,
@@ -1128,6 +1129,101 @@ class TestClearCacheAction:
         before = (p._mode, p._mini_player, p._show_more, p._quit_pending)
         p._handle_player_key("x")
         assert (p._mode, p._mini_player, p._show_more, p._quit_pending) == before
+
+
+class TestDiskUsageOnScreen:
+    """The song count answers "how many"; the byte total answers "how much" —
+    the question the budget row above it is about."""
+
+    def _settings(self):
+        p = _player()
+        p._mode = p.MODE_SETTINGS
+        return p
+
+    def _song(self, name="12.m4a", size=32):
+        path = cache_mod.audio_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        f = path / name
+        f.write_bytes(b"x" * size)
+        return f
+
+    def test_gigabytes_to_three_decimals(self):
+        gb = cache_mod.BYTES_PER_GB
+        assert cache_mod.format_gb(0) == "0.000 GB"
+        assert cache_mod.format_gb(45 * 1024 ** 2) == "0.044 GB"
+        assert cache_mod.format_gb(12 * gb + gb // 2) == "12.500 GB"
+        # Two decimals would round a handful of tracks away to nothing
+        assert cache_mod.format_gb(2 * 1024 ** 2) == "0.002 GB"
+
+    def test_an_empty_cache_reads_zero(self):
+        p = self._settings()
+        rendered = p._build_settings_display().plain
+        assert "0 songs cached · 0.000 GB" in rendered
+
+    def test_the_total_is_what_is_really_on_disk(self):
+        p = self._settings()
+        self._song("12.m4a", size=3 * 1024 ** 2)
+        self._song("13.m4a", size=1024 ** 2)
+        p._cache.invalidate_audio_count()
+        assert "2 songs cached · 0.004 GB" in p._build_settings_display().plain
+
+    def test_the_row_fits_eighty_columns_even_when_full(self, monkeypatch):
+        """A full cache reads longer than an empty one — 12.500 GB across a
+        four-figure song count is the widest this line can get."""
+        from rich.console import Console
+
+        p = self._settings()
+        monkeypatch.setattr(p._cache, "audio_count", lambda: 9999)
+        monkeypatch.setattr(
+            p._cache, "disk_bytes", lambda: 12 * cache_mod.BYTES_PER_GB + 1024 ** 3 // 2)
+        console = Console(width=80)
+        with console.capture() as cap:
+            console.print(p._build_display())
+        lines = cap.get().splitlines()
+        assert all(len(line) <= 80 for line in lines)
+        matched = [l for l in lines if "clear cache" in l]
+        assert matched, "the cache line is missing"
+        assert "9999 songs cached · 12.500 GB" in matched[0], "the row wrapped"
+
+    def test_it_is_measured_once_and_remembered(self, monkeypatch):
+        """No stat-per-frame: the settings page repaints on every keystroke."""
+        cache = MetadataCache()
+        calls = []
+        real = cache.total_bytes
+        monkeypatch.setattr(
+            cache, "total_bytes", lambda: (calls.append(1), real())[1])
+
+        assert cache.disk_bytes() == cache.disk_bytes() == cache.disk_bytes()
+        assert len(calls) == 1
+
+    def test_a_download_landing_moves_the_number(self):
+        p = self._settings()
+        assert "0.000 GB" in p._build_settings_display().plain
+        self._song("12.m4a", size=64 * 1024 ** 2)
+        p._cache.invalidate_audio_count()  # what AudioPlayer calls on a keep
+        assert "0.062 GB" in p._build_settings_display().plain
+
+    def test_clearing_the_cache_moves_the_number_back(self):
+        p = self._settings()
+        self._song("12.m4a", size=64 * 1024 ** 2)
+        p._cache.invalidate_audio_count()
+
+        p._handle_settings_key("x")
+        p._handle_key("y")
+
+        assert "0 songs cached · 0.000 GB" in p._build_settings_display().plain
+
+    def test_eviction_moves_the_number_back(self):
+        cache = MetadataCache(budget_gb=0)
+        d = cache_mod.audio_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "12.m4a").write_bytes(b"x" * (4 * 1024 ** 2))
+        assert cache.disk_bytes() > 0
+
+        cache.enforce_budget()
+
+        assert cache.disk_bytes() == 0
+        assert cache.audio_count() == 0
 
 
 class TestClearWhilePlaying:

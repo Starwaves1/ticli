@@ -182,6 +182,13 @@ def playlist_record(playlist, editable: bool) -> dict:
     }
 
 
+def format_gb(num_bytes: int) -> str:
+    """Bytes the way the settings page says them. Three decimals because two
+    would round a handful of tracks down to "0.00 GB" — the number is there to
+    show the cache filling up, so it has to move when a song lands."""
+    return f"{num_bytes / BYTES_PER_GB:.3f} GB"
+
+
 def _dir_size(path: Path) -> int:
     total = 0
     try:
@@ -211,7 +218,10 @@ class MetadataCache:
         self.songs = songs
         self.budget_gb = budget_gb
         self._index = None  # loaded from disk on first use
-        self._audio_count = None  # counted on demand, remembered until it moves
+        # Both measured on demand and remembered until something moves them —
+        # see audio_count / disk_bytes and invalidate_audio_count
+        self._audio_count = None
+        self._disk_bytes = None
 
     # ── plumbing ──
 
@@ -335,7 +345,7 @@ class MetadataCache:
             except OSError as e:
                 logger.debug("Could not delete cached track %s: %s", path, e)
                 kept += 1
-        self._audio_count = None  # recount from disk, not from intent
+        self.invalidate_audio_count()  # remeasure from disk, not from intent
         return removed, kept
 
     # ── how much is on disk ──
@@ -352,9 +362,22 @@ class MetadataCache:
                 1 for p in owned_audio_files() if p.suffix != ".part")
         return self._audio_count
 
+    def disk_bytes(self) -> int:
+        """What the cache is costing on disk, for the settings page.
+
+        The same sizing enforce_budget uses (total_bytes), just remembered:
+        the page repaints on every keystroke and stat-ing a full audio
+        directory each frame would be felt. Invalidated by the same events as
+        the song count, so the two can never disagree.
+        """
+        if self._disk_bytes is None:
+            self._disk_bytes = self.total_bytes()
+        return self._disk_bytes
+
     def invalidate_audio_count(self) -> None:
         """Something added to or removed from the audio directory."""
         self._audio_count = None
+        self._disk_bytes = None
 
     # ── typed access ──
 
@@ -413,6 +436,10 @@ class MetadataCache:
         """
         budget = self.budget_bytes
         freed = 0
+        # Every path that changes the size on disk — a write, an eviction, a
+        # clear — comes through here, so this is the one place the remembered
+        # total has to be dropped. Re-measured lazily on the next paint.
+        self._disk_bytes = None
 
         # Only ticli's own files are ever evicted — the budget is about what
         # ticli put there, and a stranger's file in the same directory is not

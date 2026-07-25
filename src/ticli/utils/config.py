@@ -94,6 +94,10 @@ SETTINGS_SPEC: list[dict] = [
         "kind": "int",
         "default": 100,
         "min": 0,
+        # The loudest any supported backend can go, not what the running one
+        # can: the real ceiling is discovered from the backend at runtime (see
+        # AudioPlayer.volume_ceiling) and clamped against on load and on edit,
+        # so a config written next to mpv is safe next to ffplay.
         "max": 250,
         "step": 5,
         "unit": "%",
