@@ -73,6 +73,7 @@ class _FakeSession:
     def __init__(self, playlists=None, latency=LATENCY):
         self.latency = latency
         self.audio_quality = None
+        self.is_pkce = False
         self.playlist_calls = 0
         self.list_calls = 0
         self._playlists = playlists if playlists is not None else [

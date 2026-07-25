@@ -39,6 +39,7 @@ class _FakeSession:
         self.calls = []
         self.caps = caps or {}
         self.audio_quality = None
+        self.is_pkce = False
 
     def search(self, query, models=None, limit=50, offset=0):
         self.calls.append({"query": query, "models": models, "limit": limit})

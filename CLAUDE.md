@@ -45,6 +45,42 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
   IPC (`keybind`) to write `user-data/ticli/media-key`, which `_monitor_playback` polls
   on its existing 0.5s tick. Gated on `IS_MACOS`; a silent no-op elsewhere and on ffplay.
 
+### Login flows and quality entitlement
+
+Two OAuth flows, and the difference is audible. The **device flow**
+(`login_oauth`, the default) is the smooth one — a code on your phone,
+nothing to paste back — but its TIDAL client is only entitled to AAC:
+it accepts a `LOSSLESS`/`HI_RES_LOSSLESS` request and grants `HIGH`,
+silently, with a byte-identical manifest. The **PKCE flow**
+(`pkce_login_url` → `pkce_get_auth_token` → `process_auth_token`, driven
+step by step rather than through tidalapi's `login_pkce()`, which
+`print()`s and `input()`s) uses the client tidalapi documents as "the
+only way how to get access to HiRes … FLAC files". It is opt-in: `[u]`
+on the settings page, or `--login-flow pkce` on a first run. The paste
+is unavoidable — the redirect URI is fixed to a tidal.com page in
+tidalapi's config and re-sent in the token exchange, so no localhost
+listener can stand in — and it has to work over SSH anyway, so the
+prompt also accepts a bare code. The TUI stands down for the duration
+(`_suspended_tui`): the one place the Live display is deliberately
+paused.
+
+Stored tokens record **which flow issued them** (`is_pkce`), because
+`Session.token_refresh` picks the client id/secret from that flag alone.
+A record that lost it refreshes against the wrong client and the session
+dies hours later, looking like a random logout. Records predating the
+flag are device-flow by construction, so migration is a defaulted read —
+nothing on disk is rewritten and nobody is logged out.
+
+Quality gating is evidence-based and costs no requests: `_stream_url`
+asks for the whole stream description (one request either way, and
+`get_url()` raises on a PKCE session), and `_note_granted_quality`
+remembers only a *downgrade* — being granted what you asked for says
+nothing about the tiers above it. Gated tiers stay listed and dimmed
+with the reason rather than hidden; when nothing has been observed,
+nothing is gated. A successful PKCE upgrade clears the ceiling, so the
+tiers re-open without a restart. Songs already cached keep their old
+quality — the upgrade toast says so and points at `[x]`.
+
 ### Caching
 
 `utils/cache.py` holds a metadata index (your playlists, and the tracks in
