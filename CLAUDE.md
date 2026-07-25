@@ -38,7 +38,7 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
 
 ### Audio Playback
 
-- ffplay: kills process on pause (instant silence), caches audio to local temp file, restarts from cache on resume
+- ffplay: kills process on pause (instant silence), restarts from the downloaded local copy on resume
 - mpv (if available): uses IPC socket for pause/resume
 - macOS media keys (mpv only): mpv registers with MPRemoteCommandCenter, so keyboard
   media keys / AirPods taps / Control Center reach it. Ticli rebinds those keys over
@@ -55,6 +55,17 @@ Cached rows are `CachedTrack` / `CachedPlaylist` records, not tidalapi
 objects; anything that needs the real thing resolves through the session
 first. The `cache_mode` / `cache_budget_mb` settings size it, and eviction
 runs after writes — never on a timer.
+
+FULL mode also keeps the audio. TIDAL serves a track as one contiguous,
+unencrypted HTTP file, so `AudioPlayer._start_download` fetches it with a
+plain `requests` GET on a daemon thread while the player streams the same
+URL — no ffmpeg, and identical on mpv and ffplay because the download no
+longer rides on the player process. The file is named `{track_id}{ext}`
+where the extension comes from the CDN's `Content-Type` (AAC-in-MP4 today,
+FLAC for a session entitled to it), written as `.part` and renamed only
+when whole, so a lookup by stem can never serve a partial file. A `stop()`
+bumps a generation counter, which is how an abandoned download knows to
+delete itself.
 
 ### Key Files
 

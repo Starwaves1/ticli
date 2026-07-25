@@ -8,11 +8,14 @@ directory: CACHE_DIR and the config file are both redirected to tmp_path.
 """
 
 import json
+import tempfile
+import threading
 import time
 import types
 
 import pytest
 
+from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
 from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
@@ -98,11 +101,99 @@ class _FakeSession:
 
 @pytest.fixture(autouse=True)
 def isolated_dirs(tmp_path, monkeypatch):
-    """Keep every player built here off the real config and cache directories."""
+    """Keep every player built here off the real config, cache and temp
+    directories — ffplay's scratch download lands in the last of those."""
     monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path / "config")
     monkeypatch.setattr(config_mod, "CONFIG_FILE", tmp_path / "config" / "config.json")
     monkeypatch.setattr(cache_mod, "CACHE_DIR", tmp_path / "cache")
+    (tmp_path / "tmp").mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
     return tmp_path
+
+
+# ── audio download fixtures ──
+#
+# The download is a plain HTTP GET, so a fake `requests.get` is the whole
+# network. Every assertion downstream is about bytes on disk.
+
+URL = "https://cdn.example/track.mp4?token=1785015974"
+BODY = bytes(range(256)) * 64  # 16,384 bytes — several chunks at any size
+
+
+class _FakeResponse:
+    """Just enough of a streaming requests response to write from."""
+
+    def __init__(self, body, content_type, on_chunk=None, chunk_size=4096):
+        self.headers = {"Content-Type": content_type} if content_type else {}
+        self._body = body
+        self._on_chunk = on_chunk
+        self._chunk_size = chunk_size
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, size):
+        for n, start in enumerate(range(0, len(self._body), self._chunk_size)):
+            if self._on_chunk:
+                self._on_chunk(n)
+            yield self._body[start:start + self._chunk_size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _fake_get(monkeypatch, body=BODY, content_type="audio/mp4", on_chunk=None):
+    """Serve `body` to the downloader. Returns the list of URLs asked for."""
+    calls = []
+
+    def _get(url, stream=False, timeout=None, **kw):
+        calls.append(url)
+        return _FakeResponse(body, content_type, on_chunk)
+
+    monkeypatch.setattr(player_mod.requests, "get", _get)
+    return calls
+
+
+def _no_spawn(monkeypatch):
+    """Stand in for mpv/ffplay. Returns the processes that were 'spawned'."""
+    procs = []
+
+    class _Proc:
+        def __init__(self, cmd, **kw):
+            self.cmd = cmd
+            procs.append(self)
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(player_mod.subprocess, "Popen", _Proc)
+    return procs
+
+
+def _audio_files(pending=False):
+    """Whole tracks in the audio cache — or, with pending, everything
+    including half-written .part files."""
+    try:
+        return sorted(f for f in cache_mod.audio_dir().iterdir()
+                      if f.is_file() and (pending or f.suffix != ".part"))
+    except OSError:
+        return []
+
+
+def _scratch_files():
+    return sorted(cache_mod.Path(tempfile.gettempdir()).glob("ticli-cache-*"))
 
 
 def _player(session=None):
@@ -435,72 +526,226 @@ class TestCacheModes:
 
 
 class TestAudioRetention:
-    """The budget is only honest if audio actually lands in the directory it
-    sizes. These drive AudioPlayer's bookkeeping directly — no ffmpeg, no
-    ffplay, no network."""
+    """FULL mode has to put real bytes in the directory the budget sizes.
 
-    def _audio(self, mode):
+    The version of this that shipped never wrote one: the download was an
+    ffmpeg call with an extension ffmpeg couldn't mux to, inside the
+    ffplay-only branch, so on mpv it never even ran. Every test here therefore
+    asserts on file *contents*, not on bookkeeping — bookkeeping was green
+    the whole time the feature was inert.
+    """
+
+    def _audio(self, mode, player_cmd="mpv"):
         from ticli.player import AudioPlayer
-        return AudioPlayer("ffplay", cache=MetadataCache(mode=mode))
+        return AudioPlayer(player_cmd, cache=MetadataCache(mode=mode))
 
-    def test_audio_is_only_stored_in_full_mode(self):
-        assert self._audio("METADATA")._cached_audio_path(12) is None
-        assert self._audio("OFF")._cached_audio_path(12) is None
-        path = self._audio("FULL")._cached_audio_path(12)
-        assert path and path.endswith("12.audio")
-        assert cache_mod.audio_dir() in cache_mod.Path(path).parents
+    def _download(self, audio, url=URL, cache_key=12):
+        """Run one download to completion the way play_url would."""
+        audio._start_download(url, cache_key, audio._download_gen)
+        assert _wait_for(lambda: _audio_files() or _scratch_files()), "nothing was written"
+        _settle()
 
-    def test_a_finished_download_survives_the_track_ending(self):
+    # ── the bytes ──
+
+    @pytest.mark.parametrize("player_cmd", ["mpv", "ffplay"])
+    def test_a_played_track_lands_on_disk_byte_for_byte(self, monkeypatch, player_cmd):
+        """The regression test for the whole bug, on *both* backends — mpv is
+        the default, and it is where FULL did literally nothing."""
+        _fake_get(monkeypatch)
+        procs = _no_spawn(monkeypatch)
+        audio = self._audio("FULL", player_cmd)
+
+        audio.play_url(URL, title="T", cache_key=12)
+
+        assert _wait_for(lambda: _audio_files())
+        _settle()
+        files = _audio_files()
+        assert [f.name for f in files] == ["12.m4a"]
+        assert files[0].read_bytes() == BODY
+        # and it streamed the URL rather than a local file it didn't have yet
+        assert URL in procs[0].cmd
+
+    def test_a_track_already_on_disk_is_played_without_the_network(self, monkeypatch):
+        calls = _fake_get(monkeypatch)
+        procs = _no_spawn(monkeypatch)
         audio = self._audio("FULL")
-        kept = audio._cached_audio_path(12)
-        part = kept + ".part"
-        cache_mod.Path(part).write_bytes(b"flac" * 100)
-        audio._cache_file = part
-        audio._keep_file = kept
-        audio._cache_process = types.SimpleNamespace(poll=lambda: 0, terminate=lambda: None)
+        kept = cache_mod.audio_dir()
+        kept.mkdir(parents=True, exist_ok=True)
+        (kept / "12.m4a").write_bytes(BODY)
+
+        audio.play_url(URL, title="T", cache_key=12)
+        _settle()
+
+        assert calls == [], "a cached track must not be fetched again"
+        assert str(kept / "12.m4a") in procs[0].cmd
+
+    def test_the_extension_is_what_the_stream_says_it_is(self, monkeypatch):
+        """Named for the bytes that arrived, never for the tier requested —
+        this session gets AAC even when it asks for lossless, and a session
+        that does get FLAC must land a .flac through the same code."""
+        _fake_get(monkeypatch, content_type="audio/flac")
+        self._download(self._audio("FULL"))
+        assert [f.name for f in _audio_files()] == ["12.flac"]
+
+    def test_the_extension_falls_back_to_the_url_then_to_mp4(self):
+        assert player_mod._audio_extension("audio/mp4; charset=utf-8", URL) == ".m4a"
+        assert player_mod._audio_extension("audio/x-flac", URL) == ".flac"
+        assert player_mod._audio_extension(None, "https://cdn/x.flac?token=1") == ".flac"
+        assert player_mod._audio_extension(None, URL) == ".m4a"
+        assert player_mod._audio_extension("application/octet-stream", "https://cdn/x") == ".m4a"
+
+    def test_the_bytes_are_kept_after_the_track_ends(self, monkeypatch):
+        _fake_get(monkeypatch)
+        audio = self._audio("FULL")
+        self._download(audio)
 
         audio.stop()
 
-        assert cache_mod.Path(kept).exists()
-        assert not cache_mod.Path(part).exists()
+        assert [f.name for f in _audio_files()] == ["12.m4a"]
+        assert _audio_files()[0].read_bytes() == BODY
 
-    def test_an_interrupted_download_is_thrown_away(self):
-        audio = self._audio("FULL")
-        kept = audio._cached_audio_path(12)
-        part = kept + ".part"
-        cache_mod.Path(part).write_bytes(b"half a track")
-        audio._cache_file = part
-        audio._keep_file = kept
-        audio._cache_process = types.SimpleNamespace(poll=lambda: None, terminate=lambda: None)
+    # ── nothing kept when nothing was asked for ──
+
+    def test_nothing_is_stored_outside_full_mode(self, monkeypatch):
+        calls = _fake_get(monkeypatch)
+        _no_spawn(monkeypatch)
+        for mode in ("OFF", "METADATA"):
+            audio = self._audio(mode, "mpv")
+            audio.play_url(URL, title="T", cache_key=12)
+            _settle()
+            assert calls == [], f"{mode} must not download a track"
+            assert _audio_files() == []
+            assert audio._cached_audio_path(12) is None
+
+    def test_ffplays_scratch_copy_is_deleted_when_the_track_ends(self, monkeypatch):
+        """ffplay's pause kills the process, so it still needs something local
+        to resume from even when nothing is being kept — but that copy is
+        scratch, and it must not outlive the track."""
+        _fake_get(monkeypatch)
+        audio = self._audio("METADATA", "ffplay")
+        self._download(audio, cache_key=None)
+        assert _scratch_files(), "ffplay lost its resume copy"
+        assert audio._cache_file and cache_mod.Path(audio._cache_file).read_bytes() == BODY
 
         audio.stop()
 
-        assert not cache_mod.Path(part).exists()
-        assert not cache_mod.Path(kept).exists()
+        assert _scratch_files() == []
+        assert _audio_files() == []
 
-    def test_a_stored_track_is_not_deleted_when_it_is_replayed(self):
+    # ── failure leaves no junk ──
+
+    def test_an_abandoned_download_leaves_nothing_behind(self, monkeypatch):
+        stopped = threading.Event()
         audio = self._audio("FULL")
-        kept = cache_mod.Path(audio._cached_audio_path(12))
-        kept.write_bytes(b"whole track")
-        audio._cache_file = str(kept)
-        audio._cache_persistent = True
+        _fake_get(monkeypatch, on_chunk=lambda n: (
+            audio.stop(), stopped.set()) if n == 1 else None)
 
-        audio.stop()
+        audio._start_download(URL, 12, audio._download_gen)
 
-        assert kept.exists()
+        assert _wait_for(stopped.is_set)
+        assert _wait_for(lambda: not _audio_files(pending=True))
+        assert _audio_files() == [], "a skipped track must not leave a partial file"
 
-    def test_retaining_a_track_sweeps_the_budget(self):
+    def test_a_failed_download_leaves_nothing_behind(self, monkeypatch):
+        def _boom(*a, **k):
+            raise OSError("connection reset")
+        monkeypatch.setattr(player_mod.requests, "get", _boom)
+        audio = self._audio("FULL")
+
+        audio._start_download(URL, 12, audio._download_gen)
+        _settle()
+
+        assert _audio_files(pending=True) == []
+        assert audio._cache_file is None
+
+    def test_a_half_written_file_is_never_served_as_whole(self):
+        audio = self._audio("FULL")
+        path = cache_mod.audio_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "12.m4a.part").write_bytes(BODY[:10])
+        assert audio._cached_audio_path(12) is None
+
+    # ── the budget, against files that now really exist ──
+
+    def test_downloaded_bytes_count_against_the_budget(self, monkeypatch):
+        _fake_get(monkeypatch)
+        audio = self._audio("FULL")
+        self._download(audio)
+        assert audio.cache.total_bytes() >= len(BODY)
+
+    def test_a_landed_track_is_swept_against_the_budget(self, monkeypatch):
+        """Eviction had never run against a real audio file, because there
+        had never been one."""
+        _fake_get(monkeypatch)
         audio = self._audio("FULL")
         audio.cache.budget_mb = 0
-        kept = audio._cached_audio_path(12)
-        cache_mod.Path(kept + ".part").write_bytes(b"x" * 5000)
-        audio._cache_file = kept + ".part"
-        audio._keep_file = kept
-        audio._cache_process = types.SimpleNamespace(poll=lambda: 0, terminate=lambda: None)
 
-        audio.stop()
+        audio._start_download(URL, 12, audio._download_gen)
 
-        assert audio.cache.total_bytes() == 0
+        assert _wait_for(lambda: audio.cache.total_bytes() == 0)
+        assert _audio_files() == []
+
+    def test_the_oldest_download_is_the_one_evicted(self, monkeypatch):
+        _fake_get(monkeypatch)
+        audio = self._audio("FULL")
+        self._download(audio, cache_key=12)
+        old = cache_mod.audio_dir() / "12.m4a"
+        past = time.time() - 10_000
+        import os
+        os.utime(old, (past, past))
+        # A second track that only overshoots the budget with the first there
+        audio.cache.budget_mb = 1
+        big = cache_mod.audio_dir() / "13.m4a"
+        big.write_bytes(b"x" * 1_040_000)
+        audio._sweep_cache()
+
+        assert not old.exists()
+        assert big.exists()
+
+    def test_the_settings_row_does_not_promise_a_backend(self):
+        """FULL is a plain HTTP GET now, so it is the same on mpv and ffplay —
+        the row said "(ffplay backend)" while doing nothing on either."""
+        meaning = config_mod.CACHE_MODE_MEANINGS["FULL"]
+        assert "ffplay" not in meaning and "mpv" not in meaning
+
+
+class TestRealHttpDownload:
+    """One end-to-end over loopback, so the bytes are proven to come off a
+    real socket through real `requests` — the fake above can only prove the
+    writing half."""
+
+    def test_bytes_off_the_wire_are_byte_identical(self):
+        import http.server
+        import threading as _threading
+        from ticli.player import AudioPlayer
+
+        payload = bytes(range(256)) * 400  # 102,400 bytes, several chunks
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/mp4")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        _threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            audio = AudioPlayer("mpv", cache=MetadataCache(mode="FULL"))
+            url = f"http://127.0.0.1:{server.server_address[1]}/track.mp4"
+            audio._start_download(url, 99, audio._download_gen)
+            assert _wait_for(lambda: _audio_files())
+            _settle()
+            landed = _audio_files()
+            assert [f.name for f in landed] == ["99.m4a"]
+            assert landed[0].read_bytes() == payload
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class TestRepaintWake:

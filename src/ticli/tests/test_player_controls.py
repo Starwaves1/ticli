@@ -311,3 +311,66 @@ class TestAccountUIMovedToSettings:
         p._handle_key(player_mod.KEY_ESC)
         assert calls == []
         assert p._logout_pending is False
+
+
+class TestDeletedCacheFile:
+    """A cached track deleted from under the player.
+
+    Checking the file exists and then opening it are two operations, and in
+    between the user can delete it. The player exits at once, which looks
+    exactly like end-of-track — so the song was silently skipped. It should
+    be started again from the network instead.
+    """
+
+    def _audio(self, tmp_path, persistent=True, exists=True):
+        audio = AudioPlayer("mpv", cache=None)
+        path = tmp_path / "12.m4a"
+        if exists:
+            path.write_bytes(b"whole track")
+        audio._cache_file = str(path)
+        audio._cache_persistent = persistent
+        return audio
+
+    def test_a_deleted_cache_file_is_noticed(self, tmp_path):
+        assert self._audio(tmp_path, exists=False).source_vanished() is True
+
+    def test_a_file_that_is_still_there_is_not(self, tmp_path):
+        assert self._audio(tmp_path).source_vanished() is False
+
+    def test_streaming_from_a_url_is_never_a_vanished_file(self, tmp_path):
+        # A scratch copy isn't what's playing — the URL is
+        audio = self._audio(tmp_path, persistent=False, exists=False)
+        assert audio.source_vanished() is False
+        assert AudioPlayer("mpv", cache=None).source_vanished() is False
+
+    def _monitor_once(self, p):
+        """Two dead polls is what the monitor requires before it acts."""
+        import threading
+        import time
+
+        p.running = True
+        thread = threading.Thread(target=p._monitor_playback, daemon=True)
+        thread.start()
+        deadline = time.time() + 3
+        while time.time() < deadline and not (p._plays or p._queue_index != 1):
+            time.sleep(0.02)
+        p.running = False
+        thread.join(timeout=2)
+
+    def test_the_track_is_restarted_where_it_was_not_skipped(self, tmp_path):
+        p = _make_player(position=45.0)
+        p.audio = self._audio(tmp_path, exists=False)
+
+        self._monitor_once(p)
+
+        assert p._plays and p._plays[0][0] == 2, "the vanished track was skipped"
+        assert p._plays[0][1] == pytest.approx(45.0, abs=1.0)
+        assert p._queue_index == 1
+
+    def test_a_track_that_simply_ended_still_advances(self, tmp_path):
+        p = _make_player(position=45.0)
+        p.audio = self._audio(tmp_path, exists=True)  # file is fine, track ended
+
+        self._monitor_once(p)
+
+        assert p._queue_index == 2

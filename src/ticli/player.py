@@ -16,11 +16,14 @@ import time
 import threading
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
 try:
     import tidalapi
+    # A hard tidalapi dependency, so importing it here adds nothing to install
+    import requests
 except ImportError:
     print("This feature requires 'tidalapi'. Install it with: pip install tidalapi")
     sys.exit(1)
@@ -107,6 +110,58 @@ KEY_REPEAT_WINDOW = 0.15
 ESC_TAIL_SECONDS = 0.05
 
 
+# Audio downloads. TIDAL serves a track as one contiguous, unencrypted HTTP
+# file, so keeping a copy is a plain GET — no ffmpeg, no remux, and nothing
+# that depends on which player is running.
+DOWNLOAD_CHUNK = 256 * 1024
+# (connect, read). Generous on read: a slow link should finish the download
+# late, not abandon it. Nothing waits on either.
+DOWNLOAD_TIMEOUT = (10, 60)
+
+# What the CDN says the bytes are → the extension they belong in. The file is
+# named for what actually arrived, never for what was asked for: this session
+# gets AAC-in-MP4 even when it requests lossless, and a session entitled to
+# FLAC would get FLAC through the same code.
+AUDIO_MIME_EXTENSIONS = {
+    "audio/mp4": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "video/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/aac": ".aac",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+}
+# The same question answered from the URL when the CDN declines to say.
+AUDIO_URL_EXTENSIONS = {
+    ".mp4": ".m4a", ".m4a": ".m4a", ".flac": ".flac", ".mp3": ".mp3",
+    ".aac": ".aac", ".ogg": ".ogg", ".wav": ".wav",
+}
+DEFAULT_AUDIO_EXT = ".m4a"
+
+
+def _audio_extension(content_type: Optional[str], url: str) -> str:
+    """The container the bytes on the wire actually are.
+
+    Content-Type first (it is the stream describing itself), the URL's own
+    suffix second, and MP4 as the last resort — that is what every tier this
+    client can reach returns today.
+    """
+    if content_type:
+        mime = content_type.split(";")[0].strip().lower()
+        if mime in AUDIO_MIME_EXTENSIONS:
+            return AUDIO_MIME_EXTENSIONS[mime]
+    suffix = os.path.splitext(urlsplit(url or "").path)[1].lower()
+    return AUDIO_URL_EXTENSIONS.get(suffix, DEFAULT_AUDIO_EXT)
+
+
+class _DownloadSuperseded(Exception):
+    """The track a download was for is no longer the one playing."""
+
+
 def _split_keys(data: str) -> list:
     """Split one raw stdin read into individual keys.
 
@@ -184,47 +239,125 @@ class AudioPlayer:
         self._lock = threading.Lock()
         self._paused = False
         self._ipc_path: Optional[str] = None
-        # For ffplay pause/resume: track position and local cache
+        # Local copy of the playing track: what ffplay resumes from, and what
+        # FULL cache mode keeps
         self._current_url: Optional[str] = None
         self._cache_file: Optional[str] = None
-        self._cache_process: Optional[subprocess.Popen] = None
         self._play_start: Optional[float] = None
         self._seek_offset: float = 0
         # macOS media keys: rebound per mpv process, title shown in Now Playing
         self._media_keys_bound = False
         self._media_title: Optional[str] = None
-        # Set while the current track's download is worth keeping (FULL cache):
-        # the name it graduates to once ffmpeg exits cleanly
-        self._keep_file: Optional[str] = None
-        # True when _cache_file is already a kept track, so stop() must not
-        # delete it — the whole point of having cached it
+        # Bumped by every stop(), so a download still running for a track the
+        # user has moved past knows to abandon itself
+        self._download_gen = 0
+        # True when _cache_file is a kept track, so stop() must not delete it —
+        # the whole point of having cached it
         self._cache_persistent = False
 
-    def _retain_cache_file(self):
-        """Graduate a finished download to its permanent name, then make the
-        cache fit its budget again. Called at end of track, never on a timer."""
-        try:
-            os.replace(self._cache_file, self._keep_file)
-        except OSError:
-            try:
-                os.unlink(self._cache_file)
-            except OSError:
-                pass
-            return
+    def _sweep_cache(self):
+        """Make the cache fit its budget again. Called when a download lands,
+        never on a timer."""
         try:
             self.cache.enforce_budget()
         except Exception as e:  # a cache sweep must never break playback
             logger.debug("Cache sweep failed: %s", e)
 
-    def _cached_audio_path(self, key) -> Optional[str]:
-        """Where a finished download of this track would live, or None when
-        audio caching is off (or there's nothing to key it by)."""
+    def _audio_cache_base(self, key) -> Optional[str]:
+        """Where a kept copy of this track lives, minus the extension — which
+        isn't known until the CDN answers. None when audio caching is off (or
+        there's nothing to key it by)."""
         if not self.cache or not self.cache.keeps_audio or key in (None, ""):
             return None
         try:
-            return str(self.cache_audio_dir() / f"{key}.audio")
+            return str(self.cache_audio_dir() / str(key))
         except OSError:
             return None
+
+    def _cached_audio_path(self, key) -> Optional[str]:
+        """A whole track already on disk for this key, or None.
+
+        Looked up by stem, because the extension is whatever the stream turned
+        out to be. One glob of a directory we own beats an index that could go
+        stale; a half-written ".part" is never an answer.
+        """
+        base = self._audio_cache_base(key)
+        if not base:
+            return None
+        directory, stem = os.path.split(base)
+        try:
+            for path in sorted(Path(directory).glob(f"{stem}.*")):
+                if path.suffix != ".part" and path.is_file():
+                    return str(path)
+        except OSError:
+            pass
+        return None
+
+    def _start_download(self, url: str, cache_key, gen: int):
+        """Fetch the whole track to disk on a daemon thread.
+
+        TIDAL hands out one contiguous, unencrypted URL, so this is a plain
+        GET: the bytes that land are the bytes it sent, byte for byte. That
+        makes it independent of the player process — mpv and ffplay both get
+        a cached track — and it needs no ffmpeg. Nothing waits on it, and the
+        file only becomes an answer once it is whole.
+        """
+        base = self._audio_cache_base(cache_key)
+        keep = base is not None
+        if not keep:
+            if self.player_cmd != "ffplay":
+                return  # mpv pauses in place and needs no local copy
+            # ffplay's pause kills the process, so it needs something to
+            # resume from even when nothing is being kept
+            base = os.path.join(tempfile.gettempdir(), f"ticli-cache-{os.getpid()}")
+        part = base + ".part"
+
+        def _drop(path):
+            if not path:
+                return
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        def _run():
+            path = None
+            try:
+                with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
+                    response.raise_for_status()
+                    ext = _audio_extension(response.headers.get("Content-Type"), url)
+                    with open(part, "wb") as handle:
+                        for chunk in response.iter_content(DOWNLOAD_CHUNK):
+                            if self._download_gen != gen:
+                                raise _DownloadSuperseded()
+                            if chunk:
+                                handle.write(chunk)
+                path = base + ext
+                os.replace(part, path)
+            except Exception as e:
+                # A missed cache is a slower track, never a broken one — and
+                # a partial file must not survive to be mistaken for a whole
+                logger.debug("Audio download did not finish: %s", e)
+                _drop(part)
+                _drop(path)
+                return
+            if self._download_gen == gen:
+                self._cache_file = path
+                self._cache_persistent = keep
+                if self._download_gen != gen:
+                    # stop() ran between the check and the assignment
+                    self._cache_file = None
+                    self._cache_persistent = False
+                    if not keep:
+                        _drop(path)
+            elif not keep:
+                # The user moved on. A whole track still belongs in the cache;
+                # a scratch copy for a player that has stopped does not.
+                _drop(path)
+            if keep and os.path.exists(path):
+                self._sweep_cache()
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def cache_audio_dir(self):
         """The audio cache directory, created if needed. Private like the rest
@@ -240,8 +373,9 @@ class AudioPlayer:
         """Play an audio URL, stopping any current playback.
 
         With audio caching on, a track played before is already on disk, so
-        the URL is never touched — that path is the same one ffplay's own
-        pause/resume cache has always used, just named by track and kept.
+        the URL is never touched; a track played for the first time is fetched
+        alongside playback and kept. Both halves are backend-independent —
+        only the source path and a background download change.
         """
         self.stop()
         with self._lock:
@@ -276,26 +410,9 @@ class AudioPlayer:
                     cmd.insert(-1, f"--start={seek}")
             else:  # ffplay
                 self._ipc_path = None
-                if not have_kept:
-                    # Download to temp file in background for instant resume.
-                    # With FULL caching that download is also what gets kept,
-                    # so it is written under its final name + ".part" and
-                    # renamed once ffmpeg exits cleanly.
-                    if kept:
-                        self._cache_file = kept + ".part"
-                        self._keep_file = kept
-                    else:
-                        self._cache_file = os.path.join(
-                            tempfile.gettempdir(), f"ticli-cache-{os.getpid()}.flac"
-                        )
-                    self._cache_process = subprocess.Popen(
-                        ["ffmpeg", "-y", "-loglevel", "quiet", "-i", url,
-                         "-c", "copy", self._cache_file],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                # Always play from the URL here — the cache has only just
-                # started downloading, so it can't satisfy a seek yet
+                # Plays from `source`: a kept file when there is one, the URL
+                # otherwise — a download that has only just started can't
+                # satisfy a seek yet
                 cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
                        "-volume", str(self.volume)]
                 if seek > 0:
@@ -306,6 +423,11 @@ class AudioPlayer:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            gen = self._download_gen
+        # Off the lock and off this thread: fetching the track must never hold
+        # up the process that is playing it
+        if not have_kept:
+            self._start_download(url, cache_key, gen)
 
     def _play_from_cache(self, seek: float):
         """Resume ffplay from local cached file at given position."""
@@ -485,6 +607,9 @@ class AudioPlayer:
     def stop(self):
         """Stop current playback."""
         with self._lock:
+            # Any download still running is for a track we are leaving: this
+            # is what tells it to abandon itself and clean up its .part
+            self._download_gen += 1
             if self._process and self._process.poll() is None:
                 self._process.terminate()
                 try:
@@ -492,23 +617,14 @@ class AudioPlayer:
                 except subprocess.TimeoutExpired:
                     self._process.kill()
                 self._process = None
-            # Stop cache download. A download that already finished cleanly is
-            # a whole track — with FULL caching it graduates to its final name
-            # and survives; anything partial or unwanted is deleted.
-            complete = self._cache_process is not None and self._cache_process.poll() == 0
-            if self._cache_process and self._cache_process.poll() is None:
-                self._cache_process.terminate()
-                complete = False
-            self._cache_process = None
-            if complete and self._keep_file:
-                self._retain_cache_file()
-            elif self._cache_file and not self._cache_persistent:
+            # A kept track is the whole point of having cached it; a scratch
+            # copy existed only to resume this one, so it goes.
+            if self._cache_file and not self._cache_persistent:
                 try:
                     os.unlink(self._cache_file)
                 except OSError:
                     pass
             self._cache_file = None
-            self._keep_file = None
             self._cache_persistent = False
             self._paused = False
             self._play_start = None
@@ -521,6 +637,13 @@ class AudioPlayer:
                 except OSError:
                     pass
                 self._ipc_path = None
+
+    def source_vanished(self) -> bool:
+        """True when the cached file we were playing has been deleted out from
+        under us — the millisecond window between checking it exists and the
+        player opening it. Playing from a URL is never this."""
+        path = self._cache_file if self._cache_persistent else None
+        return bool(path) and not os.path.exists(path)
 
     @property
     def is_playing(self) -> bool:
@@ -800,6 +923,23 @@ class HeadlessTidalPlayer:
             self._write_state_file(state)
         except Exception as e:
             logger.debug("Failed to save player state: %s", e)
+
+    def _shutdown(self):
+        """Quit cleanly, silence first.
+
+        _save_state asks mpv where it is over IPC and then writes a file, so
+        saving before stopping left music playing for a beat after the UI was
+        already gone. Read the position while the player is still alive to
+        answer it, stop the audio, and write the file into the quiet — the
+        saved position is if anything better for being taken from mpv itself.
+        """
+        if self.audio:
+            position = self.audio.get_time_pos()
+            if position is not None:
+                self._play_offset = position
+                self._play_start_time = time.time()
+            self.audio.stop()
+        self._save_state()
 
     def _restore_state(self):
         """Restore queue and search history from previous session."""
@@ -1112,7 +1252,14 @@ class HeadlessTidalPlayer:
                 dead_polls = 0
             if dead_polls >= 2:
                 dead_polls = 0
-                if self._queue and self._queue_index < len(self._queue) - 1:
+                if (self.audio and self._current_track is not None
+                        and self.audio.source_vanished()):
+                    # The cached file was deleted between "it exists" and the
+                    # player opening it, so the player exited at once. Without
+                    # this the track is silently skipped; start it again from
+                    # the network, where it was left.
+                    self._play_track(self._current_track, seek=self._get_position())
+                elif self._queue and self._queue_index < len(self._queue) - 1:
                     self._play_queue_index(self._queue_index + 1)
                 else:
                     self._playing = False
@@ -2435,10 +2582,7 @@ class HeadlessTidalPlayer:
                     self._repaint(live, force=bool(keys))
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-            # Save state before cleanup
-            self._save_state()
-            if self.audio:
-                self.audio.stop()
+            self._shutdown()
             for fd in (self._wake_r, self._wake_w):
                 try:
                     if fd is not None:

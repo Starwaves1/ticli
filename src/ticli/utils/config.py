@@ -46,12 +46,13 @@ QUALITY_MEANINGS = {
 QUALITY_V1_RENAMES = {"LOW": "HIGH", "HIGH": "LOSSLESS"}
 
 # What each cache tier actually stores. Worth spelling out: only one of them
-# can reach the gigabyte budget, and only on the ffplay backend — mpv streams
-# straight from TIDAL and never writes a track to disk for us to keep.
+# can reach the gigabyte budget. FULL fetches the track itself over plain HTTP
+# alongside playback, so it is the same on mpv and ffplay — nothing about it
+# depends on which player is running.
 CACHE_MODE_MEANINGS = {
     "OFF": "nothing on disk, every list waits on the network",
     "METADATA": "playlists and track lists, a few MB",
-    "FULL": "metadata plus played tracks (ffplay backend)",
+    "FULL": "metadata plus every track you play, up to the budget",
 }
 
 SETTINGS_SPEC: list[dict] = [

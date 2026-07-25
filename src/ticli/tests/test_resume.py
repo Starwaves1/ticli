@@ -160,6 +160,75 @@ class TestSaveState:
         assert p._queue_index == 1
 
 
+class TestQuitOrder:
+    """Quitting used to save state first and stop the audio afterwards — and
+    saving asks mpv for its position over IPC, so the music kept playing for
+    the whole write. Silence has to come first, without costing accuracy."""
+
+    def _audio(self, log, position=61.5, stop_delay=0.0):
+        def _stop():
+            time.sleep(stop_delay)
+            log.append("stop")
+
+        def _get_time_pos():
+            log.append("time-pos")
+            return position
+
+        return types.SimpleNamespace(get_time_pos=_get_time_pos, stop=_stop)
+
+    def test_audio_stops_before_the_state_file_is_written(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(player_mod, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(player_mod, "STATE_FILE", tmp_path / "player_state.json")
+        log = []
+        p = _make_player()
+        p._current_track = _fake_track(2)
+        p._queue = [_fake_track(2)]
+        p.audio = self._audio(log)
+        real_write = p._write_state_file
+        p._write_state_file = lambda data: (log.append("write"), real_write(data))[1]
+
+        p._shutdown()
+
+        assert log == ["time-pos", "stop", "write"], log
+
+    def test_the_saved_position_still_comes_from_the_player(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(player_mod, "STATE_DIR", tmp_path)
+        state_file = tmp_path / "player_state.json"
+        monkeypatch.setattr(player_mod, "STATE_FILE", state_file)
+        p = _make_player()
+        p._current_track = _fake_track(2)
+        p._queue = [_fake_track(2)]
+        p._playing = True
+        p._play_offset = 0  # wall clock says 0; only mpv knows the truth
+        p.audio = self._audio([], position=61.5)
+
+        p._shutdown()
+
+        saved = json.loads(state_file.read_text())
+        assert 61.5 <= saved["position"] < 62.0
+
+    def test_a_backend_that_cannot_report_position_still_saves(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(player_mod, "STATE_DIR", tmp_path)
+        state_file = tmp_path / "player_state.json"
+        monkeypatch.setattr(player_mod, "STATE_FILE", state_file)
+        p = _make_player()
+        p._current_track = _fake_track(2)
+        p._queue = [_fake_track(2)]
+        p._play_offset = 30.0
+        p.audio = self._audio([], position=None)  # ffplay never answers this
+
+        p._shutdown()
+
+        assert json.loads(state_file.read_text())["position"] == 30.0
+
+    def test_shutdown_without_a_player_is_harmless(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(player_mod, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(player_mod, "STATE_FILE", tmp_path / "player_state.json")
+        p = _make_player()
+        p.audio = None
+        p._shutdown()  # must not raise
+
+
 class TestTogglePlayResume:
     def _player_with_track(self, offset):
         p = _make_player()
