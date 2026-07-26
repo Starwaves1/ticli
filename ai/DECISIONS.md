@@ -193,6 +193,34 @@ first, or it fills the cache with unrecognisable leaked files twice as fast.
 The "worth caching" hook must default to today's behaviour — the value function
 is still open (see cache admission above).
 
+## The cache tracker is the source of truth (Garrett, 2026-07-26 — locked)
+
+> "Caching needs a cache tracker and the actual cached files. The cache tracker
+> will be updated and the cached files are merely a downstream result of that."
+
+Admission, eviction, play counts, timestamps and the stored quality tier are
+recorded in the **tracker**; files on disk are reconciled to it. Eviction is
+"the tracker says this is gone, remove the file", not "walk the directory and
+decide as you go". The settings metrics read the tracker, which is also the
+answer to the audit's O(N²)-on-the-UI-thread finding: reading a maintained
+index is cheap, walking the disk every paint is not.
+
+**Reconciled with his earlier, emphatic requirement** that manually deleted
+files be handled durably: the tracker is authoritative for **intent and
+metadata**, the disk is authoritative for **existence**. A tracker entry whose
+file is missing is a fact to absorb — drop the entry, correct the totals — not
+an error and not something to ignore. Verify at the moment of use; never walk
+the directory on the UI thread to find out.
+
+## Settings page at small sizes (Garrett, 2026-07-26 — locked)
+
+> "Accept that settings will not work well in very small windows. That's fine.
+> The current behavior is good."
+
+The bar stays where `9c96d63` left it: fits at **80x24** with `[x]`, `[o]`,
+`[u]` on screen, and never overflows at any size. Below that, degraded is
+explicitly acceptable. Do not add levers chasing it.
+
 ## Backlog (requested, not yet scheduled)
 
 - **`r` (start radio) must not restart the current song** (Garrett,
