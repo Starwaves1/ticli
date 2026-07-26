@@ -129,6 +129,16 @@ Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate a
 - TIDAL Premium subscription
 - ffmpeg
 
+## Credits
+
+Created and maintained by [odonald](https://github.com/odonald).
+
+Contributors:
+
+- [Garrett Simko](https://github.com/Starwaves1) — lossless/hi-res playback (PKCE login, segmented
+  DASH streams), album artwork, metadata and audio caching, scrubbing, scoped search, the artist
+  page, and macOS media keys.
+
 ## Support
 
 If you enjoy Ticli, consider [buying me a coffee](https://buymeacoffee.com/odonald).
