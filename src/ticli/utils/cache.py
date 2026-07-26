@@ -51,7 +51,7 @@ MAX_AGE_SECONDS = 30 * 24 * 3600
 KEY_PLAYLISTS = "playlists"
 
 # What ticli itself writes into the audio directory: "{track_id}{ext}" once a
-# track is whole, "{track_id}{ext}.part" while it is still arriving. Every
+# track is whole, and "{track_id}.part" while it is still arriving. Every
 # extension AudioPlayer can produce is here (player._audio_extension owns that
 # list; test_cache pins the two together). The rule matters because deleting
 # cached songs deletes an explicit list of files ticli owns — the cache
@@ -60,9 +60,31 @@ AUDIO_EXTENSIONS = (".m4a", ".mp3", ".aac", ".flac", ".ogg", ".wav")
 
 
 def is_owned_audio(name: str) -> bool:
-    """Whether a filename is one ticli wrote."""
-    stem = name[:-len(".part")] if name.endswith(".part") else name
-    root, ext = os.path.splitext(stem)
+    """Whether a filename is one ticli wrote.
+
+    A part file is bare — `467461385.part`, no extension — because
+    `AudioPlayer._start_download` opens the handle before the CDN has said
+    what container it is sending; the extension only arrives with the first
+    response header, and the file is renamed to `{track_id}{ext}` at the end.
+    So the extension is *optional* on a `.part` and required on a whole file.
+
+    This asked for `{track_id}{ext}.part` for a year and got False for every
+    part file production ever wrote. A leaked one — SIGKILL, a crash, power
+    loss, anything that isn't `stop()` — was then counted against the budget
+    by `total_bytes` (a plain directory size, which does not consult this)
+    while being invisible to `owned_audio_files`, so it could be neither
+    evicted nor cleared. Once the leak exceeded the budget every sweep
+    deleted every real song and kept the leak. See ai/INCIDENTS #6.
+    """
+    if name.endswith(".part"):
+        stem = name[:-len(".part")]
+        root, ext = os.path.splitext(stem)
+        # Bare "{track_id}.part" is what the downloader opens; the extended
+        # form is kept because a rename that lands mid-sweep is still ours
+        if not ext:
+            return bool(stem) and stem.isdigit()
+    else:
+        root, ext = os.path.splitext(name)
     return bool(root) and root.isdigit() and ext.lower() in AUDIO_EXTENSIONS
 
 

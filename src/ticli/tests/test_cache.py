@@ -705,7 +705,7 @@ class TestAudioRetention:
         audio = self._audio()
         path = cache_mod.audio_dir()
         path.mkdir(parents=True, exist_ok=True)
-        (path / "12.m4a.part").write_bytes(BODY[:10])
+        (path / "12.part").write_bytes(BODY[:10])
         assert audio._cached_audio_path(12) is None
 
     # ── the budget, against files that now really exist ──
@@ -798,7 +798,7 @@ class TestSongCount:
     def test_counts_whole_tracks_only(self):
         self._song("1.m4a")
         self._song("2.flac")
-        self._song("3.m4a.part")  # still downloading — not a song yet
+        self._song("3.part")  # still downloading — not a song yet
         assert MetadataCache().audio_count() == 2
 
     def test_an_empty_or_missing_directory_is_zero(self):
@@ -868,11 +868,55 @@ class TestOwnedFilesOnly:
     def test_the_names_ticli_writes_are_the_names_it_owns(self):
         assert cache_mod.is_owned_audio("12345.m4a")
         assert cache_mod.is_owned_audio("12345.flac")
+        # What _start_download actually opens: no extension, because the CDN
+        # has not said what container it is sending yet
+        assert cache_mod.is_owned_audio("12345.part")
+        # And the extended form, which a rename landing mid-sweep can show
         assert cache_mod.is_owned_audio("12345.m4a.part")
         assert not cache_mod.is_owned_audio("important.txt")
         assert not cache_mod.is_owned_audio("mixtape.m4a")
+        assert not cache_mod.is_owned_audio("mixtape.part")
         assert not cache_mod.is_owned_audio("12345")
         assert not cache_mod.is_owned_audio(".part")
+
+    def test_the_part_file_the_downloader_opens_is_owned(self, monkeypatch):
+        """Pins the predicate to the writer rather than to a name someone
+        thought the writer used. The bug was exactly this gap."""
+        opened = []
+        monkeypatch.setattr(player_mod, "fetch_to_file",
+                            lambda sources, part, **kw: opened.append(part))
+        audio = player_mod.AudioPlayer("mpv", cache=MetadataCache())
+        audio._start_download(URL, 12, audio._download_gen)
+        assert _wait_for(lambda: opened)
+        assert cache_mod.is_owned_audio(os.path.basename(opened[0])), opened[0]
+
+    def test_a_leaked_part_file_is_evicted_before_a_real_song(self, monkeypatch):
+        """The whole of the bug, in bytes on disk.
+
+        A part file left behind by a kill is counted by total_bytes (a plain
+        directory size) whether or not this module recognises it. When it did
+        not, every sweep evicted the real songs and kept the leak for ever.
+        """
+        monkeypatch.setattr(cache_mod, "BYTES_PER_GB", 1024)
+        cache = MetadataCache(budget_gb=1)
+        leak = self._write("111.part", 1536)   # over budget on its own
+        song = self._write("222.m4a", 256)
+        os.utime(leak, (1, 1))                 # least recently used: goes first
+
+        cache.enforce_budget()
+
+        assert not leak.exists(), "a leaked .part must be evictable"
+        assert song.exists(), "the real song must not be the one deleted"
+
+    def test_clearing_the_cache_clears_a_leaked_part_file(self):
+        cache = MetadataCache()
+        leak = self._write("111.part")
+        assert cache.clear_audio() == (1, 0)
+        assert not leak.exists()
+
+    def test_a_leaked_part_file_is_not_counted_as_a_song(self):
+        self._write("111.part")
+        assert MetadataCache().audio_count() == 0
 
     def test_every_extension_the_downloader_can_produce_is_owned(self):
         """If player._audio_extension grows a container, the delete list has
@@ -909,7 +953,7 @@ class TestOwnedFilesOnly:
 
     def test_half_written_files_go_too(self):
         cache = MetadataCache()
-        part = self._write("12.m4a.part")
+        part = self._write("12.part")
         cache.clear_audio()
         assert not part.exists()
 

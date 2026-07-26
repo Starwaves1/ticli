@@ -344,6 +344,58 @@ visible rather than implicit.
 
 ---
 
+## 2026-07-26 — the data path audit, acted on
+
+A read-only audit of streaming, caching and downloading
+(`ai/reference/data-path-audit-2026-07-26.md`, zero live requests, everything
+measured against a loopback server and the real cached hi-res track) produced
+eight findings. What follows is the work order being executed; each finding is
+its own commit so any one can be reverted alone, and each is marked **Fixed**
+in the audit rather than deleted from it.
+
+The audit's own summary of *why* these existed is worth keeping: five of the
+eight were seams — two pieces of the path each behaving correctly and
+disagreeing with each other. None of them is visible from inside the function
+that causes it, which is why they survived a green suite.
+
+### F1 — a leaked `.part` file was invisible to the cache, and evicted real songs
+
+`AudioPlayer._start_download` opens `{audio_dir}/{track_id}.part` — **no
+extension**, because the container is not known until the CDN's first response
+header arrives; the file is renamed to `{track_id}{ext}` when it is whole.
+`cache.is_owned_audio()` stripped `.part` and then *required* an audio
+extension, so it answered False for every part file production has ever
+written.
+
+The consequence is not cosmetic. `total_bytes()` is a plain directory size and
+does not consult the predicate, so a leaked part file — from a SIGKILL, a
+crash, a power loss, anything that is not `stop()` — **is** counted against the
+budget, while `owned_audio_files()` cannot see it. Measured with the real
+modules at a 1 GB budget, a 1.5 GB leak beside a 0.25 GB song:
+`enforce_budget()` deleted the song, kept the leak, and `clear_audio()`
+returned `(0, 0)`. Once leaked bytes exceed the budget the cache can never hold
+anything again, while the settings page reads `0 songs cached · 1.500 GB` —
+honest about the bytes, silent about why.
+
+The fix widens the predicate: on a `.part`, the extension is optional. The
+extended `{track_id}{ext}.part` form is still accepted, because a rename
+landing mid-sweep is still ours. `audio_count()` keeps excluding `.part` by
+suffix, so a half-written file is still not a song.
+
+**The tests were part of the bug.** `test_cache.py` asserted on `12.m4a.part`
+in four places — a filename production never creates. They now use what the
+writer writes, and a new test monkeypatches `fetch_to_file` to capture the path
+`_start_download` actually opens and asserts `is_owned_audio` on *that*, so the
+predicate is pinned to the writer rather than to a name somebody believed the
+writer used. Three more assert the leak scenario in bytes on disk: the leak is
+evicted before the real song, `clear_audio` removes it, and it is still not
+counted as a song. Filed as INCIDENTS #6 — it is INCIDENTS #2's lesson again.
+
+The `important.txt` decoy tests still pass: the predicate only widened over
+names that are already `{track_id}`-shaped.
+
+---
+
 ## In flight at time of writing
 
 - **Responsive narrow-width layout + `v` volume overlay** — width-derived
