@@ -12,6 +12,10 @@ readme = {file = "README.md", content-type = "text/markdown"}
 authors = [
     {name = "odonald"},
 ]
+maintainers = [
+    {name = "odonald"},
+    {name = "Garrett Simko"},
+]
 keywords = ["tidal", "music", "terminal", "cli", "player", "tui", "streaming", "lossless", "hifi"]
 classifiers = [
     "Development Status :: 4 - Beta",

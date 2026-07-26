@@ -36,6 +36,7 @@ MODES = (
     HeadlessTidalPlayer.MODE_PLAYER,
     HeadlessTidalPlayer.MODE_SEARCH,
     HeadlessTidalPlayer.MODE_BROWSE,
+    HeadlessTidalPlayer.MODE_ARTIST,
     HeadlessTidalPlayer.MODE_QUEUE,
     HeadlessTidalPlayer.MODE_PLAYLISTS,
     HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
@@ -343,7 +344,12 @@ class TestThePaneFits:
 
 
 def _fill_lists(p):
-    """Enough rows in every list that no screen is empty for want of data."""
+    """Enough rows in every list that no screen is empty for want of data.
+
+    Including the artist page, which is filled by hand rather than opened: its
+    sections are fetched on a thread, and a layout test must not depend on one
+    landing (and must never reach for the network to get there).
+    """
     tracks = [_track(f"Track number {i} with a longish name") for i in range(40)]
     p._queue = tracks
     p._queue_index = 3
@@ -354,6 +360,15 @@ def _fill_lists(p):
     p._playlists = [types.SimpleNamespace(
         id=str(i), name=f"A playlist named {i}", num_tracks=20) for i in range(30)]
     p._editable_playlists = p._playlists
+    p._artist = types.SimpleNamespace(id=7, name="An Artist With A Long Name")
+    p._artist_sections = {
+        (p._artist_key(section)): {
+            "state": "ready",
+            "items": [{"type": "track", "obj": t} for t in tracks],
+            "message": "",
+        }
+        for section in HeadlessTidalPlayer.ARTIST_SECTIONS
+    }
 
 
 def _body(h):
@@ -549,5 +564,113 @@ class TestTheVolumeOverlayOnScreen:
                 return
             assert any("Volume" in r for r in body), (mode, body)
             h.assert_one_frame(f"overlay over {mode}")
+        finally:
+            h.live.stop()
+
+
+def _tab_rows(h):
+    """The [Tab] row that names the section or scope — not the footer's own
+    [Tab] hint, which says the key rather than where it has landed."""
+    footer = set(_footer(h))
+    return [r.strip() for r in _body(h)
+            if "[Tab]" in r and r.strip() not in footer]
+
+
+class TestTheRowsThatSayWhereYouAre:
+    """The artist page's tab row and search's scope row are state that would
+    otherwise be hidden — which section, which scope. Neither may be relaxed
+    away by a short window, and neither may be cut off by a narrow one: they
+    say the same two things in fewer columns instead."""
+
+    def _harness(self, width, mode, height=24):
+        h = Harness(width=width, height=height,
+                    artwork=art_mod.art_size(width, height))
+        h.player._mode = mode
+        _fill_lists(h.player)
+        h.start()
+        h.repaint()
+        return h
+
+    @pytest.mark.parametrize("width", WIDTHS + (40,))
+    def test_the_artist_tab_row_is_never_clipped(self, width):
+        h = self._harness(width, HeadlessTidalPlayer.MODE_ARTIST)
+        try:
+            row = _tab_rows(h)
+            assert len(row) == 1, (width, _body(h))
+            assert "…" not in row[0], (width, row[0])
+            # Which section you are on survives at every width
+            assert "Top Tracks" in row[0], (width, row[0])
+            h.assert_one_frame(f"artist at {width}")
+        finally:
+            h.live.stop()
+
+    @pytest.mark.parametrize("width", WIDTHS + (40,))
+    def test_the_search_scope_row_is_never_clipped(self, width):
+        h = self._harness(width, HeadlessTidalPlayer.MODE_SEARCH)
+        try:
+            row = _tab_rows(h)
+            assert len(row) == 1, (width, _body(h))
+            assert "…" not in row[0], (width, row[0])
+            assert "All" in row[0], (width, row[0])
+            h.assert_one_frame(f"search at {width}")
+        finally:
+            h.live.stop()
+
+    @pytest.mark.parametrize("mode", (HeadlessTidalPlayer.MODE_ARTIST,
+                                      HeadlessTidalPlayer.MODE_SEARCH))
+    def test_a_short_window_keeps_the_row_and_drops_rows_instead(self, mode):
+        h = self._harness(60, mode, height=18)
+        try:
+            assert _tab_rows(h), _body(h)
+            h.assert_one_frame(f"{mode} at 60x18")
+        finally:
+            h.live.stop()
+
+
+class TestScrubbingAndTheOverlayOnScreen:
+    def _harness(self, width=80):
+        h = Harness(width=width, height=24,
+                    artwork=art_mod.art_size(width, 24))
+        h.start()
+        h.repaint()
+        return h
+
+    @pytest.mark.parametrize("width", WIDTHS + (40,))
+    def test_the_scrub_marker_costs_the_bar_columns_not_the_pane(self, width):
+        """The marker is on the progress line, so it comes out of the bar. A
+        marker appended past the pane's edge would wrap the line it is on."""
+        h = self._harness(width)
+        try:
+            unfocused = [r for r in _body(h) if "0:00" in r][0]
+            h.player._focus_player()
+            h.repaint()
+            focused = [r for r in _body(h) if "0:00" in r][0]
+            assert "⇆" in focused, (width, focused)
+            assert "3:20" in focused, (width, focused)
+            assert focused.count("0:00") == 1
+            assert len([r for r in _body(h) if "0:00" in r]) == 1
+            assert focused.count("─") + focused.count("━") <= unfocused.count("─") + unfocused.count("━")
+            h.assert_one_frame(f"focused at {width}")
+        finally:
+            h.live.stop()
+
+    def test_the_overlay_takes_the_marker_off_the_line(self):
+        h = self._harness()
+        try:
+            h.player._focus_player()
+            h.repaint()
+            assert any("⇆" in r for r in _body(h))
+            h.player._handle_key("v")
+            h.repaint()
+            body = _body(h)
+            assert not any("⇆" in r for r in body), body
+            assert any("Volume" in r for r in body), body
+            h.assert_one_frame("overlay over a scrub")
+            # and closing it puts the marker back
+            h.player._handle_key("\r")
+            h.repaint()
+            assert any("⇆" in r for r in _body(h)), _body(h)
+            h.assert_one_frame("scrub returned")
+            assert h.stranded() == []
         finally:
             h.live.stop()

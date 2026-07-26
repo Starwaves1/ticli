@@ -263,6 +263,11 @@ from ticli.utils import artwork
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
 
+# How long a name the "+ New playlist" row will take. A cap so the row cannot
+# grow past the panel, not a rule from TIDAL — nothing in tidalapi documents a
+# limit, so this errs generous.
+PLAYLIST_NAME_MAX = 100
+
 AUDIO_PLAYERS = ["mpv", "ffplay"]
 
 IS_MACOS = sys.platform == "darwin"
@@ -308,6 +313,19 @@ MEDIA_KEY_PROP = "user-data/ticli/media-key"
 # Going back this far into a track restarts it instead of skipping backwards —
 # the rule every other player uses, for ← and the PREV media key alike
 PREV_RESTART_SECONDS = 30
+
+# Scrubbing. One press of ←/→ with the player focused moves the track this far,
+# and never nearer the end than SEEK_END_MARGIN: landing on EOF makes the
+# backend exit at once, which reads as "the track ended" and skips.
+SEEK_STEP_SECONDS = 10
+SEEK_END_MARGIN = 2
+# The floor between two seeks actually reaching the backend. The screen moves on
+# every press regardless; this is only about how often mpv is spoken to and how
+# often ffplay — which has no runtime control at all — is respawned. A press
+# that arrives too soon leaves its position pending, and the monitor's existing
+# 0.5s tick delivers it, so a held-down arrow costs a couple of seeks a second
+# rather than one respawn per key repeat.
+SEEK_COALESCE_SECONDS = 0.3
 
 # Next-track stream URL prefetch. Fired from the monitor's existing tick this
 # far before the end of a track, and thrown away if it isn't used almost at
@@ -372,6 +390,11 @@ KEY_REPEAT_WINDOW = 0.15
 # worth of rows, so a held-down arrow can never fan out into requests.
 SEARCH_MAX_OFFSET = 300
 SEARCH_FETCH_MIN_INTERVAL = 1.0
+# Track radio. One request buys a whole endless mix, so the same brakes the
+# search pages use apply here: one fetch in flight blocks the next, and the
+# interval is the floor between them, so a held-down [r] is one request.
+RADIO_LIMIT = 25
+RADIO_FETCH_MIN_INTERVAL = 1.0
 # How long to wait for the tail of an escape sequence that straddled a read.
 # Only a bare Esc ever pays it in full; kept generous so an arrow key over a
 # slow SSH link can't decode as Esc and quit the player.
@@ -517,7 +540,40 @@ class _DownloadSuperseded(Exception):
 
 def _empty_search_pool() -> dict:
     """Fetched-but-not-yet-shown search rows, per category."""
-    return {"tracks": [], "albums": [], "artists": []}
+    return {"tracks": [], "albums": [], "artists": [], "playlists": []}
+
+
+def _empty_search_reservoir() -> dict:
+    """Everything one query has brought back, kept whole and never consumed.
+
+    A fetch asks for all four categories at once, so this is what every scope
+    draws on: `offset` is how deep into the query it has gone, `exhausted` is
+    per category because they run out at different depths, and `stopped` is a
+    failure the scopes should stop asking about. In memory only, for the length
+    of the run — deliberately not the on-disk index in utils/cache.py.
+    """
+    return {
+        "tracks": [], "albums": [], "artists": [], "playlists": [],
+        "offset": 0,
+        "exhausted": {"tracks": False, "albums": False,
+                      "artists": False, "playlists": False},
+        "stopped": False,
+        "message": "",
+    }
+
+
+def _empty_search_view() -> dict:
+    """One scope's answer to one query.
+
+    `consumed` is how far into each of the reservoir's categories this scope
+    has already drawn — the scope's paging depth, which is what makes tabbing
+    away and back come back to the same rows. `cached` records that the view
+    was shown without a request of its own, because the display says so.
+    """
+    return {
+        "loading": False, "results": [], "cursor": 0, "message": "",
+        "consumed": {"tracks": 0, "albums": 0, "artists": 0}, "cached": False,
+    }
 
 
 def _split_keys(data: str) -> list:
@@ -907,13 +963,7 @@ class AudioPlayer:
                 # Plays from `source`: a kept file when there is one, the URL
                 # otherwise — a download that has only just started can't
                 # satisfy a seek yet
-                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
-                       "-volume", str(self._ffplay_volume())]
-                if segmented:
-                    cmd += self._hls_flags()
-                if seek > 0:
-                    cmd += ["-ss", str(seek)]
-                cmd.append(source)
+                cmd = self._ffplay_cmd(source, seek)
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -925,13 +975,26 @@ class AudioPlayer:
         if not have_kept:
             self._start_download(url, cache_key, gen)
 
+    def _ffplay_cmd(self, source: str, seek: float) -> list:
+        """How ffplay is asked to play `source` from `seek`.
+
+        The one place that spelling lives, because ffplay is respawned from
+        three of them — a fresh track, a resume, and a scrub — and a flag
+        missing from one of those is a stream that plays everywhere but there.
+        """
+        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
+               "-volume", str(self._ffplay_volume())]
+        if source.endswith(HLS_SUFFIX):
+            cmd += self._hls_flags()
+        if seek > 0:
+            cmd += ["-ss", str(seek)]
+        cmd.append(source)
+        return cmd
+
     def _play_from_cache(self, seek: float):
         """Resume ffplay from local cached file at given position."""
-        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
-               "-volume", str(self._ffplay_volume()), "-ss", str(seek),
-               self._cache_file]
         self._process = subprocess.Popen(
-            cmd,
+            self._ffplay_cmd(self._cache_file, seek),
             stdout=subprocess.DEVNULL,
             stderr=self._open_stderr(),
         )
@@ -1072,6 +1135,60 @@ class AudioPlayer:
             self._play_start = time.time()
             return True
 
+    def seek_to(self, position: float) -> bool:
+        """Move the current track to an absolute position. False when the
+        backend could not be moved and the caller has to start the track again.
+
+        Three cases, and none of them costs a request — the source this is
+        already playing is the source it seeks in:
+
+        - **mpv**, playing or paused: one IPC seek, gapless, and mpv keeps
+          whatever pause state it had.
+        - **ffplay while paused**: there is no process (pause kills it), so
+          the position it will resume from is just a number, and moving that
+          number is the whole seek.
+        - **ffplay while playing**: no runtime control exists at all, so the
+          process is killed and started again at the offset from the same
+          source. Deliberately not stop()/play_url(): those bump the download
+          generation, which would abandon the copy being fetched for this very
+          track and make every scrub start it over.
+        """
+        position = max(0.0, position)
+        with self._lock:
+            alive = self._process is not None and self._process.poll() is None
+            if self.player_cmd == "mpv" and self._ipc_path and alive:
+                if not self._mpv_command({"command": ["seek", position, "absolute"]}):
+                    return False
+                self._seek_offset = position
+                self._play_start = None if self._paused else time.time()
+                return True
+            if self._paused and not alive:
+                # ffplay's pause killed the process, so there is nothing to
+                # seek — only the number resume() will start from
+                self._seek_offset = position
+                return True
+            if not alive or self.player_cmd == "mpv":
+                # Nothing to talk to (or an mpv that stopped answering): the
+                # caller starts the track again at the new position instead
+                return False
+            source = self._cache_file if (
+                self._cache_file and os.path.exists(self._cache_file)) else self._current_url
+            if not source:
+                return False
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            self._process = subprocess.Popen(
+                self._ffplay_cmd(source, position),
+                stdout=subprocess.DEVNULL,
+                stderr=self._open_stderr(),
+            )
+            self._seek_offset = position
+            self._play_start = time.time()
+            return True
+
     def _bind_media_keys(self) -> bool:
         """Point mpv's media keys at MEDIA_KEY_PROP so ticli handles them."""
         for key, action in MEDIA_KEY_ACTIONS.items():
@@ -1171,6 +1288,33 @@ class HeadlessTidalPlayer:
     MODE_PLAYLISTS = "playlists"
     MODE_ADD_TO_PLAYLIST = "add_to_playlist"
     MODE_SETTINGS = "settings"
+    MODE_ARTIST = "artist"
+
+    # The artist page's tabs, in the order Tab walks them. Each one is a
+    # different TIDAL endpoint and each is fetched the first time you land on
+    # it — see _load_artist_section.
+    ARTIST_SECTIONS = ("tracks", "albums", "playlists", "suggestions")
+    ARTIST_SECTION_LABELS = {
+        "tracks": "Top Tracks",
+        "albums": "Albums",
+        "playlists": "Playlists",
+        "suggestions": "Suggestions",
+    }
+    # Empty and failed are different facts and get different words: the first
+    # says what TIDAL knows about this artist, the second that we never got to
+    # ask. A blank screen would say neither.
+    ARTIST_SECTION_EMPTY = {
+        "tracks": "No tracks for this artist",
+        "albums": "No albums for this artist",
+        "playlists": "No playlists feature this artist",
+        "suggestions": "No suggestions for this artist",
+    }
+    ARTIST_SECTION_FAILED = {
+        "tracks": "Failed to load top tracks",
+        "albums": "Failed to load albums",
+        "playlists": "Failed to load playlists",
+        "suggestions": "Failed to load suggestions",
+    }
 
     # Setting name → tidalapi quality, and the terse badge shown on the player.
     # One name per tidalapi tier, same spelling as tidalapi uses, so the setting
@@ -1182,24 +1326,34 @@ class HeadlessTidalPlayer:
         "LOSSLESS": tidalapi.Quality.high_lossless,
         "HIRES": tidalapi.Quality.hi_res_lossless,
     }
-    # Search scopes, in the order Tab cycles them. "playlists" is the odd one
-    # out on purpose: TIDAL has no server-side search of your own playlists, so
-    # that scope is answered from the local index and never asks the network.
-    SEARCH_FILTERS = ("all", "tracks", "albums", "artists", "playlists")
+    # Search scopes, in the order Tab cycles them. The four server-side ones
+    # come first and share one request; "playlists" — *your* playlists — is
+    # last on purpose, because it is the odd one out: TIDAL has no server-side
+    # search of your own playlists, so that scope is answered from the local
+    # index and never asks the network at all.
+    #
+    # Two playlist scopes, and the scope key is not the category key: the
+    # reservoir's categories are named the way session.search() names them,
+    # and "tidal_playlists" is a *scope* over the "playlists" category, while
+    # the scope literally called "playlists" reads no category at all.
+    SEARCH_FILTERS = ("all", "tracks", "albums", "artists",
+                      "tidal_playlists", "playlists")
     SEARCH_FILTER_LABELS = {
         "all": "All",
         "tracks": "Tracks",
         "albums": "Albums",
         "artists": "Artists",
+        "tidal_playlists": "Playlists",
         "playlists": "My Playlists",
     }
     # Which categories a scope asks TIDAL for. Keyed by the plural names
     # session.search() answers with, so the fetch never has to translate.
     SEARCH_FILTER_KINDS = {
-        "all": ("tracks", "albums", "artists"),
+        "all": ("tracks", "albums", "artists", "playlists"),
         "tracks": ("tracks",),
         "albums": ("albums",),
         "artists": ("artists",),
+        "tidal_playlists": ("playlists",),
     }
 
     QUALITY_LABELS = {
@@ -1249,24 +1403,36 @@ class HeadlessTidalPlayer:
         self._play_start_time: Optional[float] = None
         self._play_offset: float = 0
         self._liked_ids: set = set()
-        # Search state
+        # Track radio: a fetch is in flight, and when the last one started
+        self._radio_fetching = False
+        self._radio_last_fetch = 0.0
+        # Scrubbing. _player_focus is what ↑ hands to the player: while it is
+        # set, ←/→ move within the track instead of between tracks (or in the
+        # list below). _seek_target is the position the user has scrubbed to
+        # and _seek_applied the last one the backend was actually told about —
+        # they differ only while a press is waiting out SEEK_COALESCE_SECONDS.
+        self._player_focus = False
+        self._seek_target: Optional[float] = None
+        self._seek_applied: Optional[float] = None
+        self._seek_applying = False
+        self._last_seek_apply = 0.0
+        # Search state. Results, cursor and message are not attributes: they
+        # are properties over the *view* for the scope on screen, so Tab is a
+        # change of which view is being read and nothing has to be copied.
         self._search_query = ""
-        self._search_results = []
-        self._search_cursor = 0
-        self._search_loading = False
-        self._search_message = ""
         self._search_history: list = []  # recent searches, newest first
-        # Which scope the query runs in, and the paging state behind it.
-        # The pool is what a fetch brought back but the page had no room for;
-        # scrolling past the bottom spends that before asking TIDAL again.
+        # Which scope the query runs in, and what the session has in hand for
+        # it: one reservoir of rows per query, and one view per scope drawing
+        # on it. Both are dropped the moment the query changes.
         self._search_filter = "all"
-        self._search_pool: dict = _empty_search_pool()
-        self._search_offset = 0
-        self._search_done = False  # TIDAL has nothing more behind this query
-        self._search_fetching = False  # a "load more" is in flight
+        self._search_key = ""  # the query the reservoir and views belong to
+        self._search_reservoir: dict = _empty_search_reservoir()
+        self._search_views: dict = {}
+        self._search_fetching = False  # a page is in flight (any scope)
         self._search_last_fetch = 0.0
-        # Bumped whenever the query, the scope or the results are reset, so a
-        # fetch that lands after the fact knows to throw its page away
+        # Bumped whenever the query is reset, so a fetch that lands after the
+        # fact knows to throw its page away. Not on a scope change: that page
+        # is still for this query, and every scope is served out of it.
         self._search_gen = 0
         # Browse state
         self._browse_title = ""
@@ -1276,6 +1442,16 @@ class HeadlessTidalPlayer:
         self._browse_message = ""
         # Set when browse is showing one of the user's own (editable) playlists
         self._browse_playlist = None
+        # Artist page state. Every section is its own request, so none of them
+        # runs until you tab onto it, and the answer is kept for the session in
+        # _artist_sections keyed by (artist id, section): walking the tabs back
+        # and forth costs one request per tab, ever, and never a second.
+        # _artist_cursors remembers where you were in each of them.
+        self._artist = None
+        self._artist_section = self.ARTIST_SECTIONS[0]
+        self._artist_cursor = 0
+        self._artist_sections: dict = {}
+        self._artist_cursors: dict = {}
         self._browse_remove_busy = False
         # Queue view state
         self._queue_cursor = 0
@@ -1291,6 +1467,13 @@ class HeadlessTidalPlayer:
         self._picker_cursor = 0
         self._picker_loading = False
         self._picker_busy = False
+        # The name being typed into the "+ New playlist" row, or None when it
+        # is not open. None vs "" is the whole state: "" is an open prompt with
+        # nothing typed yet, which is not the same as no prompt at all.
+        self._picker_new_name: Optional[str] = None
+        # The playlist a track was last added to, pinned to the top of the
+        # picker and persisted in the state file (see _remember_last_playlist).
+        self._last_playlist_id: Optional[str] = None
         # Settings page state. _settings_edit is the digits typed into a number
         # row so far, or None when the arrows are just navigating; it is only
         # ever replaced wholesale, never appended to in place
@@ -1320,8 +1503,11 @@ class HeadlessTidalPlayer:
         self._mini_player = False
         # Show more controls
         self._show_more = False
-        # The [v] volume overlay, which takes the footer's rows while it is up
+        # The [v] volume overlay, which takes the footer's rows while it is up,
+        # and whether the player had the arrows when it opened (so closing it
+        # gives them back to the scrub rather than to prev/next)
         self._volume_open = False
+        self._volume_from_focus = False
         # How the pane was last laid out. Replaced on every _build_display;
         # ROOMY_FIT until then, so a display builder called on its own (the
         # tests do) elides nothing for want of a window.
@@ -1670,6 +1856,38 @@ class HeadlessTidalPlayer:
         except Exception as e:
             logger.debug("Failed to merge position into saved state: %s", e)
 
+    def _remember_last_playlist(self, playlist):
+        """Pin the playlist a track was just added to, and persist it.
+
+        This lives in the *state* file, not the config: the config is a
+        schema'd set of things the user chose, each with a row on the settings
+        page and a migration when it changes. Which playlist you last used is
+        none of those — it is incidental, machine-written, and it belongs next
+        to the queue and the search history, which are already here.
+
+        Written through immediately (read-modify-write of the same atomic
+        file) rather than left to the shutdown save, because a session that
+        ends by anything other than [q] would otherwise lose it. Always called
+        from the background thread that did the adding, never the UI thread.
+        """
+        pid = str(getattr(playlist, "id", "") or "")
+        if not pid:
+            return
+        self._last_playlist_id = pid
+        data = {}
+        try:
+            if STATE_FILE.exists():
+                loaded = json.loads(STATE_FILE.read_text())
+                if isinstance(loaded, dict):
+                    data = loaded
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug("Failed to read state before pinning playlist: %s", e)
+        data["last_playlist_id"] = pid
+        try:
+            self._write_state_file(data)
+        except OSError as e:
+            logger.debug("Failed to persist last-used playlist: %s", e)
+
     def _save_state(self):
         """Save queue and playback state to disk for next session."""
         # If the restore never finished attaching the queue, our in-memory
@@ -1690,6 +1908,10 @@ class HeadlessTidalPlayer:
                 "position": self._get_position(),
                 "search_history": self._search_history[:20],
             }
+            # A full save rewrites the whole file, so the pin has to be carried
+            # through it or the last add of the session would be forgotten
+            if self._last_playlist_id:
+                state["last_playlist_id"] = self._last_playlist_id
             self._write_state_file(state)
         except Exception as e:
             logger.debug("Failed to save player state: %s", e)
@@ -1720,6 +1942,7 @@ class HeadlessTidalPlayer:
         except (json.JSONDecodeError, OSError):
             return
         self._search_history = data.get("search_history", [])[:20]
+        self._last_playlist_id = data.get("last_playlist_id") or None
         track_ids = data.get("track_ids", [])
         queue_index = data.get("queue_index", 0)
         position = data.get("position", 0) or 0
@@ -1757,7 +1980,11 @@ class HeadlessTidalPlayer:
                         pass
                 # Don't clobber anything the user started while we were loading
                 # (playing the restored track itself is fine — attach its queue)
-                if tracks and self._current_track in (None, current):
+                # `_restore_pending` is also the claim on the queue: anything
+                # that deliberately set one while we were fetching (radio keeps
+                # the same track playing, so the check below can't see it) drops
+                # the flag, and this attach stands down rather than clobbering it
+                if tracks and self._restore_pending and self._current_track in (None, current):
                     self._queue = tracks
                     try:
                         self._queue_index = tracks.index(current) if current is not None else min(idx, len(tracks) - 1)
@@ -1786,6 +2013,9 @@ class HeadlessTidalPlayer:
         """
         self._track_changing = True
         self._play_gen = gen = self._play_gen + 1
+        # This start decides where the track begins; any position still
+        # waiting to be scrubbed to belonged to the track we are leaving
+        self._seek_target = None
         self._prefetch_id = None  # re-arm the prefetch for this track's successor
         self._current_track = track
         self._playing = True
@@ -1960,11 +2190,80 @@ class HeadlessTidalPlayer:
     def _restart_current_track(self):
         """Send the current track back to 0:00 — a gapless mpv seek when the
         process is alive and playing, a fresh spawn from 0 otherwise."""
+        self._seek_target = None  # 0:00 supersedes anything still being scrubbed to
         if self._playing and self.audio and self.audio.seek_to_start():
             self._play_offset = 0
             self._play_start_time = time.time()
             return
         self._play_track(self._current_track, seek=0)
+
+    def _seek_by(self, delta: float):
+        """Scrub the current track by delta seconds.
+
+        The clock moves here, on the keypress, so the bar and the timer answer
+        the arrow before anything has been asked of the backend — a seek that
+        only appeared on the next position poll felt broken. Everything else
+        reads the position through _get_position(), so moving _play_offset is
+        the whole of the bookkeeping: the progress bar, the saved resume
+        position, the prefetch and the auto-advance all follow from it.
+
+        Both ends clamp. Past the start is 0:00, not the previous track, and
+        past the end stops just short of it rather than advancing: ←/→ mean
+        "move inside this song" here, and skipping is what they mean when the
+        player does not have focus.
+        """
+        if self._current_track is None:
+            return
+        duration = getattr(self._current_track, "duration", 0) or 0
+        target = max(0.0, self._get_position() + delta)
+        if duration > 0:
+            target = min(target, max(0.0, duration - SEEK_END_MARGIN))
+        self._play_offset = target
+        self._play_start_time = time.time() if self._playing else None
+        self._seek_target = target
+        self._flush_seek()
+
+    def _seek_pending(self) -> bool:
+        """Whether a scrubbed position is still on its way to the backend."""
+        return self._seek_applying or (
+            self._seek_target is not None and self._seek_target != self._seek_applied)
+
+    def _flush_seek(self):
+        """Hand a scrubbed position to the backend, at most one every
+        SEEK_COALESCE_SECONDS.
+
+        Called by the press that made it and, when that press landed too soon
+        after the last one, by the monitor's existing tick — no new thread of
+        control, and a held-down arrow costs a couple of seeks a second
+        instead of an mpv round trip (or, worse, an ffplay respawn) per key
+        repeat. Nothing is dropped: a position the backend has not been told
+        about stays visible as _seek_target != _seek_applied until it has.
+        """
+        target = self._seek_target
+        if target is None or target == self._seek_applied or self._seek_applying:
+            return
+        if time.monotonic() - self._last_seek_apply < SEEK_COALESCE_SECONDS:
+            return  # too soon — the next press or the monitor tick delivers it
+        self._seek_applying = True
+        self._last_seek_apply = time.monotonic()
+        gen = self._play_gen
+        track = self._current_track
+
+        def _run():
+            # Off the UI thread: an mpv that has stopped answering makes this
+            # wait out the IPC timeout, and killing ffplay is not instant
+            try:
+                if self._play_gen != gen:
+                    return  # the track moved on; this seek belongs to the old one
+                if not (self.audio and self.audio.seek_to(target)):
+                    # No live process to move — the only way to a position is
+                    # to start the track there
+                    self._play_track(track, seek=target)
+                self._seek_applied = target
+            finally:
+                self._seek_applying = False
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _toggle_play_key(self):
         """Play/pause from a keypress, on any screen.
@@ -2030,20 +2329,84 @@ class HeadlessTidalPlayer:
         threading.Thread(target=_run, daemon=True).start()
 
     def _start_track_radio(self):
-        """Start radio based on current track."""
-        if not self._current_track:
+        """Seed an endless mix from the song that is playing — without
+        interrupting it.
+
+        Radio is a queue change and nothing else: the track you pressed [r] on
+        keeps playing, from where it was, out of the process and the stream URL
+        it already had. It used to call `_play_track` on the first radio track,
+        which restarted the song you were enjoying from 0:00 and paid a second
+        `get_stream()` for the privilege. Nothing about the mix requires that —
+        `get_track_radio()` is "give me N tracks", so the whole job is to make
+        those tracks the *upcoming* queue with the current one at its head.
+
+        The fetch is a round trip, so it runs on a daemon thread, and the
+        brakes are the ones already in use elsewhere: `_radio_fetching`
+        single-flights it, `RADIO_FETCH_MIN_INTERVAL` floors the gap between
+        one fetch and the next (so a held-down [r] cannot fan out even between
+        two fast replies), and `_play_gen` — bumped by every `_play_track` —
+        is the generation counter that throws away a mix for a song that has
+        since been skipped past. Failure keeps the music playing and says so.
+        """
+        track = self._current_track
+        if track is None:
             return
-        track_id = self._current_track.id
+        now = time.monotonic()
+        if self._radio_fetching or now - self._radio_last_fetch < RADIO_FETCH_MIN_INTERVAL:
+            return
+        self._radio_fetching = True
+        self._radio_last_fetch = now
+        gen = self._play_gen
+        # Playback does not change, so without this the key looks dead
+        self._set_toast("Starting radio…")
+
         def _run():
+            tracks = None
             try:
-                radio_tracks = self._current_track.get_track_radio(limit=25)
-                if radio_tracks:
-                    self._queue = radio_tracks
-                    self._queue_index = 0
-                    self._play_track(self._queue[0])
-            except Exception:
-                pass
+                tracks = track.get_track_radio(limit=RADIO_LIMIT)
+            except Exception as e:
+                logger.debug("Track radio failed: %s", e)
+            finally:
+                self._radio_fetching = False
+            if self._play_gen != gen:
+                # A different song is playing now — this mix is for a song the
+                # user has already left, and must not take its queue
+                return
+            if not tracks or not self._apply_radio_queue(tracks):
+                self._set_toast("Radio unavailable — queue unchanged")
+            self._wake()
+
         threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_radio_queue(self, tracks: list):
+        """Put the playing track at the head of a fresh radio queue.
+
+        Whole-object assignment, never a mutation of the list the paint thread
+        and the monitor are reading. The current track becomes position 0, so
+        auto-advance, "up next" and the saved state all agree the moment the
+        swap lands, and the seed is dropped from the mix so it can't play
+        twice. The prefetch is re-armed rather than kept: a URL fetched for
+        whatever used to be next is no longer next (`_take_prefetched` would
+        discard it on the id check anyway).
+        """
+        head = self._current_track
+        if head is None:
+            return False
+        seed_id = getattr(head, "id", None)
+        queue = [head] + [t for t in tracks if getattr(t, "id", None) != seed_id]
+        if len(queue) < 2:
+            return False  # the mix was the song itself: nothing to queue
+        self._queue = queue
+        self._queue_index = 0
+        self._prefetch = None
+        self._prefetch_id = None
+        # The rows under the queue screen's cursor are all different rows now
+        self._queue_cursor = 0
+        # This queue is the user's, not the restore's: a restore still fetching
+        # the old one must not land on top of it, and saves are whole again
+        self._restore_pending = False
+        self._set_toast(f"Radio started — {len(queue) - 1} tracks up next")
+        return True
 
     def _handle_media_key(self, action):
         """Apply a media-key action coming from mpv (macOS only)."""
@@ -2064,10 +2427,13 @@ class HeadlessTidalPlayer:
         dead_polls = 0
         while self.running:
             if (self._playing and not self._track_changing and self.audio
+                    and not self._seek_applying
                     and not self.audio.is_paused and not self.audio.is_playing):
                 # Require two consecutive dead polls before advancing: a track
                 # change kills the old process before spawning the new one,
-                # and a single poll can land inside that window
+                # and a single poll can land inside that window. A seek being
+                # applied is the same window on ffplay, which has to be killed
+                # and respawned to land anywhere but where it already is.
                 dead_polls += 1
             else:
                 dead_polls = 0
@@ -2103,12 +2469,18 @@ class HeadlessTidalPlayer:
                     self._play_offset = 0
             elif self._playing and self.audio:
                 # Resync wall-clock position with mpv's real position so
-                # startup latency and drift never accumulate
-                pos = self.audio.get_time_pos()
-                if pos is not None:
-                    self._play_offset = pos
-                    self._play_start_time = time.time()
+                # startup latency and drift never accumulate — but not while a
+                # scrub is still on its way to the backend, or the bar would
+                # snap back to where the track was before the arrow key
+                if not self._seek_pending():
+                    pos = self.audio.get_time_pos()
+                    if pos is not None:
+                        self._play_offset = pos
+                        self._play_start_time = time.time()
                 self._maybe_prefetch_next()
+            # A press that came in too soon after the last one left its
+            # position waiting; this tick is what delivers it
+            self._flush_seek()
             # Save state periodically so a crash doesn't lose the position
             if time.time() - last_save > 10:
                 self._save_state()
@@ -2214,6 +2586,8 @@ class HeadlessTidalPlayer:
             content.append(f"  {pos_str}/{dur_str}", style="cyan")
             if self._queue:
                 content.append(f"  [{self._queue_index + 1}/{len(self._queue)}]", style="dim")
+            if self._player_focus:
+                content.append(f"  \u21c6 {SEEK_STEP_SECONDS}s", style="bold yellow")
             return content
 
         # Full player display
@@ -2278,14 +2652,23 @@ class HeadlessTidalPlayer:
         the indent leave over, and under MIN_BAR_WIDTH there is no honest bar
         to draw at all — the times alone are more informative than four cells
         that round to the same place for half the track.
+
+        The scrub marker is part of this line and not an afterthought appended
+        to it: focus is a state the arrows are in, so it has to be on screen,
+        and the columns it costs have to come out of the bar rather than off
+        the end of the pane.
         """
         pos_str = format_time(position)
         dur_str = format_time(duration) if duration > 0 else "--:--"
-        room = self._fit.inner - INDENT - len(pos_str) - len(dur_str) - 2
+        marker = f"  ⇆ {SEEK_STEP_SECONDS}s" if self._player_focus else ""
+        room = (self._fit.inner - INDENT - len(pos_str) - len(dur_str)
+                - len(marker) - 2)
         width = min(self._bar_max, room)
         line = Text()
         if width < MIN_BAR_WIDTH:
             line.append(f"{' ' * INDENT}{pos_str} / {dur_str}", style="cyan")
+            if marker:
+                line.append(marker, style="bold yellow")
             return line
         if duration > 0:
             filled = int(width * min(position / duration, 1.0))
@@ -2295,6 +2678,8 @@ class HeadlessTidalPlayer:
         line.append(f"{' ' * INDENT}{pos_str} ", style="cyan")
         line.append(bar, style="bold cyan" if self._playing else "dim")
         line.append(f" {dur_str}", style="cyan")
+        if marker:
+            line.append(marker, style="bold yellow")
         return line
 
     def _page_rows(self) -> int:
@@ -2310,9 +2695,15 @@ class HeadlessTidalPlayer:
         content.append("\u2588", style="bold white")
 
         # The scope row. It is always on screen, so Tab has something to point
-        # at and the active scope is never hidden state. Where the five don't
-        # fit, the active one alone still says both of those things \u2014 better
-        # than a row of scopes with the answer cut off the end of it.
+        # at and the active scope is never hidden state. A scope already shown
+        # for this query is marked, so "Tab is free from here on" is visible
+        # rather than something you have to have read the source to know.
+        #
+        # Six scopes do not fit a narrow pane, and the answer is not to let the
+        # row run off the end of one: below the width that holds them all, the
+        # active scope stands alone with its place in the cycle, which says the
+        # same two things — which scope you are in, and that Tab moves through
+        # more of them.
         scopes = Text()
         scopes.append("\n   [Tab]", style="bold")
         for i, name in enumerate(self.SEARCH_FILTERS):
@@ -2321,14 +2712,23 @@ class HeadlessTidalPlayer:
             scopes.append(
                 self.SEARCH_FILTER_LABELS[name],
                 style="bold cyan" if active else "dim")
-        if len(scopes.plain) - 1 > self._fit.inner:
+            if self._scope_answered(name):
+                scopes.append("\u00b7", style="dim cyan")
+        if cell_len(scopes.plain.lstrip("\n")) > self._fit.inner:
             scopes = Text("\n   [Tab]", style="bold")
+            scopes.append(f"  {self.SEARCH_FILTER_LABELS[self._search_filter]}",
+                          style="bold cyan")
+            if self._scope_answered(self._search_filter):
+                scopes.append("\u00b7", style="dim cyan")
             scopes.append(
-                f"  {self.SEARCH_FILTER_LABELS[self._search_filter]}",
-                style="bold cyan")
+                f"  ({self.SEARCH_FILTERS.index(self._search_filter) + 1}"
+                f"/{len(self.SEARCH_FILTERS)})", style="dim")
         content.append_text(scopes)
 
-        if self._search_loading:
+        if self._search_loading and not self._search_results:
+            # A scope waiting for its first page. Not the same as one that came
+            # back empty (green, below) and not the same as one served out of
+            # what the session already had (marked under the rows).
             content.append("\n\n   Searching...", style="dim yellow")
         elif self._search_message:
             content.append(f"\n\n   {self._search_message}", style="dim green")
@@ -2345,7 +2745,8 @@ class HeadlessTidalPlayer:
                     content.append("  \u25b8 ", style="bold cyan")
                 else:
                     content.append("    ", style="")
-                type_styles = {"track": "bold green", "album": "bold magenta", "artist": "bold yellow"}
+                type_styles = {"track": "bold green", "album": "bold magenta",
+                               "artist": "bold yellow", "playlist": "bold blue"}
                 badge = item["type"].upper()
                 content.append(f"[{badge}]", style=type_styles.get(item["type"], "dim"))
                 content.append(f" {item['name']}", style="bold white" if i == self._search_cursor else "white")
@@ -2353,10 +2754,15 @@ class HeadlessTidalPlayer:
                     content.append(f"  {item['artist']}", style="dim")
                 if item.get("playlist"):
                     content.append(f"  in {item['playlist']}", style="dim cyan")
-            if self._search_fetching:
+            if self._search_loading:
                 # The next page is on its way — say so under the last row, so
                 # scrolling off the bottom never looks like a frozen player
                 content.append("\n\n   Loading more...", style="dim yellow")
+            elif self._search_view()["cached"]:
+                # These rows cost nothing: they were already in hand when Tab
+                # landed here. Said plainly, because "instant" and "stale" are
+                # the same thing seen from two sides.
+                content.append("\n\n   Already loaded this session", style="dim")
             if total > page:
                 page_num = (self._search_cursor // page) + 1
                 total_pages = (total + page - 1) // page
@@ -2415,6 +2821,97 @@ class HeadlessTidalPlayer:
                 page_num = (max(0, self._browse_cursor - 1) // page) + 1 if self._browse_cursor > 0 else 1
                 total_pages = (total + page - 1) // page
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+
+        return content
+
+    def _build_artist_display(self) -> Text:
+        content = Text()
+        name = getattr(self._artist, "name", "") or "Artist"
+        content.append(f"   {name}", style="bold magenta")
+
+        # The tab row, always on screen for the same reason search's scope row
+        # is: which section you are in is never hidden state, and Tab has
+        # something to point at. Narrower than the four tabs need, it says the
+        # same thing about the one you are on and counts the rest — which is
+        # the pair of facts, and is not "Suggesti…" cut off at the border.
+        tabs = Text()
+        tabs.append("\n   [Tab]", style="bold")
+        for i, key in enumerate(self.ARTIST_SECTIONS):
+            tabs.append("  " if i == 0 else " · ", style="dim")
+            active = key == self._artist_section
+            tabs.append(
+                self.ARTIST_SECTION_LABELS[key],
+                style="bold cyan" if active else "dim")
+        if cell_len(tabs.plain.lstrip("\n")) > self._fit.inner:
+            tabs = Text("\n   [Tab]", style="bold")
+            tabs.append(f"  {self.ARTIST_SECTION_LABELS[self._artist_section]}",
+                        style="bold cyan")
+            tabs.append(
+                f"  ({self.ARTIST_SECTIONS.index(self._artist_section) + 1}"
+                f"/{len(self.ARTIST_SECTIONS)})", style="dim")
+        content.append_text(tabs)
+
+        record = self._artist_record()
+        label = self.ARTIST_SECTION_LABELS[self._artist_section].lower()
+        if record is None or record["state"] == "loading":
+            content.append(f"\n\n   Loading {label}...", style="dim yellow")
+            return content
+        if record["state"] == "failed":
+            # Red and with a way out: a failure is not "there is nothing here",
+            # and the difference has to be visible at a glance
+            content.append(f"\n\n   {record['message']}", style="bold red")
+            content.append("\n   [Enter] retry  [Tab] another section", style="dim")
+            return content
+
+        rows = record["items"]
+        if not rows:
+            content.append(f"\n\n   {record['message']}", style="dim green")
+            return content
+
+        total = len(rows)
+        page = self._page_rows()
+        cursor = min(max(self._artist_cursor, 0), total - 1)
+        page_start = (cursor // page) * page
+        page_end = min(page_start + page, total)
+        content.append(f"  ({total})", style="dim")
+        content.append("\n", style="")
+        type_styles = {"track": "bold green", "album": "bold magenta",
+                       "playlist": "bold cyan", "artist": "bold yellow"}
+        for i in range(page_start, page_end):
+            row = rows[i]
+            obj = row["obj"]
+            selected = (i == cursor)
+            content.append("\n")
+            content.append("  ▸ " if selected else "    ",
+                           style="bold cyan" if selected else "")
+            content.append(f"[{row['type'].upper()}]",
+                           style=type_styles.get(row["type"], "dim"))
+            item_name = getattr(obj, "name", None) or "?"
+            content.append(f" {item_name}", style="bold white" if selected else "white")
+            if row["type"] == "track":
+                artists = getattr(obj, "artists", None)
+                if artists:
+                    content.append(f"  {artists[0].name}", style="dim")
+                content.append(f"  {format_time(getattr(obj, 'duration', 0) or 0)}",
+                               style="dim cyan")
+            elif row["type"] == "album":
+                artist = getattr(obj, "artist", None)
+                if artist is not None and getattr(artist, "name", None):
+                    content.append(f"  {artist.name}", style="dim")
+                year = getattr(obj, "year", None)
+                if year:
+                    content.append(f"  {year}", style="dim cyan")
+            elif row["type"] == "playlist":
+                num_tracks = getattr(obj, "num_tracks", None)
+                if num_tracks:
+                    content.append(f"  {num_tracks} tracks", style="dim cyan")
+                creator = getattr(obj, "creator", None)
+                if creator is not None and getattr(creator, "name", None):
+                    content.append(f"  by {creator.name}", style="dim")
+        if total > page:
+            page_num = (cursor // page) + 1
+            total_pages = (total + page - 1) // page
+            content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
 
         return content
 
@@ -2506,16 +3003,38 @@ class HeadlessTidalPlayer:
         content.append("   Add to playlist: ", style="bold magenta")
         content.append(track_name, style="bold white")
 
+        # The "+ New playlist" row is cursor -1 and always on screen, above the
+        # list and off the paging, so it is reachable from any page and from an
+        # empty list. Typing turns it into a textbox with a visible caret, the
+        # way the settings page does, so typing never looks like navigating.
+        content.append("\n\n")
+        if self._picker_new_name is not None:
+            content.append("  ▸ ", style="bold cyan")
+            content.append("New playlist: ", style="bold white")
+            content.append(f"‹ {self._picker_new_name}▏›", style="bold yellow")
+            # The two keys this row takes are the footer's whole content while
+            # it is open (see _mode_hints), and a second copy of them here is
+            # the first thing to run off the end of a narrow pane — the only
+            # hint in the app that was written outside _fit_hints, and it was
+            # the only one that could be cut in half
+        else:
+            selected = self._picker_cursor < 0
+            content.append("  ▸ " if selected else "    ", style="bold cyan" if selected else "")
+            content.append("+ New playlist", style="bold white" if selected else "white")
+
+        playlists = self._picker_playlists()
         if self._picker_loading:
             content.append("\n\n   Loading playlists...", style="dim yellow")
-        elif self._editable_playlists:
-            total = len(self._editable_playlists)
+        elif playlists:
+            total = len(playlists)
             page = self._page_rows()
-            page_start = (self._picker_cursor // page) * page
+            # The cursor sits at -1 on the "+ New playlist" row, which belongs
+            # to no page — clamp rather than divide a negative into one
+            page_start = (max(self._picker_cursor, 0) // page) * page
             page_end = min(page_start + page, total)
             content.append("\n", style="")
             for i in range(page_start, page_end):
-                pl = self._editable_playlists[i]
+                pl = playlists[i]
                 content.append("\n")
                 if i == self._picker_cursor:
                     content.append("  ▸ ", style="bold cyan")
@@ -2526,8 +3045,12 @@ class HeadlessTidalPlayer:
                 content.append(pl_name, style="bold white" if i == self._picker_cursor else "white")
                 if num_tracks != "":
                     content.append(f"  {num_tracks} tracks", style="dim cyan")
+                # Say why this one is at the top, rather than reordering silently
+                if i == 0 and self._last_playlist_id and str(
+                        getattr(pl, "id", "") or "") == self._last_playlist_id:
+                    content.append("  last used", style="dim")
             if total > page:
-                page_num = (self._picker_cursor // page) + 1
+                page_num = (max(self._picker_cursor, 0) // page) + 1
                 total_pages = (total + page - 1) // page
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
         else:
@@ -2731,27 +3254,34 @@ class HeadlessTidalPlayer:
 
         `short` is the same thing in fewer columns and `rank` decides what is
         dropped first when even the keys won't fit; neither has anything to do
-        with the order. Every mode that isn't typing a query carries [v],
-        because the volume overlay is reachable from all of them.
+        with the order. Every mode that is not typing carries [v], because the
+        volume overlay is reachable from all of them — and the two that are
+        typing (a search query, a new playlist's name) do not, because there
+        `v` is the letter v.
+
+        Every hint on every screen goes through here and out through
+        _fit_hints. Nothing is appended to the footer anywhere else, which is
+        what makes "a pair is never split" true of all of them at once rather
+        than of the ones somebody remembered.
         """
         if self._mini_player:
             # Tiny mode is the whole point of tiny mode: one line, no footer
             return []
         if self._mode == self.MODE_SEARCH:
             hints = [
-                Hint("Enter/→", "search/open", "open", 0),
-                Hint("↑/↓", "navigate", "move", 2),
+                Hint("Enter/\u2192", "search/open", "open", 0),
+                Hint("\u2191/\u2193", "navigate", "move", 2),
                 Hint("Tab", "filter", None, 3),
             ]
             if self._search_results:
                 hints.append(Hint("Space", "pause/play", "pause", 4))
-            hints.append(Hint("←/Esc", "back", None, 1))
+            hints.append(Hint("\u2190/Esc", "back", None, 1))
             hints.append(Hint("Bksp", "delete", "del", 5))
             return hints
         if self._mode == self.MODE_BROWSE:
             hints = [
-                Hint("Enter/→", "play track", "play", 0),
-                Hint("↑/↓", "navigate", "move", 2),
+                Hint("Enter/\u2192", "play track", "play", 0),
+                Hint("\u2191/\u2193", "navigate", "move", 2),
                 Hint("Space", "pause/play", "pause", 4),
                 Hint("a", "play all", "all", 5),
                 Hint("y", "add to playlist", "add", 6),
@@ -2759,44 +3289,75 @@ class HeadlessTidalPlayer:
             if self._browse_playlist is not None:
                 hints.append(Hint("x", "remove", "del", 7))
             hints.append(Hint("v", "volume", "vol", 3))
-            hints.append(Hint("←/Esc", "back", None, 1))
+            hints.append(Hint("\u2190/Esc", "back", None, 1))
             return hints
+        if self._mode == self.MODE_ARTIST:
+            # [Tab] outranks nearly everything here: the four sections are the
+            # page, and a footer that dropped it would leave three of them
+            # unreachable with no sign they exist
+            return [
+                Hint("Enter/\u2192", "open", None, 0),
+                Hint("\u2191/\u2193", "navigate", "move", 3),
+                Hint("Tab", "section", None, 1),
+                Hint("a", "play all", "all", 5),
+                Hint("v", "volume", "vol", 4),
+                Hint("\u2190/Esc", "back", None, 2),
+            ]
         if self._mode == self.MODE_QUEUE:
             return [
                 Hint("Enter", "play", None, 0),
-                Hint("↑/↓", "navigate", "move", 2),
+                Hint("\u2191/\u2193", "navigate", "move", 2),
                 Hint("Space", "pause/play", "pause", 4),
                 Hint("x", "remove", "del", 6),
                 Hint("y", "add to playlist", "add", 7),
                 Hint("v", "volume", "vol", 3),
-                Hint("←/Esc", "back", None, 1),
+                Hint("\u2190/Esc", "back", None, 1),
             ]
         if self._mode == self.MODE_PLAYLISTS:
             return [
-                Hint("Enter/→", "open", None, 0),
-                Hint("↑/↓", "navigate", "move", 2),
+                Hint("Enter/\u2192", "open", None, 0),
+                Hint("\u2191/\u2193", "navigate", "move", 2),
                 Hint("Space", "pause/play", "pause", 4),
                 Hint("v", "volume", "vol", 3),
-                Hint("←/Esc", "back", None, 1),
+                Hint("\u2190/Esc", "back", None, 1),
             ]
         if self._mode == self.MODE_ADD_TO_PLAYLIST:
+            if self._picker_new_name is not None:
+                # Typing: the arrows do nothing here, so the row must not
+                # advertise them — and [v] is a letter of the name
+                return [
+                    Hint("Enter", "create", None, 0),
+                    Hint("Esc", "cancel", None, 1),
+                ]
             return [
                 Hint("Enter", "add", None, 0),
-                Hint("↑/↓", "navigate", "move", 1),
-                Hint("←/Esc", "cancel", None, 2),
+                Hint("\u2191/\u2193", "navigate", "move", 2),
+                Hint("v", "volume", "vol", 3),
+                Hint("\u2190/Esc", "cancel", None, 1),
             ]
         if self._mode == self.MODE_SETTINGS:
             return [
-                Hint("↑/↓", "select", None, 1),
-                Hint("←/→", "change", None, 0),
+                Hint("\u2191/\u2193", "select", None, 1),
+                Hint("\u2190/\u2192", "change", None, 0),
                 Hint("Space", "pause/play", "pause", 4),
                 Hint("v", "volume", "vol", 3),
                 Hint("o", "log out", "out", 5),
                 Hint("Esc", "back", None, 2),
             ]
+        # The player screen, where the arrows mean two different things and the
+        # footer has to say which: scrubbing is a state, so it is never left to
+        # be inferred from the marker on the progress line alone
         hints = [
             Hint("space", "play/pause", "play", 0),
-            Hint("←/→", "prev/next", "skip", 1),
+        ]
+        if self._player_focus:
+            hints += [
+                Hint("\u2190/\u2192", f"seek {SEEK_STEP_SECONDS}s", "seek", 1),
+                Hint("\u2193", "back", None, 1),
+            ]
+        else:
+            hints.append(Hint("\u2190/\u2192", "prev/next", "skip", 1))
+        hints += [
             Hint("s", "search", None, 2),
             Hint("v", "volume", "vol", 3),
             Hint("t", "tiny", None, 5),
@@ -2804,6 +3365,7 @@ class HeadlessTidalPlayer:
         ]
         if self._show_more:
             hints += [
+                Hint("\u2191", "scrub", None, 6),
                 Hint("l", "like", None, 6),
                 Hint("r", "radio", None, 6),
                 Hint("y", "add to playlist", "add", 7),
@@ -2900,6 +3462,8 @@ class HeadlessTidalPlayer:
                 content.append_text(self._build_search_display())
             elif self._mode == self.MODE_BROWSE:
                 content.append_text(self._build_browse_display())
+            elif self._mode == self.MODE_ARTIST:
+                content.append_text(self._build_artist_display())
             elif self._mode == self.MODE_QUEUE:
                 content.append_text(self._build_queue_display())
             elif self._mode == self.MODE_PLAYLISTS:
@@ -2999,6 +3563,13 @@ class HeadlessTidalPlayer:
         page showing one row out of seven at 80x24, which is what the first
         attempt at this actually did. The footer is last everywhere, and only
         ever from two rows to one.
+
+        Nothing here can relax the artist page's tab row or the search screen's
+        scope row, and that is deliberate rather than an omission: both are
+        state that would otherwise be hidden — which section you are in, which
+        scope Tab landed on — so they are drawn at every height and it is the
+        rows under them that give way. (The scope row still gets *narrower*
+        with the pane; that is width, and it is decided where it is drawn.)
         """
         if self._mini_player:
             return ()
@@ -3022,15 +3593,13 @@ class HeadlessTidalPlayer:
         if self._mode == self.MODE_SEARCH:
             self._nav_history.append({
                 "mode": self.MODE_SEARCH,
+                # The rows, the pool and the paging depth are all still in
+                # _search_views and the reservoir behind it, so coming back
+                # from an album needs nothing but the query and the scope it
+                # was in — and asks TIDAL for nothing at all
                 "query": self._search_query,
-                "results": list(self._search_results),
-                "cursor": self._search_cursor,
-                # Paging comes back too, so coming back from an album lands you
-                # where you were and scrolling on still fetches the next page
                 "filter": self._search_filter,
-                "pool": dict(self._search_pool),
-                "offset": self._search_offset,
-                "done": self._search_done,
+                "cursor": self._search_cursor,
             })
         elif self._mode == self.MODE_BROWSE:
             self._nav_history.append({
@@ -3038,6 +3607,13 @@ class HeadlessTidalPlayer:
                 "title": self._browse_title,
                 "tracks": list(self._browse_tracks),
                 "cursor": self._browse_cursor,
+            })
+        elif self._mode == self.MODE_ARTIST:
+            self._nav_history.append({
+                "mode": self.MODE_ARTIST,
+                "artist": self._artist,
+                "section": self._artist_section,
+                "cursor": self._artist_cursor,
             })
         elif self._mode == self.MODE_QUEUE:
             self._nav_history.append({
@@ -3061,16 +3637,12 @@ class HeadlessTidalPlayer:
         if mode == self.MODE_SEARCH:
             self._mode = self.MODE_SEARCH
             self._search_query = state.get("query", "")
-            self._search_results = state.get("results", [])
-            self._search_cursor = state.get("cursor", 0)
             self._search_filter = state.get("filter", "all")
-            self._search_pool = state.get("pool") or _empty_search_pool()
-            self._search_offset = state.get("offset", 0)
-            self._search_done = state.get("done", False)
-            self._search_gen += 1  # anything still in flight belongs to the old view
-            self._search_loading = False
-            self._search_fetching = False
-            self._search_message = ""
+            if self._search_filter in self._search_views:
+                self._search_cursor = state.get("cursor", 0)
+            # The generation is deliberately left alone: a page still in flight
+            # is for this same query, and the scope that asked for it is still
+            # waiting for it here.
         elif mode == self.MODE_BROWSE:
             self._mode = self.MODE_BROWSE
             self._browse_title = state.get("title", "")
@@ -3078,9 +3650,20 @@ class HeadlessTidalPlayer:
             self._browse_cursor = state.get("cursor", 0)
             self._browse_loading = False
             self._browse_message = ""
+        elif mode == self.MODE_ARTIST:
+            # The sections are still in _artist_sections, so coming back lands
+            # on the same tab with the same rows and makes no request at all
+            self._mode = self.MODE_ARTIST
+            self._artist = state.get("artist")
+            self._artist_section = state.get("section", self.ARTIST_SECTIONS[0])
+            self._artist_cursor = state.get("cursor", 0)
+            self._load_artist_section()
         elif mode == self.MODE_QUEUE:
             self._mode = self.MODE_QUEUE
-            self._queue_cursor = state.get("cursor", 0)
+            # Clamped: the queue can have been replaced (radio) or shortened
+            # while we were away, and a cursor past the end pages the screen
+            # to rows that no longer exist
+            self._queue_cursor = min(state.get("cursor", 0), max(len(self._queue) - 1, 0))
         elif mode == self.MODE_PLAYLISTS:
             self._mode = self.MODE_PLAYLISTS
             self._playlists_cursor = state.get("cursor", 0)
@@ -3099,24 +3682,38 @@ class HeadlessTidalPlayer:
 
     @staticmethod
     def _search_split(page: int) -> tuple:
-        """How many tracks / albums / artists make up one page of results.
-        Keeps the old 50/30/20 feel, but scaled to "Songs per page" instead of
-        a hardcoded 5/3/2 — one page of search is one page of rows, like every
-        other list. Albums and artists never round away to nothing."""
-        # Floor division, so the rounding always falls to tracks and songs stay
-        # at least half the page even at the 5-row minimum
-        albums = max(1, page * 3 // 10)
-        artists = max(1, page * 2 // 10)
-        return max(1, page - albums - artists), albums, artists
+        """How many tracks / albums / artists / playlists make up one page of
+        results.
 
-    def _search_kinds(self) -> tuple:
-        """Which categories the active scope asks TIDAL for."""
-        return self.SEARCH_FILTER_KINDS.get(self._search_filter, ())
+        45/25/15/15, scaled to "Songs per page" rather than hardcoded — one
+        page of search is one page of rows, like every other list. Tracks keep
+        the plurality because the common case is looking for a song; the
+        fourth category came out of albums and artists (was 50/30/20) rather
+        than out of tracks. No category ever rounds away to nothing.
+        """
+        # Floor division, so the rounding always falls to tracks
+        albums = max(1, page * 25 // 100)
+        artists = max(1, page * 15 // 100)
+        playlists = max(1, page * 15 // 100)
+        return max(1, page - albums - artists - playlists), albums, artists, playlists
 
-    def _search_models(self) -> list:
-        """The tidalapi models behind those categories."""
-        models = {"tracks": tidalapi.Track, "albums": tidalapi.Album, "artists": tidalapi.Artist}
-        return [models[kind] for kind in self._search_kinds()]
+    def _search_kinds(self, scope: Optional[str] = None) -> tuple:
+        """Which of the reservoir's categories a scope shows."""
+        return self.SEARCH_FILTER_KINDS.get(scope or self._search_filter, ())
+
+    @staticmethod
+    def _search_models() -> list:
+        """What a fetch asks TIDAL for — always all four categories, whatever
+        scope asked for it.
+
+        `limit` is applied per type (session.search() puts the model names in
+        one `types=` parameter of one GET), so this is the same single request
+        either way; the payload is bigger and every other scope is then
+        answered out of it for free. That is the whole trade: one request buys
+        the query, not the scope, so Tab can apply immediately without costing
+        anything.
+        """
+        return [tidalapi.Track, tidalapi.Album, tidalapi.Artist, tidalapi.Playlist]
 
     def _search_row(self, kind: str, obj) -> dict:
         """One result row. Everything downstream reads these, not the objects."""
@@ -3126,81 +3723,271 @@ class HeadlessTidalPlayer:
         if kind == "albums":
             artist = obj.artist.name if obj.artist else ""
             return {"type": "album", "name": obj.name, "artist": artist, "obj": obj}
+        if kind == "playlists":
+            # Whose playlist it is, and failing that how big it is. A curated
+            # playlist often has no creator name, and "Chill Vibes" on its own
+            # says nothing about which of the twelve of them this is.
+            creator = getattr(getattr(obj, "creator", None), "name", "") or ""
+            count = getattr(obj, "num_tracks", 0) or 0
+            detail = creator or (f"{count} tracks" if count > 0 else "")
+            return {"type": "playlist", "name": obj.name, "artist": detail, "obj": obj}
         return {"type": "artist", "name": obj.name, "artist": "", "obj": obj}
 
-    def _take_search_page(self, pool: dict, page: int) -> tuple:
-        """One page of rows out of the pool, and what the pool has left.
+    # ── The per-scope views over one query's reservoir ──
+
+    def _search_view(self, scope: Optional[str] = None) -> dict:
+        """The view for a scope, or an empty one if it has never been shown.
+        Presence in `_search_views` — not any flag inside the record — is the
+        answer to "has this scope been applied to this query", exactly as
+        `_artist_sections` answers it for the artist page's tabs."""
+        return self._search_views.get(scope or self._search_filter) or _empty_search_view()
+
+    def _scope_answered(self, scope: str) -> bool:
+        """Whether this scope already has its rows for this query — the thing
+        the mark on the scope row means, asked in one place because the row is
+        drawn two ways (all six scopes, or the active one alone when the pane
+        is too narrow for six) and both must mark it the same."""
+        view = self._search_views.get(scope)
+        return bool(view) and not view["loading"]
+
+    def _put_search_view(self, scope: str, **changes):
+        """Replace a view whole. Both dicts are assigned, never mutated, so a
+        paint racing a fetch reads one complete record or the other."""
+        self._search_views = {
+            **self._search_views, scope: {**self._search_view(scope), **changes}}
+
+    @property
+    def _search_results(self) -> list:
+        return self._search_view()["results"]
+
+    @_search_results.setter
+    def _search_results(self, value: list):
+        self._put_search_view(self._search_filter, results=list(value))
+
+    @property
+    def _search_message(self) -> str:
+        return self._search_view()["message"]
+
+    @property
+    def _search_loading(self) -> bool:
+        """The scope on screen is waiting for rows — its first page or its
+        next one; the display tells those apart by whether it has any yet."""
+        return self._search_view()["loading"]
+
+    @property
+    def _search_cursor(self) -> int:
+        return self._search_view()["cursor"]
+
+    @_search_cursor.setter
+    def _search_cursor(self, value: int):
+        self._put_search_view(self._search_filter, cursor=value)
+
+    @property
+    def _search_offset(self) -> int:
+        """How deep into the query the reservoir has gone — one number for
+        every scope, because one fetch deepens all of them."""
+        return self._search_reservoir["offset"]
+
+    @_search_offset.setter
+    def _search_offset(self, value: int):
+        self._search_reservoir = {**self._search_reservoir, "offset": value}
+
+    @property
+    def _search_pool(self) -> dict:
+        """What the reservoir still holds that the scope on screen has not
+        shown. Only that scope's categories: a page of albums nobody asked for
+        is not "more results" under Tracks."""
+        consumed = self._search_view()["consumed"]
+        pool = _empty_search_pool()
+        for kind in self._search_kinds():
+            pool[kind] = self._search_reservoir[kind][consumed.get(kind, 0):]
+        return pool
+
+    @property
+    def _search_done(self) -> bool:
+        return self._search_scope_done(self._search_filter)
+
+    @_search_done.setter
+    def _search_done(self, value: bool):
+        self._search_reservoir = {**self._search_reservoir, "stopped": bool(value)}
+
+    def _search_scope_done(self, scope: str) -> bool:
+        """Nothing more will ever come for this scope: the query failed, TIDAL
+        has nothing past 300, or every category it shows has run short. An
+        empty tuple of categories (My Playlists) is done by construction."""
+        reservoir = self._search_reservoir
+        if reservoir["stopped"] or reservoir["offset"] >= SEARCH_MAX_OFFSET:
+            return True
+        return all(reservoir["exhausted"][kind] for kind in self._search_kinds(scope))
+
+    def _take_search_page(self, scope: str, consumed: dict, page: int) -> tuple:
+        """One page of rows for a scope, out of the reservoir at `consumed`,
+        and the depth that leaves behind.
 
         Under a type filter the page is all of that type; under "All" it is the
-        50/30/20 split, still exactly `page` rows. Never mutates the pool it is
-        given — the caller swaps in the returned one whole.
+        45/25/15/15 split, still exactly `page` rows. Reads the reservoir, never
+        touches it — two scopes can be at two depths in the same rows.
         """
-        if self._search_filter == "all":
-            n_tracks, n_albums, n_artists = self._search_split(page)
+        reservoir = self._search_reservoir
+        kinds = ("tracks", "albums", "artists", "playlists")
+        avail = {kind: len(reservoir[kind]) - consumed.get(kind, 0) for kind in kinds}
+        if scope == "all":
+            n_tracks, n_albums, n_artists, n_playlists = self._search_split(page)
             # A query with one album shouldn't waste the other album rows —
             # hand the shortfall to tracks, which is what you searched for
-            n_albums = min(n_albums, len(pool["albums"]))
-            n_artists = min(n_artists, len(pool["artists"]))
-            n_tracks = min(page - n_albums - n_artists, len(pool["tracks"]))
-            counts = {"tracks": n_tracks, "albums": n_albums, "artists": n_artists}
+            n_albums = min(n_albums, avail["albums"])
+            n_artists = min(n_artists, avail["artists"])
+            n_playlists = min(n_playlists, avail["playlists"])
+            n_tracks = min(page - n_albums - n_artists - n_playlists, avail["tracks"])
+            counts = {"tracks": n_tracks, "albums": n_albums,
+                      "artists": n_artists, "playlists": n_playlists}
         else:
-            counts = {kind: page for kind in self._search_kinds()}
+            counts = {kind: page for kind in self._search_kinds(scope)}
 
         items = []
-        rest = _empty_search_pool()
-        for kind in ("tracks", "albums", "artists"):
-            take = min(counts.get(kind, 0), len(pool[kind]))
-            items.extend(self._search_row(kind, obj) for obj in pool[kind][:take])
-            rest[kind] = pool[kind][take:]
+        rest = dict(consumed)
+        for kind in kinds:
+            start = consumed.get(kind, 0)
+            take = min(counts.get(kind, 0), avail[kind])
+            items.extend(self._search_row(kind, obj)
+                         for obj in reservoir[kind][start:start + take])
+            rest[kind] = start + take
         return items, rest
 
     @staticmethod
     def _pool_size(pool: dict) -> int:
         return sum(len(v) for v in pool.values())
 
+    def _search_servable(self, scope: str) -> bool:
+        """Can the rows already in hand answer this scope's next page?
+
+        A short page — or none at all — only counts once the query has nothing
+        left to give: otherwise the first Tab onto a thin category would settle
+        for four rows. But once it *is* done, an empty category is the answer,
+        and asking again would only fetch a page TIDAL has already said it does
+        not have.
+        """
+        consumed = self._search_view(scope)["consumed"]
+        held = sum(len(self._search_reservoir[kind]) - consumed.get(kind, 0)
+                   for kind in self._search_kinds(scope))
+        if held >= self._page_size:
+            return True
+        return self._search_scope_done(scope) and self._search_reservoir["offset"] > 0
+
+    def _fill_search_view(self, scope: str):
+        """Append one page to a scope out of the reservoir, and say so when
+        there was nothing there to append."""
+        view = self._search_view(scope)
+        items, consumed = self._take_search_page(scope, view["consumed"], self._page_size)
+        self._put_search_view(
+            scope, results=view["results"] + items, consumed=consumed, loading=False,
+            message="" if (view["results"] or items) else "No results found")
+
+    def _fill_waiting_search_views(self):
+        """A page landed: hand it to every scope that was waiting for one.
+        Not just the scope on screen — a Tab while the request was out left
+        others loading, and they are answered by the same rows."""
+        for scope in self.SEARCH_FILTERS:
+            if scope in self._search_views and self._search_views[scope]["loading"]:
+                self._fill_search_view(scope)
+
+    def _fail_waiting_search_views(self, message: str):
+        """The request the waiting scopes were waiting for did not come back.
+        One that already has rows keeps them and simply stops paging."""
+        for scope in self.SEARCH_FILTERS:
+            view = self._search_views.get(scope)
+            if view is None or not view["loading"]:
+                continue
+            self._put_search_view(
+                scope, loading=False, message="" if view["results"] else message)
+
     def _reset_search_results(self):
-        """Forget the current results and everything paging knows about them.
-        Bumping the generation is what makes a fetch already in flight drop
-        its page instead of appending it to a list it no longer belongs to."""
+        """Forget the query and everything filed under it — every scope's view
+        and the reservoir they all draw on. Bumping the generation is what
+        makes a fetch already in flight drop its page instead of pouring it
+        into a reservoir that no longer belongs to that query."""
         self._search_gen += 1
-        self._search_results = []
-        self._search_cursor = 0
-        self._search_message = ""
-        self._search_pool = _empty_search_pool()
-        self._search_offset = 0
-        self._search_done = False
+        self._search_key = ""
+        self._search_views = {}
+        self._search_reservoir = _empty_search_reservoir()
+        self._search_fetching = False
 
     def _cycle_search_filter(self, step: int = 1):
-        """Tab through the scopes. Changing scope drops the results but does
-        not refetch: every scope but "My Playlists" costs a request, and Tab is
-        a key you press repeatedly. Enter runs the search, exactly as it does
-        after typing — one deliberate keystroke, one request."""
+        """Tab through the scopes, applying each one as you land on it — no
+        second keystroke. It is not the fan-out it looks like: a fetch asks for
+        all three categories at once, so the scopes share one reservoir and
+        cycling every one of them after a search costs nothing at all. The
+        cursor lives in the view, so coming back comes back to where you were.
+        """
         order = self.SEARCH_FILTERS
         self._search_filter = order[(order.index(self._search_filter) + step) % len(order)]
-        self._reset_search_results()
-        self._search_loading = False
+        self._apply_search_scope()
 
     def _do_search(self):
+        """Enter: the explicit search, and the explicit refresh. Everything
+        filed under this query goes — every scope's rows, not just the one on
+        screen — so Enter is how you get past the session's cache."""
         query = self._search_query.strip()
         if not query:
             return
         self._add_to_history(query)
         self._reset_search_results()
-        if self._search_filter == "playlists":
+        self._search_key = query
+        self._apply_search_scope()
+
+    def _apply_search_scope(self):
+        """Show the scope on screen, and ask TIDAL for it only if nothing
+        already in hand can answer it.
+
+        The three ways out without a request are the point: a scope visited
+        before, a scope the reservoir can fill, and a scope whose page is
+        already on its way — that last one is what makes a held-down Tab one
+        request rather than five.
+        """
+        query = self._search_query.strip()
+        if not query:
+            return
+        scope = self._search_filter
+        if query != self._search_key:
+            # Tabbed onto a query nothing is filed under (typing never
+            # searches): start the query here, in this scope
+            self._reset_search_results()
+            self._search_key = query
+        elif scope in self._search_views:
+            # Visited already, loading or ready — either way there is nothing
+            # to do. Only a finished one counts as free: a scope still waiting
+            # on the request it started must not claim it cost nothing.
+            if not self._search_views[scope]["loading"]:
+                self._put_search_view(scope, cached=True)
+            return
+        if scope == "playlists":
             self._search_own_playlists(query)
             return
-        self._search_loading = True
+        if self._search_reservoir["message"]:
+            self._put_search_view(scope, loading=False,
+                                  message=self._search_reservoir["message"])
+            return
+        if self._search_servable(scope):
+            self._put_search_view(scope, cached=True)
+            self._fill_search_view(scope)
+            return
+        self._put_search_view(scope, loading=True, message="", cached=False)
+        if self._search_fetching:
+            return  # the page already in flight will fill this view too
+        self._search_fetching = True
         self._fetch_search_page(query, self._search_gen)
 
     def _fetch_search_page(self, query: str, gen: int):
         """One page of results from TIDAL, on a daemon thread.
 
+        It fills the reservoir, not a scope: whatever comes back belongs to the
+        query, and every scope waiting on it is served out of the same rows.
+
         Snapshot the page size now: changing the setting mid-flight retunes the
         next search, it never refetches this one.
         """
         page = self._page_size
-        offset = self._search_offset
-        kinds = self._search_kinds()
+        offset = self._search_reservoir["offset"]
         models = self._search_models()
         self._search_last_fetch = time.monotonic()
 
@@ -3211,32 +3998,32 @@ class HeadlessTidalPlayer:
                 # one category comes up short.
                 results = self.session.search(query, models=models, limit=page, offset=offset)
                 if gen != self._search_gen:
-                    return  # the query or the scope moved on while we were out
-                pool = _empty_search_pool()
-                short = True
-                for kind in kinds:
-                    found = list(results.get(kind) or [])
-                    pool[kind] = self._search_pool[kind] + found
-                    if len(found) >= page:
-                        short = False
-                # A page TIDAL couldn't fill for any category is the last one,
-                # and it never has more than 300 items behind a query anyway
-                self._search_offset = offset + page
-                self._search_done = short or self._search_offset >= SEARCH_MAX_OFFSET
-                items, rest = self._take_search_page(pool, page)
-                if gen != self._search_gen:
-                    return
-                self._search_pool = rest
-                self._search_results = self._search_results + items
-                if not self._search_results:
-                    self._search_message = "No results found"
+                    return  # the query moved on while we were out
+                reservoir = self._search_reservoir
+                found = {kind: list(results.get(kind) or [])
+                         for kind in ("tracks", "albums", "artists", "playlists")}
+                # A category TIDAL couldn't fill has nothing more behind it, and
+                # there is never more than 300 items behind a query anyway
+                self._search_reservoir = {
+                    **reservoir,
+                    **{kind: reservoir[kind] + rows for kind, rows in found.items()},
+                    "offset": offset + page,
+                    "exhausted": {kind: reservoir["exhausted"][kind] or len(rows) < page
+                                  for kind, rows in found.items()},
+                }
+                self._fill_waiting_search_views()
             except Exception as e:
                 if gen == self._search_gen:
-                    self._search_message = f"Search failed: {e}"
-                    self._search_done = True
+                    message = f"Search failed: {e}"
+                    self._search_reservoir = {
+                        **self._search_reservoir, "stopped": True, "message": message}
+                    self._fail_waiting_search_views(message)
             finally:
-                self._search_loading = False
-                self._search_fetching = False
+                # Only while this is still the query being searched: a fetch
+                # that has been superseded must not open the gate on the one
+                # that replaced it
+                if gen == self._search_gen:
+                    self._search_fetching = False
                 self._wake()  # results landed off the UI thread; repaint now
 
         threading.Thread(target=_run, daemon=True).start()
@@ -3244,29 +4031,27 @@ class HeadlessTidalPlayer:
     def _search_more(self):
         """The next page, asked for by scrolling off the bottom of this one.
 
-        Free whenever the last fetch overshot the page — that surplus is
-        already in the pool. Only an empty pool costs a request, and only one
-        is ever in flight, so holding the down arrow can't fan out.
+        Free whenever the reservoir still holds rows this scope has not shown —
+        which is most of the time, since every fetch brings back a page of each
+        category. Only an empty one costs a request, and only one is ever in
+        flight, so holding the down arrow can't fan out.
         """
         if self._search_loading or self._search_fetching:
             return
-        if self._search_filter == "playlists":
+        scope = self._search_filter
+        if scope == "playlists":
             return  # a local scan already returned everything it has
-        page = self._page_size
-        pool = self._search_pool
-        if self._pool_size(pool) >= page or (self._search_done and self._pool_size(pool)):
-            items, rest = self._take_search_page(pool, page)
-            self._search_pool = rest
-            self._search_results = self._search_results + items
+        if self._search_servable(scope):
+            self._fill_search_view(scope)
             return
-        if self._search_done or self._search_offset >= SEARCH_MAX_OFFSET:
-            self._search_done = True
+        if self._search_scope_done(scope):
             return
         if time.monotonic() - self._search_last_fetch < SEARCH_FETCH_MIN_INTERVAL:
             return
         query = self._search_query.strip()
         if not query:
             return
+        self._put_search_view(scope, loading=True, cached=False)
         self._search_fetching = True
         self._fetch_search_page(query, self._search_gen)
 
@@ -3274,28 +4059,53 @@ class HeadlessTidalPlayer:
         """Search the user's own playlists — from the local index, never the
         network. TIDAL has no API for this, and the cache was built for it:
         every playlist it has fetched keeps the plain-text name, artists and
-        album of each track. A scan of a few thousand rows is instant, so this
-        runs on the UI thread and there is nothing to wait for."""
-        self._search_done = True  # local scan: everything it has, in one go
+        album of each track, and the playlist's own name alongside. A scan of a
+        few thousand rows is instant, so this runs on the UI thread and there
+        is nothing to wait for.
+
+        Four fields, case-insensitive substring on each, and the *order* is the
+        design: title, then artist, then album, then playlist name. Ranking
+        matters more the more fields there are — the playlist name is one
+        string standing in for every track under it, so a query that matched
+        only it would otherwise bury the track actually called that under a
+        whole "Late Night" playlist. Last place keeps "type the playlist's name
+        and get its tracks" working without letting it flood anything.
+
+        The one indexed field deliberately left out is the playlist's creator:
+        on your own playlists it is your own name on every row, which matches
+        everything or nothing and tells you neither.
+        """
+        # A local scan returns everything it has in one go, so this view is
+        # complete the moment it is written — nothing pages it and nothing
+        # refetches it for the rest of the query's life
         if not self._cache.enabled:
-            self._search_message = (
-                "Playlist search needs the metadata cache — turn 'Cache playlists' on in settings")
+            self._put_search_view(
+                "playlists", loading=False, results=[], cursor=0,
+                message="Playlist search needs the metadata cache — "
+                        "turn 'Cache playlists' on in settings")
             return
         names = {p.id: p.name for p in (self._cache.get_playlists() or [])}
         needle = query.lower()
-        exact, loose = [], []
+        # One bucket per field, kept in rank order and concatenated at the end.
+        # Within a bucket the index's own order survives, so two tracks that
+        # matched the same way stay in the order their playlists are in.
+        by_title, by_artist, by_album, by_playlist = [], [], [], []
+        matched_playlists = {pid for pid, pname in names.items()
+                             if needle in (pname or "").lower()}
         scanned = 0
         for playlist_id, record in self._cache.iter_tracks():
             scanned += 1
             name = record.get("name") or ""
             artists = ", ".join(record.get("artists") or [])
             album = record.get("album") or ""
-            # Case-insensitive substring, nothing cleverer: a title match is
-            # what you meant, so those lead; artist and album matches follow
             if needle in name.lower():
-                bucket = exact
-            elif needle in artists.lower() or needle in album.lower():
-                bucket = loose
+                bucket = by_title
+            elif needle in artists.lower():
+                bucket = by_artist
+            elif needle in album.lower():
+                bucket = by_album
+            elif playlist_id in matched_playlists:
+                bucket = by_playlist
             else:
                 continue
             bucket.append({
@@ -3305,11 +4115,12 @@ class HeadlessTidalPlayer:
                 "playlist": names.get(playlist_id, "Playlist"),
                 "obj": CachedTrack(record),
             })
-        self._search_results = exact + loose
-        if not self._search_results:
-            self._search_message = (
+        results = by_title + by_artist + by_album + by_playlist
+        self._put_search_view(
+            "playlists", loading=False, results=results, cursor=0, cached=False,
+            message="" if results else (
                 "No results in your playlists" if scanned else
-                "Nothing cached to search yet — open Playlists once to index them")
+                "Nothing cached to search yet — open Playlists once to index them"))
 
     def _select_search_result(self):
         if not self._search_results:
@@ -3327,6 +4138,11 @@ class HeadlessTidalPlayer:
             self._open_album(obj)
         elif item["type"] == "artist":
             self._open_artist(obj)
+        elif item["type"] == "playlist":
+            # The same door the playlists page and the artist page use. It
+            # decides for itself whether the playlist is editable, so one that
+            # arrived from search is read-only unless it really is yours.
+            self._open_playlist(obj)
 
     def _open_album(self, album):
         self._push_nav()
@@ -3352,29 +4168,170 @@ class HeadlessTidalPlayer:
         threading.Thread(target=_run, daemon=True).start()
 
     def _open_artist(self, artist):
+        """Open the artist page on its first tab. Nothing but that tab is
+        fetched: the other three are several more requests, and opening a page
+        is one keystroke."""
         self._push_nav()
-        self._mode = self.MODE_BROWSE
-        self._browse_playlist = None
-        self._browse_title = f"{artist.name} - Top Tracks"
-        self._browse_tracks = []
-        self._browse_cursor = -1
-        self._browse_loading = True
-        self._browse_message = ""
+        self._mode = self.MODE_ARTIST
+        self._artist = artist
+        self._artist_section = self.ARTIST_SECTIONS[0]
+        self._artist_cursor = self._artist_cursors.get(self._artist_key(), 0)
+        self._load_artist_section()
+
+    # ── Artist page ──
+
+    def _artist_key(self, section: Optional[str] = None):
+        """What a section's results are filed under: the artist and the tab.
+        Keyed by id rather than by object so the same artist reached from two
+        places is still the same page."""
+        return (str(getattr(self._artist, "id", "") or ""), section or self._artist_section)
+
+    def _artist_record(self):
+        """The record for the tab on screen: state, rows and a message. None
+        only before the first visit, which the display reads as loading."""
+        return self._artist_sections.get(self._artist_key())
+
+    def _artist_rows(self) -> list:
+        record = self._artist_record()
+        return record["items"] if record and record["state"] == "ready" else []
+
+    def _load_artist_section(self, force: bool = False):
+        """Fetch the tab on screen, once. The presence of a record — loading,
+        ready or failed — *is* the answer to "has this tab been visited", so a
+        held-down Tab cannot fan out into requests and a second look costs
+        nothing. `force` is the retry a failed tab offers."""
+        artist = self._artist
+        if artist is None:
+            return
+        key = self._artist_key()
+        if key in self._artist_sections and not force:
+            return
+        section = self._artist_section
+        limit = max(20, self._page_size)
+        self._artist_sections = {
+            **self._artist_sections, key: {"state": "loading", "items": [], "message": ""}}
 
         def _run():
             try:
-                # At least a page — a 40-row page must not show 20 tracks and
-                # claim that's all the artist has
-                tracks = artist.get_top_tracks(limit=max(20, self._page_size))
-                self._browse_tracks = list(tracks)
-                if not self._browse_tracks:
-                    self._browse_message = "No tracks found"
+                items = self._fetch_artist_section(artist, section, limit)
             except Exception:
-                self._browse_message = "Failed to load artist"
-            finally:
-                self._browse_loading = False
+                record = {"state": "failed", "items": [],
+                          "message": self.ARTIST_SECTION_FAILED[section]}
+            else:
+                record = {"state": "ready", "items": items,
+                          "message": "" if items else self.ARTIST_SECTION_EMPTY[section]}
+            # Whole-dict assignment: the paint thread only ever reads a record
+            # that is already complete
+            self._artist_sections = {**self._artist_sections, key: record}
+            self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _fetch_artist_section(self, artist, section: str, limit: int) -> list:
+        """One tab, one round of requests, off the UI thread. Rows are tagged
+        with what they are, because a section can hold more than one kind."""
+        if section == "tracks":
+            # At least a page — a 40-row page must not show 20 tracks and
+            # claim that's all the artist has
+            return [{"type": "track", "obj": t}
+                    for t in (artist.get_top_tracks(limit=limit) or [])]
+        if section == "albums":
+            return [{"type": "album", "obj": a}
+                    for a in (artist.get_albums(limit=limit) or [])]
+        if section == "playlists":
+            return [{"type": "playlist", "obj": p}
+                    for p in self._artist_page_playlists(artist)]
+        return self._artist_suggestions(artist, limit)
+
+    def _artist_page_playlists(self, artist) -> list:
+        """The playlists an artist appears on. There is no
+        artists/{id}/playlists endpoint — tidalapi's Artist has no accessor for
+        one — so this comes from the artist page itself (pages/artist), which
+        is where listen.tidal.com gets the same rows. One request; keep the
+        playlist items out of it and drop everything else."""
+        page = artist.page()
+        found = []
+        seen = set()
+        for category in (getattr(page, "categories", None) or []):
+            for item in (getattr(category, "items", None) or []):
+                if not isinstance(item, tidalapi.Playlist):
+                    continue
+                pid = str(getattr(item, "id", "") or "")
+                if pid and pid in seen:
+                    continue
+                seen.add(pid)
+                found.append(item)
+        return found
+
+    def _artist_suggestions(self, artist, limit: int) -> list:
+        """What TIDAL suggests off the back of this artist: the artist radio —
+        the same tracks its mix is made of — then the artists it considers
+        similar. Two endpoints in one tab, and either half alone is still a
+        useful page, so only losing both counts as a failure."""
+        rows = []
+        failed = 0
+        try:
+            rows += [{"type": "track", "obj": t}
+                     for t in (artist.get_radio(limit=limit) or [])]
+        except Exception:
+            failed += 1
+        try:
+            rows += [{"type": "artist", "obj": a}
+                     for a in (artist.get_similar() or [])]
+        except Exception:
+            failed += 1
+        if failed == 2:
+            raise RuntimeError("neither radio nor similar artists answered")
+        return rows
+
+    def _cycle_artist_section(self, step: int = 1):
+        """Tab between the tabs, wrapping, and landing on one for the first
+        time is what fetches it. The cursor is per tab, so coming back to
+        Albums comes back to where you were in them."""
+        order = self.ARTIST_SECTIONS
+        self._artist_cursors = {**self._artist_cursors, self._artist_key(): self._artist_cursor}
+        self._artist_section = order[(order.index(self._artist_section) + step) % len(order)]
+        self._artist_cursor = self._artist_cursors.get(self._artist_key(), 0)
+        self._load_artist_section()
+
+    def _artist_section_tracks(self) -> list:
+        return [row["obj"] for row in self._artist_rows() if row["type"] == "track"]
+
+    def _select_artist_row(self):
+        """Enter on a row does the obvious thing for what the row is, through
+        the same navigation everything else uses. On a failed tab it is the
+        retry instead — a section that lost its one request would otherwise
+        stay lost for the session."""
+        record = self._artist_record()
+        if record is not None and record["state"] == "failed":
+            self._load_artist_section(force=True)
+            return
+        rows = self._artist_rows()
+        if not rows or not (0 <= self._artist_cursor < len(rows)):
+            return
+        row = rows[self._artist_cursor]
+        obj = row["obj"]
+        if row["type"] == "album":
+            self._open_album(obj)
+        elif row["type"] == "playlist":
+            self._open_playlist(obj)
+        elif row["type"] == "artist":
+            self._open_artist(obj)
+        else:
+            # Position counted rather than searched for: a section can hold
+            # tracks and artists at once, and two tracks can compare equal
+            tracks = self._artist_section_tracks()
+            index = sum(1 for r in rows[:self._artist_cursor] if r["type"] == "track")
+            self._queue = tracks
+            self._queue_index = index
+            self._play_track(obj)
+
+    def _play_all_artist(self):
+        tracks = self._artist_section_tracks()
+        if not tracks:
+            return
+        self._queue = tracks
+        self._play_queue_index(0)
 
     def _play_browse_track(self):
         if not self._browse_tracks:
@@ -3540,7 +4497,32 @@ class HeadlessTidalPlayer:
             return self._queue[self._queue_cursor]
         if self._mode == self.MODE_BROWSE and self._browse_tracks and self._browse_cursor >= 0:
             return self._browse_tracks[self._browse_cursor]
+        if self._mode == self.MODE_ARTIST:
+            rows = self._artist_rows()
+            if rows and 0 <= self._artist_cursor < len(rows):
+                row = rows[self._artist_cursor]
+                # Only a track row is addable; on an album or an artist row the
+                # sensible target is still whatever is playing
+                if row["type"] == "track":
+                    return row["obj"]
         return self._current_track
+
+    def _picker_playlists(self) -> list:
+        """The picker's rows, last-used first.
+
+        Derived on read rather than stored: the cache in _editable_playlists
+        stays whatever TIDAL said, and a pin naming a playlist that is no
+        longer in it — deleted on the web since the last run — simply matches
+        nothing and the normal order comes back. No ghost row, no error.
+        """
+        playlists = self._editable_playlists  # read once: another thread replaces it
+        pid = self._last_playlist_id
+        if not pid or not playlists:
+            return playlists
+        pinned = [p for p in playlists if str(getattr(p, "id", "") or "") == pid]
+        if not pinned:
+            return playlists
+        return pinned + [p for p in playlists if str(getattr(p, "id", "") or "") != pid]
 
     def _open_playlist_picker(self):
         """Open the add-to-playlist picker for the targeted track."""
@@ -3551,7 +4533,10 @@ class HeadlessTidalPlayer:
         self._push_nav()
         self._mode = self.MODE_ADD_TO_PLAYLIST
         self._picker_track = track
-        self._picker_cursor = 0
+        self._picker_new_name = None
+        # -1 is the "+ New playlist" row, the same way -1 is "Play All" in
+        # browse. With nothing to add to, that row is the only one there is.
+        self._picker_cursor = 0 if self._editable_playlists else -1
         # Reuse the cached list for a minute — listing re-fetches every playlist
         if not self._editable_playlists or time.time() - self._editable_playlists_time > 60:
             self._picker_loading = True
@@ -3563,6 +4548,8 @@ class HeadlessTidalPlayer:
                         p for p in (playlists or []) if isinstance(p, tidalapi.UserPlaylist)
                     ]
                     self._editable_playlists_time = time.time()
+                    if not self._editable_playlists:
+                        self._picker_cursor = -1
                 except Exception:
                     pass
                 finally:
@@ -3581,6 +4568,9 @@ class HeadlessTidalPlayer:
         def _run():
             try:
                 added = playlist.add([str(track.id)])  # server skips duplicates
+                # Pinned before the toast, so "the toast appeared" implies the
+                # pin is already on disk — both for the user and for the tests
+                self._remember_last_playlist(playlist)
                 if added:
                     self._set_toast(f'Added to "{playlist.name}"')
                 else:
@@ -3589,6 +4579,57 @@ class HeadlessTidalPlayer:
                 self._set_toast("Failed to add to playlist")
             finally:
                 self._picker_busy = False
+            self._wake()
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _picker_create_and_add(self, name: str):
+        """Create a playlist and put the picked track in it, in one gesture.
+
+        Two requests on a background thread, and they fail separately: a
+        creation that worked followed by an add that didn't is not "failed to
+        create a playlist", and saying so would send the user looking for a
+        playlist that is already there.
+        """
+        if self._picker_busy:
+            return
+        name = (name or "").strip()
+        if not name:
+            # Nothing is created for an empty name, and the prompt stays open
+            # rather than closing as if something had happened
+            self._set_toast("Playlist name can't be empty")
+            return
+        track = self._picker_track
+        # Set before anything else: a second Enter arriving on the same tick
+        # has to find this already true, or the playlist is created twice
+        self._picker_busy = True
+        self._picker_new_name = None
+        self._go_back()
+
+        def _run():
+            try:
+                playlist = self.session.user.create_playlist(name, "")
+            except Exception:
+                self._set_toast(f'Failed to create "{name}"')
+                self._picker_busy = False
+                self._wake()
+                return
+            # Created, so it is the last one used whatever the add does next
+            self._remember_last_playlist(playlist)
+            # Whole-object assignment, never an insert into the shared list
+            pid = str(getattr(playlist, "id", "") or "")
+            self._editable_playlists = [playlist] + [
+                p for p in self._editable_playlists
+                if not pid or str(getattr(p, "id", "") or "") != pid
+            ]
+            try:
+                playlist.add([str(track.id)])
+                self._set_toast(f'Created "{name}" and added track')
+            except Exception:
+                self._set_toast(f'Created "{name}", but failed to add track')
+            finally:
+                self._picker_busy = False
+            self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -3773,19 +4814,33 @@ class HeadlessTidalPlayer:
                 self._clear_cached_songs()
             return
 
-        # The volume overlay is over whatever mode is underneath, so it takes
-        # the key first — and gives it back only by closing.
+        # The volume overlay is over whatever mode is underneath — including
+        # the player holding the arrows for scrubbing — so it takes the key
+        # before anything else and gives none of them back until it closes.
         if self._volume_open:
             self._handle_volume_key(key)
             return
+
+        # Scrub focus comes next, and `v` reaches it as "anything else": focus
+        # drops and the key falls through to open the overlay. That is the
+        # right way round, because the two are competing for the same arrows —
+        # scrubbing while a volume bar is on screen would leave ←/→ meaning two
+        # things at once. Read before, because _handle_focus_key is what drops
+        # it and the overlay needs to know it is holding them on loan.
+        was_focused = self._player_focus
+        if self._handle_focus_key(key):
+            return
+
         if key in ("v", "V") and self._can_open_volume():
-            self._volume_open = True
+            self._open_volume(from_focus=was_focused)
             return
 
         if self._mode == self.MODE_SEARCH:
             self._handle_search_key(key)
         elif self._mode == self.MODE_BROWSE:
             self._handle_browse_key(key)
+        elif self._mode == self.MODE_ARTIST:
+            self._handle_artist_key(key)
         elif self._mode == self.MODE_QUEUE:
             self._handle_queue_key(key)
         elif self._mode == self.MODE_PLAYLISTS:
@@ -3797,16 +4852,74 @@ class HeadlessTidalPlayer:
         else:
             self._handle_player_key(key)
 
+    def _focus_player(self):
+        """Give the player the arrow keys. \u2191 is what asks for it: from the top
+        of a list, where \u2191 had nowhere left to go, and from the player screen,
+        where it did nothing at all. Pointless with no track to scrub."""
+        if self._current_track is not None:
+            self._player_focus = True
+
+    def _handle_focus_key(self, key: str) -> bool:
+        """Keys that belong to the player while it has focus. True when the key
+        was used up here.
+
+        This is the whole of the seeking interaction, and it is one rule in one
+        place rather than a branch per screen: focused, \u2190/\u2192 scrub and \u2193 (or
+        Esc) hands the arrows back. Anything else \u2014 typing a query, [t], Enter,
+        [v] \u2014 means the user is done scrubbing, so focus drops and the key goes
+        on to the screen it was meant for. Nothing is stolen: unfocused, every
+        key means exactly what it always did, including \u2190/\u2192 for prev/next.
+        """
+        if not self._player_focus:
+            return False
+        if key == KEY_RIGHT:
+            self._seek_by(SEEK_STEP_SECONDS)
+            return True
+        if key == KEY_LEFT:
+            self._seek_by(-SEEK_STEP_SECONDS)
+            return True
+        if key in (" ", "k"):
+            self._toggle_play_key()
+            return True
+        if key == KEY_UP:
+            return True  # already as far up as focus goes
+        self._player_focus = False
+        # The two keys that mean "give the list back" and nothing more; every
+        # other key falls through to the screen underneath, now unfocused
+        return key in (KEY_DOWN, KEY_ESC)
+
     def _can_open_volume(self) -> bool:
         """Whether `v` means "volume" right now.
 
-        Everywhere except the two places where it means the letter v: a search
-        query, which types every printable key it gets, and a settings row
-        being typed into. Nothing else binds v — the player screen, browse,
-        the queue, playlists, the picker and the settings page were all
+        Everywhere except the three places where it means the letter v: a
+        search query, which types every printable key it gets; a settings row
+        being typed into; and the picker's new-playlist name, which types them
+        too. Nothing else binds v \u2014 the player screen, browse, the artist page,
+        the queue, playlists, the picker's list and the settings page were all
         checked, and none of them wanted it.
         """
-        return self._mode != self.MODE_SEARCH and self._settings_edit is None
+        return (self._mode != self.MODE_SEARCH
+                and self._settings_edit is None
+                and self._picker_new_name is None)
+
+    def _open_volume(self, from_focus: bool = False):
+        """Open the overlay, recording whether the player had the arrows.
+
+        It usually has not, and then this is a bool that stays False. When it
+        has, the arrows are on loan rather than taken: you were scrubbing, you
+        turned it down, and Enter puts you back where you were instead of
+        making you press \u2191 again. The caller passes it in because by the time
+        we get here `_handle_focus_key` has already dropped the focus.
+        """
+        self._volume_from_focus = from_focus
+        self._player_focus = False
+        self._volume_open = True
+
+    def _close_volume(self):
+        self._volume_open = False
+        if self._volume_from_focus:
+            self._volume_from_focus = False
+            self._focus_player()
 
     def _handle_volume_key(self, key: str):
         """The overlay's keys. Arrows move the level by the same step the
@@ -3814,10 +4927,10 @@ class HeadlessTidalPlayer:
         closes it too so the key that opened it also puts it away. Play/pause
         keeps working, because reaching for the volume is not a reason to lose
         the spacebar. Anything else is ignored rather than acted on
-        underneath — an overlay that swallowed a `q` and opened the queue
+        underneath \u2014 an overlay that swallowed a `q` and opened the queue
         would be worse than one that did nothing."""
         if key in (KEY_ENTER, KEY_ENTER2, KEY_ESC, "v", "V"):
-            self._volume_open = False
+            self._close_volume()
             return
         spec = get_spec("volume")
         if key in (KEY_RIGHT, KEY_UP):
@@ -3834,6 +4947,10 @@ class HeadlessTidalPlayer:
             self._next_track()
         elif key == KEY_LEFT:
             self._prev_track()
+        elif key == KEY_UP:
+            # No list here, so ↑ has always been a no-op: it is where scrubbing
+            # goes, and ←/→ keep meaning prev/next until it is pressed
+            self._focus_player()
         elif key == "s":
             self._mini_player = False
             self._mode = self.MODE_SEARCH
@@ -3891,8 +5008,10 @@ class HeadlessTidalPlayer:
             self._cycle_search_filter(-1)
             return
         if key == KEY_UP:
-            if self._search_results:
-                self._search_cursor = max(0, self._search_cursor - 1)
+            if self._search_results and self._search_cursor > 0:
+                self._search_cursor -= 1
+            else:
+                self._focus_player()
         elif key == KEY_DOWN:
             if self._search_results:
                 if self._search_cursor < len(self._search_results) - 1:
@@ -3922,8 +5041,10 @@ class HeadlessTidalPlayer:
             self._toggle_play_key()
             return
         if key == KEY_UP:
-            if self._browse_tracks:
-                self._browse_cursor = max(-1, self._browse_cursor - 1)
+            if self._browse_tracks and self._browse_cursor > -1:
+                self._browse_cursor -= 1
+            else:
+                self._focus_player()
         elif key == KEY_DOWN:
             if self._browse_tracks:
                 self._browse_cursor = min(len(self._browse_tracks) - 1, self._browse_cursor + 1)
@@ -3939,6 +5060,39 @@ class HeadlessTidalPlayer:
         elif key == "x":
             self._remove_from_browse_playlist()
 
+    def _handle_artist_key(self, key: str):
+        """Tab is the only key the artist page adds. ↑ from the top still hands
+        the arrows to the player for scrubbing, ←/Esc still goes back, and Tab
+        works while a section is loading or failed — there is no state this
+        page can be in that you cannot leave."""
+        if key == KEY_ESC or key == KEY_LEFT:
+            self._go_back()
+            return
+        if key == " ":
+            self._toggle_play_key()
+            return
+        if key == KEY_TAB:
+            self._cycle_artist_section(1)
+            return
+        if key == KEY_SHIFT_TAB:
+            self._cycle_artist_section(-1)
+            return
+        rows = self._artist_rows()
+        if key == KEY_UP:
+            if rows and self._artist_cursor > 0:
+                self._artist_cursor -= 1
+            else:
+                self._focus_player()
+        elif key == KEY_DOWN:
+            if rows:
+                self._artist_cursor = min(len(rows) - 1, self._artist_cursor + 1)
+        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
+            self._select_artist_row()
+        elif key == "a":
+            self._play_all_artist()
+        elif key == "y":
+            self._open_playlist_picker()
+
     def _handle_queue_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:
             self._mode = self.MODE_PLAYER
@@ -3947,8 +5101,10 @@ class HeadlessTidalPlayer:
             self._toggle_play_key()
             return
         if key == KEY_UP:
-            if self._queue:
-                self._queue_cursor = max(0, self._queue_cursor - 1)
+            if self._queue and self._queue_cursor > 0:
+                self._queue_cursor -= 1
+            else:
+                self._focus_player()
         elif key == KEY_DOWN:
             if self._queue:
                 self._queue_cursor = min(len(self._queue) - 1, self._queue_cursor + 1)
@@ -3968,8 +5124,10 @@ class HeadlessTidalPlayer:
             self._toggle_play_key()
             return
         if key == KEY_UP:
-            if self._playlists:
-                self._playlists_cursor = max(0, self._playlists_cursor - 1)
+            if self._playlists and self._playlists_cursor > 0:
+                self._playlists_cursor -= 1
+            else:
+                self._focus_player()
         elif key == KEY_DOWN:
             if self._playlists:
                 self._playlists_cursor = min(len(self._playlists) - 1, self._playlists_cursor + 1)
@@ -3978,21 +5136,37 @@ class HeadlessTidalPlayer:
                 self._open_playlist(self._playlists[self._playlists_cursor])
 
     def _handle_add_to_playlist_key(self, key: str):
+        # While a name is being typed the picker is a textbox, so this runs
+        # before anything else and swallows every key it doesn't use: Space
+        # types a space rather than pausing, and an arrow must not navigate a
+        # list the user cannot see the cursor on.
+        if self._picker_new_name is not None:
+            if key == KEY_ESC:
+                self._picker_new_name = None  # nothing was created
+            elif key in (KEY_BACKSPACE, KEY_BACKSPACE2):
+                self._picker_new_name = self._picker_new_name[:-1]
+            elif key in (KEY_ENTER, KEY_ENTER2):
+                self._picker_create_and_add(self._picker_new_name)
+            elif len(key) == 1 and key.isprintable():
+                if len(self._picker_new_name) < PLAYLIST_NAME_MAX:
+                    self._picker_new_name = self._picker_new_name + key
+            return
         if key == KEY_ESC or key == KEY_LEFT:
             self._go_back()
             return
         if key == " ":
             self._toggle_play_key()
             return
+        playlists = self._picker_playlists()
         if key == KEY_UP:
-            if self._editable_playlists:
-                self._picker_cursor = max(0, self._picker_cursor - 1)
+            self._picker_cursor = max(-1, self._picker_cursor - 1)
         elif key == KEY_DOWN:
-            if self._editable_playlists:
-                self._picker_cursor = min(len(self._editable_playlists) - 1, self._picker_cursor + 1)
+            self._picker_cursor = min(len(playlists) - 1, self._picker_cursor + 1)
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
-            if self._editable_playlists and self._picker_cursor < len(self._editable_playlists):
-                self._picker_add_to(self._editable_playlists[self._picker_cursor])
+            if self._picker_cursor < 0:
+                self._picker_new_name = ""
+            elif playlists and self._picker_cursor < len(playlists):
+                self._picker_add_to(playlists[self._picker_cursor])
 
     def _handle_settings_key(self, key: str):
         # Typing a number into a row: digits extend it, Backspace shortens it,

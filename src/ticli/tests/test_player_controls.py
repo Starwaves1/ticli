@@ -385,6 +385,7 @@ class TestTheVolumeOverlay:
     MODES_THAT_OPEN = (
         HeadlessTidalPlayer.MODE_PLAYER,
         HeadlessTidalPlayer.MODE_BROWSE,
+        HeadlessTidalPlayer.MODE_ARTIST,
         HeadlessTidalPlayer.MODE_QUEUE,
         HeadlessTidalPlayer.MODE_PLAYLISTS,
         HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
@@ -475,3 +476,121 @@ class TestTheVolumeOverlay:
             p._handle_key(player_mod.KEY_RIGHT)
         assert p.config["volume"] == 100
         assert max(p.audio.volumes) == 100
+
+
+class TestTheVolumeOverlayAgainstTheOtherArrowKeys:
+    """Three things want the arrow keys: prev/next, scrubbing, and the overlay.
+    Only one of them may have them at a time, and handing them back has to end
+    up where they came from."""
+
+    def _player(self, focused=False):
+        p = HeadlessTidalPlayer()
+        p.audio = _FakeAudio()
+        p.audio.player_cmd = "mpv"
+        p.audio.volume_ceiling = lambda: 250   # room to go up as well as down
+        p._current_track = _fake_track(1)
+        p._queue = [p._current_track]
+        p._playing = True
+        if focused:
+            p._focus_player()
+            assert p._player_focus is True
+        return p
+
+    def test_v_takes_the_arrows_off_the_scrub(self):
+        """Both want ←/→. A volume bar on screen while ←/→ still seeks would
+        leave the same two keys meaning two things at once."""
+        p = self._player(focused=True)
+        p._handle_key("v")
+        assert p._volume_open is True
+        assert p._player_focus is False
+
+    def test_closing_gives_the_arrows_back_to_the_scrub(self):
+        """They were on loan. You were scrubbing, you turned it down, Enter
+        puts you back where you were rather than making you press ↑ again."""
+        p = self._player(focused=True)
+        p._handle_key("v")
+        p._handle_key(player_mod.KEY_ENTER)
+        assert p._volume_open is False
+        assert p._player_focus is True
+
+    def test_closing_from_an_unfocused_player_leaves_prev_next_alone(self):
+        p = self._player()
+        p._handle_key("v")
+        p._handle_key(player_mod.KEY_ESC)
+        assert p._player_focus is False, "nothing was on loan, nothing comes back"
+
+    def test_the_arrows_move_the_volume_not_the_track_while_it_is_open(self):
+        p = self._player(focused=True)
+        seeks = []
+        p._seek_by = lambda step: seeks.append(step)
+        p._handle_key("v")
+        p._handle_key(player_mod.KEY_RIGHT)
+        p._handle_key(player_mod.KEY_LEFT)
+        assert seeks == [], "the overlay owns the arrows while it is up"
+        assert p.audio.volumes == [105, 100]
+        assert p.config["volume"] == 100
+
+    def test_the_scrub_still_owns_them_when_the_overlay_is_shut(self):
+        p = self._player(focused=True)
+        seeks = []
+        p._seek_by = lambda step: seeks.append(step)
+        p._handle_key("v")
+        p._handle_key(player_mod.KEY_ENTER)
+        p._handle_key(player_mod.KEY_RIGHT)
+        assert seeks == [player_mod.SEEK_STEP_SECONDS]
+
+    def test_the_marker_and_the_footer_agree_about_who_has_them(self):
+        """Focus is a state, so it is on screen twice on purpose: the marker on
+        the progress line and the label on the footer hint."""
+        p = self._player(focused=True)
+        p._current_track.album = None      # _build_player_display reads it
+        text = p._build_display().renderable.plain
+        assert f"\u21c6 {player_mod.SEEK_STEP_SECONDS}s" in text
+        assert f"seek {player_mod.SEEK_STEP_SECONDS}s" in text
+        assert "prev/next" not in text
+        p._handle_key("v")
+        text = p._build_display().renderable.plain
+        assert "\u21c6" not in text, "the arrows are the overlay's now"
+        assert "Volume" in text
+
+
+class TestTheVolumeOverlayAgainstTypingScreens:
+    """Every screen that types a printable key is a screen where `v` is the
+    letter v. There are three."""
+
+    def _player(self):
+        p = HeadlessTidalPlayer()
+        p.audio = _FakeAudio()
+        return p
+
+    def test_the_new_playlist_name_prompt_types_it(self):
+        p = self._player()
+        p._mode = p.MODE_ADD_TO_PLAYLIST
+        p._picker_new_name = ""
+        p._handle_key("v")
+        assert p._volume_open is False
+        assert p._picker_new_name == "v"
+
+    def test_the_picker_list_still_opens_it(self):
+        """Only the prompt types; the row list underneath is a list like any
+        other and keeps [v]."""
+        p = self._player()
+        p._mode = p.MODE_ADD_TO_PLAYLIST
+        p._picker_new_name = None
+        p._handle_key("v")
+        assert p._volume_open is True
+
+    def test_the_footer_offers_v_only_where_it_works(self):
+        p = self._player()
+        for mode, typing, wanted in (
+            (p.MODE_PLAYER, None, True),
+            (p.MODE_SEARCH, None, False),
+            (p.MODE_ARTIST, None, True),
+            (p.MODE_ADD_TO_PLAYLIST, None, True),
+            (p.MODE_ADD_TO_PLAYLIST, "", False),
+        ):
+            p._mode = mode
+            p._picker_new_name = typing
+            keys = [h.key for h in p._mode_hints()]
+            assert ("v" in keys) is wanted, (mode, typing, keys)
+            assert p._can_open_volume() is wanted or mode != p.MODE_ADD_TO_PLAYLIST
