@@ -122,12 +122,22 @@ which keeps a stream a single string everywhere else in the player.
 
 Search mode types the query with every printable key, so the only key left
 for a filter is one that isn't printable: `Tab` cycles the scope (All /
-Tracks / Albums / Artists / My Playlists, `Shift-Tab` backwards) and the
+Tracks / Albums / Artists / Playlists / My Playlists, `Shift-Tab`
+backwards) and the
 scope row under the query says which is active. **`Tab` applies the scope
 as you land on it** — no second keystroke — and it is still true that one
 search is one request, because a fetch buys the *query*, not the scope.
 
-`session.search()` is asked for **all three categories** whatever scope
+**Playlists** is TIDAL's — community and editorial — and **My Playlists**
+is yours; they are two different questions and two different rows. The
+first is a fifth server-side scope riding the same request as the others;
+the second is answered from the local index and is last in the cycle
+because it is the odd one out. The scope *key* for the community one is
+`tidal_playlists`, because the reservoir's categories are named the way
+`session.search()` names them and `playlists` was already taken by a scope
+that reads no category at all.
+
+`session.search()` is asked for **all four categories** whatever scope
 asked for it: `limit` is applied per type, so that is the same single
 request a scoped search used to make, with the other scopes paid for. What
 comes back goes into `_search_reservoir`, one per query, kept whole and
@@ -148,8 +158,10 @@ So 40 rapid presses are one request, and no new machinery: the same
 single-flight flag, `SEARCH_FETCH_MIN_INTERVAL` and `_search_gen` that
 paging already used.
 
-Under a type filter the whole page is that type; under All it stays the
-50/30/20 split. `_search_pool` is now derived — what the reservoir holds
+Under a type filter the whole page is that type; under All it is a
+45/25/15/15 split — the fourth category came out of albums and artists
+(it was 50/30/20), not out of tracks, because the common case is still
+looking for a song. `_search_pool` is now derived — what the reservoir holds
 that this scope has not shown, in this scope's categories only — and
 `_search_more` spends that before asking, never past TIDAL's 300-item
 `SEARCH_MAX_OFFSET`, one fetch at a time and no sooner than

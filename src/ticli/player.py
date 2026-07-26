@@ -353,22 +353,23 @@ class _DownloadSuperseded(Exception):
 
 def _empty_search_pool() -> dict:
     """Fetched-but-not-yet-shown search rows, per category."""
-    return {"tracks": [], "albums": [], "artists": []}
+    return {"tracks": [], "albums": [], "artists": [], "playlists": []}
 
 
 def _empty_search_reservoir() -> dict:
     """Everything one query has brought back, kept whole and never consumed.
 
-    A fetch asks for all three categories at once, so this is what every scope
+    A fetch asks for all four categories at once, so this is what every scope
     draws on: `offset` is how deep into the query it has gone, `exhausted` is
     per category because they run out at different depths, and `stopped` is a
     failure the scopes should stop asking about. In memory only, for the length
     of the run — deliberately not the on-disk index in utils/cache.py.
     """
     return {
-        "tracks": [], "albums": [], "artists": [],
+        "tracks": [], "albums": [], "artists": [], "playlists": [],
         "offset": 0,
-        "exhausted": {"tracks": False, "albums": False, "artists": False},
+        "exhausted": {"tracks": False, "albums": False,
+                      "artists": False, "playlists": False},
         "stopped": False,
         "message": "",
     }
@@ -1138,24 +1139,34 @@ class HeadlessTidalPlayer:
         "LOSSLESS": tidalapi.Quality.high_lossless,
         "HIRES": tidalapi.Quality.hi_res_lossless,
     }
-    # Search scopes, in the order Tab cycles them. "playlists" is the odd one
-    # out on purpose: TIDAL has no server-side search of your own playlists, so
-    # that scope is answered from the local index and never asks the network.
-    SEARCH_FILTERS = ("all", "tracks", "albums", "artists", "playlists")
+    # Search scopes, in the order Tab cycles them. The four server-side ones
+    # come first and share one request; "playlists" — *your* playlists — is
+    # last on purpose, because it is the odd one out: TIDAL has no server-side
+    # search of your own playlists, so that scope is answered from the local
+    # index and never asks the network at all.
+    #
+    # Two playlist scopes, and the scope key is not the category key: the
+    # reservoir's categories are named the way session.search() names them,
+    # and "tidal_playlists" is a *scope* over the "playlists" category, while
+    # the scope literally called "playlists" reads no category at all.
+    SEARCH_FILTERS = ("all", "tracks", "albums", "artists",
+                      "tidal_playlists", "playlists")
     SEARCH_FILTER_LABELS = {
         "all": "All",
         "tracks": "Tracks",
         "albums": "Albums",
         "artists": "Artists",
+        "tidal_playlists": "Playlists",
         "playlists": "My Playlists",
     }
     # Which categories a scope asks TIDAL for. Keyed by the plural names
     # session.search() answers with, so the fetch never has to translate.
     SEARCH_FILTER_KINDS = {
-        "all": ("tracks", "albums", "artists"),
+        "all": ("tracks", "albums", "artists", "playlists"),
         "tracks": ("tracks",),
         "albums": ("albums",),
         "artists": ("artists",),
+        "tidal_playlists": ("playlists",),
     }
 
     QUALITY_LABELS = {
@@ -2420,7 +2431,8 @@ class HeadlessTidalPlayer:
                     content.append("  \u25b8 ", style="bold cyan")
                 else:
                     content.append("    ", style="")
-                type_styles = {"track": "bold green", "album": "bold magenta", "artist": "bold yellow"}
+                type_styles = {"track": "bold green", "album": "bold magenta",
+                               "artist": "bold yellow", "playlist": "bold blue"}
                 badge = item["type"].upper()
                 content.append(f"[{badge}]", style=type_styles.get(item["type"], "dim"))
                 content.append(f" {item['name']}", style="bold white" if i == self._search_cursor else "white")
@@ -3167,15 +3179,20 @@ class HeadlessTidalPlayer:
 
     @staticmethod
     def _search_split(page: int) -> tuple:
-        """How many tracks / albums / artists make up one page of results.
-        Keeps the old 50/30/20 feel, but scaled to "Songs per page" instead of
-        a hardcoded 5/3/2 — one page of search is one page of rows, like every
-        other list. Albums and artists never round away to nothing."""
-        # Floor division, so the rounding always falls to tracks and songs stay
-        # at least half the page even at the 5-row minimum
-        albums = max(1, page * 3 // 10)
-        artists = max(1, page * 2 // 10)
-        return max(1, page - albums - artists), albums, artists
+        """How many tracks / albums / artists / playlists make up one page of
+        results.
+
+        45/25/15/15, scaled to "Songs per page" rather than hardcoded — one
+        page of search is one page of rows, like every other list. Tracks keep
+        the plurality because the common case is looking for a song; the
+        fourth category came out of albums and artists (was 50/30/20) rather
+        than out of tracks. No category ever rounds away to nothing.
+        """
+        # Floor division, so the rounding always falls to tracks
+        albums = max(1, page * 25 // 100)
+        artists = max(1, page * 15 // 100)
+        playlists = max(1, page * 15 // 100)
+        return max(1, page - albums - artists - playlists), albums, artists, playlists
 
     def _search_kinds(self, scope: Optional[str] = None) -> tuple:
         """Which of the reservoir's categories a scope shows."""
@@ -3183,15 +3200,17 @@ class HeadlessTidalPlayer:
 
     @staticmethod
     def _search_models() -> list:
-        """What a fetch asks TIDAL for — always all three categories, whatever
+        """What a fetch asks TIDAL for — always all four categories, whatever
         scope asked for it.
 
-        `limit` is applied per type, so this is the same single request either
-        way; the payload is bigger and every other scope is then answered out
-        of it for free. That is the whole trade: one request buys the query,
-        not the scope, so Tab can apply immediately without costing anything.
+        `limit` is applied per type (session.search() puts the model names in
+        one `types=` parameter of one GET), so this is the same single request
+        either way; the payload is bigger and every other scope is then
+        answered out of it for free. That is the whole trade: one request buys
+        the query, not the scope, so Tab can apply immediately without costing
+        anything.
         """
-        return [tidalapi.Track, tidalapi.Album, tidalapi.Artist]
+        return [tidalapi.Track, tidalapi.Album, tidalapi.Artist, tidalapi.Playlist]
 
     def _search_row(self, kind: str, obj) -> dict:
         """One result row. Everything downstream reads these, not the objects."""
@@ -3201,6 +3220,14 @@ class HeadlessTidalPlayer:
         if kind == "albums":
             artist = obj.artist.name if obj.artist else ""
             return {"type": "album", "name": obj.name, "artist": artist, "obj": obj}
+        if kind == "playlists":
+            # Whose playlist it is, and failing that how big it is. A curated
+            # playlist often has no creator name, and "Chill Vibes" on its own
+            # says nothing about which of the twelve of them this is.
+            creator = getattr(getattr(obj, "creator", None), "name", "") or ""
+            count = getattr(obj, "num_tracks", 0) or 0
+            detail = creator or (f"{count} tracks" if count > 0 else "")
+            return {"type": "playlist", "name": obj.name, "artist": detail, "obj": obj}
         return {"type": "artist", "name": obj.name, "artist": "", "obj": obj}
 
     # ── The per-scope views over one query's reservoir ──
@@ -3287,20 +3314,22 @@ class HeadlessTidalPlayer:
         and the depth that leaves behind.
 
         Under a type filter the page is all of that type; under "All" it is the
-        50/30/20 split, still exactly `page` rows. Reads the reservoir, never
+        45/25/15/15 split, still exactly `page` rows. Reads the reservoir, never
         touches it — two scopes can be at two depths in the same rows.
         """
         reservoir = self._search_reservoir
-        kinds = ("tracks", "albums", "artists")
+        kinds = ("tracks", "albums", "artists", "playlists")
         avail = {kind: len(reservoir[kind]) - consumed.get(kind, 0) for kind in kinds}
         if scope == "all":
-            n_tracks, n_albums, n_artists = self._search_split(page)
+            n_tracks, n_albums, n_artists, n_playlists = self._search_split(page)
             # A query with one album shouldn't waste the other album rows —
             # hand the shortfall to tracks, which is what you searched for
             n_albums = min(n_albums, avail["albums"])
             n_artists = min(n_artists, avail["artists"])
-            n_tracks = min(page - n_albums - n_artists, avail["tracks"])
-            counts = {"tracks": n_tracks, "albums": n_albums, "artists": n_artists}
+            n_playlists = min(n_playlists, avail["playlists"])
+            n_tracks = min(page - n_albums - n_artists - n_playlists, avail["tracks"])
+            counts = {"tracks": n_tracks, "albums": n_albums,
+                      "artists": n_artists, "playlists": n_playlists}
         else:
             counts = {kind: page for kind in self._search_kinds(scope)}
 
@@ -3461,7 +3490,7 @@ class HeadlessTidalPlayer:
                     return  # the query moved on while we were out
                 reservoir = self._search_reservoir
                 found = {kind: list(results.get(kind) or [])
-                         for kind in ("tracks", "albums", "artists")}
+                         for kind in ("tracks", "albums", "artists", "playlists")}
                 # A category TIDAL couldn't fill has nothing more behind it, and
                 # there is never more than 300 items behind a query anyway
                 self._search_reservoir = {
@@ -3598,6 +3627,11 @@ class HeadlessTidalPlayer:
             self._open_album(obj)
         elif item["type"] == "artist":
             self._open_artist(obj)
+        elif item["type"] == "playlist":
+            # The same door the playlists page and the artist page use. It
+            # decides for itself whether the playlist is editable, so one that
+            # arrived from search is read-only unless it really is yours.
+            self._open_playlist(obj)
 
     def _open_album(self, album):
         self._push_nav()
