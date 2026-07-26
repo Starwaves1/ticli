@@ -192,14 +192,21 @@ class _Fit:
     """
 
     __slots__ = ("inner", "rows", "page_rows", "artwork", "hint_rows",
-                 "prose", "_levers")
+                 "prose", "mini", "_levers")
 
-    def __init__(self, inner, rows, page_rows, hint_rows, levers=()):
+    def __init__(self, inner, rows, page_rows, hint_rows, levers=(), mini=False):
         self.inner = inner
         self.rows = rows
         self.page_rows = page_rows
         self.artwork = True
         self.prose = True
+        # Which pane is being drawn, read by the composer rather than taken
+        # from the player. Not a lever today — nothing relaxes into the tiny
+        # player — but a lever is where it would go: `relax` walks an ordered
+        # list and _build_display recomposes after each pull, so "drop to a
+        # different screen entirely" is one more entry, plus restating `inner`
+        # and `rows`, which differ because the mini panel pads (0, 1).
+        self.mini = mini
         self.hint_rows = hint_rows
         self._levers = list(levers)
 
@@ -249,6 +256,7 @@ KEY_SHIFT_TAB = "\x1b[Z"
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
     QUALITY_CHOICES,
+    QUALITY_MEANINGS,
     SETTINGS_ROWS,
     coerce,
     cycle_value,
@@ -258,7 +266,7 @@ from ticli.utils.config import (
     save_config,
 )
 from ticli.utils.cache import CachedTrack, MetadataCache, format_gb
-from ticli.utils import artwork
+from ticli.utils import artwork, downloads, tags
 
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
@@ -538,6 +546,62 @@ class _DownloadSuperseded(Exception):
     """The track a download was for is no longer the one playing."""
 
 
+def stream_sources(url: str) -> list:
+    """Every URL that has to be fetched to have the whole track.
+
+    One for a BTS stream, and for a segmented one the initialization segment
+    followed by every media segment — written end to end, that *is* the
+    fragmented MP4 file. Empty when the string is not something that can be
+    fetched at all.
+    """
+    if url.endswith(HLS_SUFFIX):
+        return _hls_segments(url)
+    if url.startswith(("http://", "https://")):
+        return [url]
+    return []
+
+
+def fetch_to_file(sources: list, part: str, abandoned=None, progress=None) -> str:
+    """Write every source into `part`, end to end. Returns the extension.
+
+    The one downloader: the cache's background copy and a deliberate download
+    are the same bytes off the same CDN, and having written it twice is how
+    one of them would quietly stop working. TIDAL serves audio unencrypted
+    over plain HTTP, so this is a GET — no ffmpeg, no remux, and identical on
+    both backends because it does not ride on the player process.
+
+    `abandoned()` is checked every chunk and raises out of the download when
+    it answers True; `progress(done, total)` is told how far along it is, with
+    a total of 0 when the CDN didn't say. Raises on anything else — the caller
+    decides what a failed download means.
+    """
+    ext = DEFAULT_AUDIO_EXT
+    done = 0
+    total = 0
+    with open(part, "wb") as handle:
+        for index, source in enumerate(sources):
+            with requests.get(source, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
+                response.raise_for_status()
+                if index == 0:
+                    # The first segment describes the container the whole file
+                    # is going to be
+                    ext = _audio_extension(response.headers.get("Content-Type"), source)
+                    if len(sources) == 1:
+                        try:
+                            total = int(response.headers.get("Content-Length") or 0)
+                        except (TypeError, ValueError):
+                            total = 0
+                for chunk in response.iter_content(DOWNLOAD_CHUNK):
+                    if abandoned is not None and abandoned():
+                        raise _DownloadSuperseded()
+                    if chunk:
+                        handle.write(chunk)
+                        done += len(chunk)
+                        if progress is not None:
+                            progress(done, total)
+    return ext
+
+
 def _empty_search_pool() -> dict:
     """Fetched-but-not-yet-shown search rows, per category."""
     return {"tracks": [], "albums": [], "artists": [], "playlists": []}
@@ -747,13 +811,8 @@ class AudioPlayer:
         end to end, *is* the fragmented MP4 file. Verified by playing the
         result — both backends open it with no flags at all.
         """
-        if url.endswith(HLS_SUFFIX):
-            sources = _hls_segments(url)
-            if not sources:
-                return
-        elif url.startswith(("http://", "https://")):
-            sources = [url]
-        else:
+        sources = stream_sources(url)
+        if not sources:
             return
         base = self._audio_cache_base(cache_key)
         keep = base is not None
@@ -776,22 +835,8 @@ class AudioPlayer:
         def _run():
             path = None
             try:
-                ext = DEFAULT_AUDIO_EXT
-                with open(part, "wb") as handle:
-                    for index, source in enumerate(sources):
-                        with requests.get(source, stream=True,
-                                          timeout=DOWNLOAD_TIMEOUT) as response:
-                            response.raise_for_status()
-                            if index == 0:
-                                # The first segment describes the container the
-                                # whole file is going to be
-                                ext = _audio_extension(
-                                    response.headers.get("Content-Type"), source)
-                            for chunk in response.iter_content(DOWNLOAD_CHUNK):
-                                if self._download_gen != gen:
-                                    raise _DownloadSuperseded()
-                                if chunk:
-                                    handle.write(chunk)
+                ext = fetch_to_file(sources, part,
+                                    abandoned=lambda: self._download_gen != gen)
                 path = base + ext
                 os.replace(part, path)
             except Exception as e:
@@ -910,13 +955,20 @@ class AudioPlayer:
         return path
 
     def play_url(self, url: str, seek: float = 0, title: Optional[str] = None,
-                 cache_key=None):
+                 cache_key=None, local: Optional[str] = None):
         """Play an audio URL, stopping any current playback.
 
         With audio caching on, a track played before is already on disk, so
         the URL is never touched; a track played for the first time is fetched
         alongside playback and kept. Both halves are backend-independent —
         only the source path and a background download change.
+
+        `local` is a deliberately downloaded copy (see utils/downloads.py) and
+        outranks both: it is the same bytes, it is the user's file rather than
+        ours, and it means a downloaded library plays offline. Like the cache,
+        it is verified at the moment of use rather than trusted — a file the
+        user deleted by hand falls straight through to the network, which is
+        the whole of "handled durably" on this path.
         """
         self.stop()
         with self._lock:
@@ -926,7 +978,8 @@ class AudioPlayer:
             self._media_keys_bound = False
             self._seek_offset = seek
             self._play_start = time.time()
-            kept = self._cached_audio_path(cache_key)
+            kept = local if (local and os.path.exists(local)) else \
+                self._cached_audio_path(cache_key)
             # A track played before is already whole on disk: play the file and
             # never touch the network. Works on both backends, because only the
             # source path changes.
@@ -1289,6 +1342,7 @@ class HeadlessTidalPlayer:
     MODE_ADD_TO_PLAYLIST = "add_to_playlist"
     MODE_SETTINGS = "settings"
     MODE_ARTIST = "artist"
+    MODE_DOWNLOAD = "download"
 
     # The artist page's tabs, in the order Tab walks them. Each one is a
     # different TIDAL endpoint and each is fetched the first time you land on
@@ -1474,6 +1528,15 @@ class HeadlessTidalPlayer:
         # The playlist a track was last added to, pinned to the top of the
         # picker and persisted in the state file (see _remember_last_playlist).
         self._last_playlist_id: Optional[str] = None
+        # Download screen state. _download_track is what [d] was pressed on,
+        # _download_cursor the tier under the cursor (pre-placed on the one
+        # settings is set to), and _download_job the one job at a time — a
+        # whole dict, replaced rather than mutated, so the paint thread can
+        # never read it half-written.
+        self._download_track = None
+        self._download_cursor = 0
+        self._download_job = None
+        self._download_job_gen = 0
         # Settings page state. _settings_edit is the digits typed into a number
         # row so far, or None when the arrows are just navigating; it is only
         # ever replaced wholesale, never appended to in place
@@ -2040,14 +2103,20 @@ class HeadlessTidalPlayer:
                         self._queue = [real if t is track else t for t in queue]
                     if self._play_gen == gen:
                         self._current_track = real
-                url = self._take_prefetched(real.id) or self._stream_url(real)
+                # A deliberate download is played from the user's own folder
+                # and costs no request at all — so it is looked for before the
+                # stream URL is asked for, not after
+                owned = downloads.path_for(real.id)
+                url = "" if owned else (
+                    self._take_prefetched(real.id) or self._stream_url(real))
                 # Superseded by a newer track, or paused while we were
                 # fetching — either way this start is no longer wanted
                 if self._play_gen != gen or not self._playing:
                     return
                 artist = ", ".join(a.name for a in real.artists) if real.artists else ""
                 title = f"{real.name} — {artist}" if artist else real.name
-                self.audio.play_url(url, seek=seek, title=title, cache_key=real.id)
+                self.audio.play_url(url, seek=seek, title=title, cache_key=real.id,
+                                    local=str(owned) if owned else None)
                 if self._play_gen != gen:
                     return
                 self._playing = True
@@ -2515,6 +2584,8 @@ class HeadlessTidalPlayer:
         reason there might never be one — no cover, no colour, no room, a
         failed fetch, an undecodable image — comes out here as None too.
         """
+        # `self._mini_player`, not `self._fit.mini`: this is asked outside a
+        # build too, where the fit is whatever the last one left behind
         if (not self._show_artwork or self._mini_player
                 or self._mode != self.MODE_PLAYER or not self._fit.artwork):
             return None
@@ -3157,6 +3228,22 @@ class HeadlessTidalPlayer:
             f" · {format_gb(self._cache.disk_bytes())}", style="dim")
         content.append("   [x]", style="bold")
         content.append(" clear cache", style="dim")
+        # Downloads are the other tier and read as one: their own folder, their
+        # own count, and deliberately no budget and no [x] — nothing in ticli
+        # deletes a track somebody asked for. Saying where they are is the
+        # whole point of the line; a folder you cannot find is not user-owned.
+        kept = downloads.downloaded_count()
+        content.append(
+            f"\n   {kept} song{'' if kept == 1 else 's'} downloaded"
+            f" · {format_gb(downloads.total_bytes())}", style="dim")
+        # Where they are is the point of the line and survives a short window;
+        # *why* they are exempt from the budget is prose and goes with the rest
+        # of it, which is what keeps [x], [o] and [u] on screen at 80x24
+        content.append(f"   {downloads.display_dir()}", style="dim")
+        if prose:
+            content.append(
+                "\n   Downloads are never evicted and never counted against"
+                " the cache budget", style="dim")
         # Account lives here rather than on the player screen — it's a thing you
         # look at when you're already in settings, not while listening
         content.append("\n   Logged in as ", style="dim")
@@ -3165,6 +3252,119 @@ class HeadlessTidalPlayer:
         content.append(" log out", style="dim")
         content.append_text(self._build_pkce_line())
         return content
+
+    def _build_download_display(self) -> Text:
+        """The download screen: one track, one column of tiers.
+
+        A single column because that is what a cursor reads down. The tier
+        under the cursor says `download now` — the action belongs to the row
+        you are on, not to a separate button somewhere else — and *every* row
+        shows its size, because all four estimates are arithmetic on a
+        duration we already have and cost nothing to show. They are prefixed
+        `~` and the line under the picker says how good the `~` is for the
+        tier you are on, which is not the same answer for AAC and for FLAC.
+        """
+        content = Text()
+        track = self._download_track
+        content.append("   Download", style="bold magenta")
+        if track is None:
+            content.append("\n\n   No track selected", style="dim")
+            return content
+
+        artist = ", ".join(a.name for a in (getattr(track, "artists", None) or [])
+                           if getattr(a, "name", None))
+        album = getattr(track, "album", None)
+        content.append(f"\n\n   {getattr(track, 'name', '?')}", style="bold white")
+        if artist:
+            content.append(f" — {artist}", style="white")
+        if album is not None and getattr(album, "name", None):
+            content.append(f"\n   {album.name}", style="dim")
+        content.append(f"   {format_time(getattr(track, 'duration', 0))}", style="dim")
+
+        existing = downloads.path_for(getattr(track, "id", None))
+        if existing is not None:
+            content.append(f"\n\n   Already downloaded · {existing}", style="green")
+
+        content.append("\n")
+        # Three things want the same line: the tier, the action on the hovered
+        # row, and the size. What gives way, in order, is the *action* and then
+        # the size — the action because [Enter] download is in the footer and
+        # the cursor already says which row it applies to, and the size last
+        # because it is the only thing here you cannot get anywhere else. What
+        # never happens is a clipped estimate: `~24…` reads as a number, and a
+        # wrong number is worse than no number.
+        room = max(self._fit.inner - INDENT - 1, 8)
+        widest = max(len(t) for t in QUALITY_CHOICES)
+        sizes = {t: "~" + downloads.format_bytes(self._download_estimate(t))
+                 for t in QUALITY_CHOICES}
+        size_col = max(len(s) for s in sizes.values())
+        action = "download now"
+        if widest + 2 + len(action) + 2 + size_col > room:
+            action = "" if widest + 2 + size_col <= room else None
+        show_size = widest + 2 + size_col <= room or action == "download now"
+        for index, tier in enumerate(QUALITY_CHOICES):
+            selected = index == self._download_cursor
+            gated = self._quality_unavailable(tier)
+            content.append("\n")
+            content.append("  ▸ " if selected else "    ",
+                           style="bold cyan" if selected else "")
+            style = "dim" if gated else ("bold white" if selected else "white")
+            content.append(f"{tier:<{widest}}", style=style)
+            # The action sits on the hovered row and nowhere else
+            if action:
+                content.append(
+                    f"  {action if selected else '':<{len(action)}}",
+                    style="bold cyan" if selected and not gated else "dim")
+            if show_size:
+                # Right-aligned, so four estimates read as a column of sizes
+                content.append(f"  {sizes[tier]:>{size_col}}",
+                               style="dim" if gated or not selected else "cyan")
+
+        # What the hovered tier is, and what its `~` is worth. One line rather
+        # than four, because a description repeated on every row is noise and
+        # the accuracy genuinely differs between AAC and FLAC.
+        tier = self._download_tier()
+        content.append(f"\n\n   {QUALITY_MEANINGS.get(tier, '')}", style="dim")
+        content.append(f"\n   {downloads.ESTIMATE_ACCURACY.get(tier, '')}", style="dim")
+        if self._quality_unavailable(tier):
+            content.append(
+                f"\n   This login isn't served {tier}; TIDAL sends "
+                f"{self._quality_ceiling} instead — [u] on the settings page fixes it",
+                style="dim yellow")
+        content.append_text(self._build_download_status())
+        content.append(f"\n\n   Saved to {downloads.display_dir()}"
+                       "/<artist>/<album>/", style="dim")
+        return content
+
+    def _build_download_status(self) -> Text:
+        """Loading, done and failed as three different screens, and honest
+        about the tags: the file's own folder and filename always carry the
+        artist, album and title, and what got written *inside* the file is
+        reported from what was actually written, never from intent."""
+        line = Text()
+        job = self._download_job
+        if not job:
+            return line
+        state = job.get("state")
+        if state == "running":
+            done, total = job.get("done") or 0, job.get("total") or 0
+            share = f" · {done * 100 // total}%" if total else ""
+            line.append(f"\n\n   Downloading {job.get('tier')}"
+                        f" · {downloads.format_bytes(done)}{share}", style="yellow")
+            line.append("   [x] cancel", style="dim")
+        elif state == "cancelled":
+            line.append("\n\n   Download cancelled", style="dim")
+        elif state == "done":
+            line.append(f"\n\n   Saved {job.get('path')}", style="green")
+            written = job.get("tags")
+            line.append(
+                f"\n   Tagged with {written}" if written else
+                "\n   No tags could be written into this container — the folder "
+                "and filename carry the artist, album and title", style="dim")
+        elif state == "failed":
+            line.append(f"\n\n   Download failed — {job.get('error')}", style="red")
+            line.append("   [Enter] retry", style="dim")
+        return line
 
     def _build_quality_gate_note(self) -> Text:
         """Why the dimmed tiers in the ladder above are dimmed — and, if the
@@ -3286,8 +3486,9 @@ class HeadlessTidalPlayer:
                 Hint("a", "play all", "all", 5),
                 Hint("y", "add to playlist", "add", 6),
             ]
+            hints.append(Hint("d", "download", "get", 7))
             if self._browse_playlist is not None:
-                hints.append(Hint("x", "remove", "del", 7))
+                hints.append(Hint("x", "remove", "del", 8))
             hints.append(Hint("v", "volume", "vol", 3))
             hints.append(Hint("\u2190/Esc", "back", None, 1))
             return hints
@@ -3300,6 +3501,7 @@ class HeadlessTidalPlayer:
                 Hint("\u2191/\u2193", "navigate", "move", 3),
                 Hint("Tab", "section", None, 1),
                 Hint("a", "play all", "all", 5),
+                Hint("d", "download", "get", 6),
                 Hint("v", "volume", "vol", 4),
                 Hint("\u2190/Esc", "back", None, 2),
             ]
@@ -3310,6 +3512,7 @@ class HeadlessTidalPlayer:
                 Hint("Space", "pause/play", "pause", 4),
                 Hint("x", "remove", "del", 6),
                 Hint("y", "add to playlist", "add", 7),
+                Hint("d", "download", "get", 8),
                 Hint("v", "volume", "vol", 3),
                 Hint("\u2190/Esc", "back", None, 1),
             ]
@@ -3335,6 +3538,20 @@ class HeadlessTidalPlayer:
                 Hint("v", "volume", "vol", 3),
                 Hint("\u2190/Esc", "cancel", None, 1),
             ]
+        if self._mode == self.MODE_DOWNLOAD:
+            # [x] only while there is a job to cancel, because a key that does
+            # nothing is worse than one that is not offered — and the running
+            # job's own line says it too, next to the bytes it is cancelling
+            hints = [
+                Hint("Enter", "download", "get", 0),
+                Hint("\u2191/\u2193", "quality", "tier", 1),
+                Hint("Space", "pause/play", "pause", 4),
+            ]
+            if (self._download_job or {}).get("state") == "running":
+                hints.append(Hint("x", "cancel", None, 2))
+            hints.append(Hint("v", "volume", "vol", 5))
+            hints.append(Hint("\u2190/Esc", "back", None, 3))
+            return hints
         if self._mode == self.MODE_SETTINGS:
             return [
                 Hint("\u2191/\u2193", "select", None, 1),
@@ -3369,6 +3586,7 @@ class HeadlessTidalPlayer:
                 Hint("l", "like", None, 6),
                 Hint("r", "radio", None, 6),
                 Hint("y", "add to playlist", "add", 7),
+                Hint("d", "download", "get", 6),
                 Hint("q", "queue", None, 6),
                 Hint("p", "playlists", "lists", 6),
                 Hint("c", "settings", "config", 6),
@@ -3449,7 +3667,7 @@ class HeadlessTidalPlayer:
         if time.time() < self._toast_until:
             content.append(f"\n   {self._toast}", style="bold green")
 
-        if self._mini_player:
+        if fit.mini:
             if self._quit_pending:
                 content.append_text(self._build_quit_confirm())
             return self._with_footer(content, fit)
@@ -3472,6 +3690,8 @@ class HeadlessTidalPlayer:
                 content.append_text(self._build_add_to_playlist_display())
             elif self._mode == self.MODE_SETTINGS:
                 content.append_text(self._build_settings_display())
+            elif self._mode == self.MODE_DOWNLOAD:
+                content.append_text(self._build_download_display())
 
         if self._quit_pending:
             content.append_text(self._build_quit_confirm())
@@ -3526,6 +3746,7 @@ class HeadlessTidalPlayer:
             # rows are worth more to the music than to the footer
             hint_rows=2 if height >= 16 else 1,
             levers=levers,
+            mini=mini,
         )
         self._fit = fit
         body, footer = self._compose(fit)
@@ -4524,6 +4745,212 @@ class HeadlessTidalPlayer:
             return playlists
         return pinned + [p for p in playlists if str(getattr(p, "id", "") or "") != pid]
 
+    # ── Downloads ──
+
+    def _open_download(self):
+        """Open the download screen for whatever [d] was pressed on.
+
+        The same target rule the add-to-playlist picker uses, so [d] and [y]
+        never disagree about which track the screen you are looking at means.
+        The cursor is pre-placed on the tier settings is set to: that is the
+        tier this session is already listening at, so Enter twice is the
+        answer for the common case and the other three are one arrow away.
+        """
+        track = self._target_track_for_picker()
+        if track is None:
+            self._set_toast("No track selected")
+            return
+        self._push_nav()
+        self._mode = self.MODE_DOWNLOAD
+        self._mini_player = False
+        self._download_track = track
+        try:
+            self._download_cursor = QUALITY_CHOICES.index(self._quality_name)
+        except ValueError:
+            self._download_cursor = 0
+        # A job for a different track is finished business; one for this track
+        # is what the screen should still be reporting on
+        job = self._download_job
+        running = bool(job) and job.get("state") == "running"
+        if job and job.get("track_id") != getattr(track, "id", None):
+            self._download_job = None
+        if not running:
+            # A download the app was killed in the middle of left a scratch
+            # file behind. It is named for this track and nothing is writing
+            # it, so it goes — by exact name, the only deletion this feature
+            # ever performs under the music folder.
+            self._discard_staging(getattr(track, "id", None))
+
+    def _cancel_download(self):
+        """Stop the running download and take its half-written file with it.
+
+        The generation counter is what tells the thread; it checks it every
+        chunk, so the file is gone within one chunk of the keypress rather
+        than at the end of the track it was fetching.
+        """
+        job = self._download_job
+        if not job or job.get("state") != "running":
+            return
+        self._download_job_gen += 1
+        self._download_job = dict(job, state="cancelled")
+        self._set_toast("Download cancelled")
+
+    def _download_tier(self) -> str:
+        return QUALITY_CHOICES[self._download_cursor % len(QUALITY_CHOICES)]
+
+    def _download_estimate(self, tier: str) -> int:
+        """Bytes this track is likely to be at this tier. **No network.**
+
+        Duration is already on the track (and already in the metadata index),
+        so all four tiers can be shown at once for free. Asking TIDAL instead
+        would be one `playbackinfo` request per track per tier against a
+        limiter that revokes streaming at about fifty — see ai/INCIDENTS #1.
+        """
+        return downloads.estimate_bytes(
+            getattr(self._download_track, "duration", 0), tier)
+
+    def _start_download_job(self, tier: str):
+        """Download the targeted track at `tier`, on a daemon thread.
+
+        One job at a time, by the same single-flight rule the search paging
+        uses: a held-down Enter must not fan out into requests. The generation
+        counter is what a job checks to know it has been superseded — leaving
+        the screen or starting another download bumps it, and the running job
+        abandons its half-written file rather than landing on top of a newer
+        one.
+        """
+        track = self._download_track
+        if track is None:
+            return
+        job = self._download_job
+        if job and job.get("state") == "running":
+            return
+        self._download_job_gen = gen = self._download_job_gen + 1
+        track_id = getattr(track, "id", None)
+        self._download_job = {
+            "state": "running", "tier": tier, "track_id": track_id,
+            "done": 0, "total": 0, "path": None, "error": "", "tags": "",
+        }
+
+        def _update(**changes):
+            job = dict(self._download_job or {})
+            job.update(changes)
+            self._download_job = job
+            self._wake()
+
+        def _run():
+            final = None
+            try:
+                real = self._resolve_track(track)
+                if real is None:
+                    raise RuntimeError("track could not be resolved")
+                meta = downloads.track_metadata(real)
+                url = self._download_stream_url(real, tier)
+                sources = stream_sources(url)
+                if not sources:
+                    raise RuntimeError("stream named nothing to fetch")
+                # The extension is not known until the CDN answers, so the
+                # file is written under a provisional name and moved once the
+                # container has identified itself
+                staging = downloads.download_dir() / f".ticli-{track_id}{downloads.PART_SUFFIX}"
+                staging.parent.mkdir(parents=True, exist_ok=True)
+                last = [0.0]
+
+                def _progress(done, total):
+                    # Cheap enough to call per chunk, but a repaint per chunk
+                    # is not — one every quarter second is already faster than
+                    # the eye and slower than the monitor's own tick
+                    now = time.time()
+                    if now - last[0] < 0.25:
+                        return
+                    last[0] = now
+                    _update(done=done, total=total)
+
+                ext = fetch_to_file(
+                    sources, str(staging),
+                    abandoned=lambda: self._download_job_gen != gen,
+                    progress=_progress)
+                final = downloads.destination(meta, ext)
+                final.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(staging, final)
+                written = tags.write_tags(final, meta, self._cover_bytes(real))
+                size = final.stat().st_size
+                downloads.record(track_id, final.relative_to(downloads.download_dir()),
+                                 tier, size)
+                if self._download_job_gen != gen:
+                    return
+                _update(state="done", path=str(final), tags=written,
+                        done=size, total=size)
+                self._set_toast(f"Downloaded to {final.parent}")
+            except _DownloadSuperseded:
+                self._discard_staging(track_id)
+                if final is not None:
+                    downloads.discard_scratch(final)
+            except Exception as e:
+                logger.debug("Download failed: %s", e)
+                self._discard_staging(track_id)
+                if final is not None:
+                    downloads.discard_scratch(final)
+                if self._download_job_gen == gen:
+                    _update(state="failed", error=str(e)[:PLAYER_ERROR_CHARS])
+            finally:
+                self._wake()
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _discard_staging(self, track_id) -> None:
+        """Remove the half-written file this job was writing, by exact name.
+
+        The only thing ticli ever deletes under the music folder. A finished
+        download is never removed, and no directory ever is — ~/Music is the
+        user's own, and the rule there is stricter than in the cache, not
+        looser.
+        """
+        try:
+            (downloads.download_dir()
+             / f".ticli-{track_id}{downloads.PART_SUFFIX}").unlink()
+        except OSError:
+            pass
+
+    def _download_stream_url(self, track, tier: str) -> str:
+        """A stream URL for this track at a tier that may not be the one
+        playing. Network — callers are already off the UI thread.
+
+        tidalapi reads the quality off the session, and there is no per-call
+        override, so the setting is moved for the length of one request and
+        put back in a `finally`. One assignment of one string, restored
+        whatever happens: the worst case is a track starting in the same
+        breath being fetched at the download's tier instead of the player's,
+        which is a quality difference for one track and not a failure.
+        """
+        wanted = self.QUALITY_MAP.get(tier)
+        previous = self.session.audio_quality
+        try:
+            if wanted:
+                self.session.audio_quality = wanted
+            return self._stream_url(track)
+        finally:
+            self.session.audio_quality = previous
+
+    def _cover_bytes(self, track):
+        """The album cover as JPEG, for embedding. None is an ordinary answer.
+
+        A plain unauthenticated GET from resources.tidal.com — the same URL
+        the pixel-art cover already uses, so it is not an API request and
+        cannot contribute to a rate limit. Any failure at all means a file
+        without embedded art, never a failed download.
+        """
+        cover = artwork.cover_id_of(track)
+        if not cover:
+            return None
+        try:
+            response = requests.get(artwork.cover_url(cover), timeout=10)
+            response.raise_for_status()
+            return response.content
+        except Exception as e:
+            logger.debug("No cover for the downloaded file: %s", e)
+            return None
+
     def _open_playlist_picker(self):
         """Open the add-to-playlist picker for the targeted track."""
         track = self._target_track_for_picker()
@@ -4847,6 +5274,8 @@ class HeadlessTidalPlayer:
             self._handle_playlists_key(key)
         elif self._mode == self.MODE_ADD_TO_PLAYLIST:
             self._handle_add_to_playlist_key(key)
+        elif self._mode == self.MODE_DOWNLOAD:
+            self._handle_download_key(key)
         elif self._mode == self.MODE_SETTINGS:
             self._handle_settings_key(key)
         else:
@@ -4971,6 +5400,8 @@ class HeadlessTidalPlayer:
             self._start_track_radio()
         elif key == "y":
             self._open_playlist_picker()
+        elif key == "d":
+            self._open_download()
         elif key == "q":
             self._mini_player = False
             self._mode = self.MODE_QUEUE
@@ -5057,6 +5488,8 @@ class HeadlessTidalPlayer:
             self._play_all_browse()
         elif key == "y":
             self._open_playlist_picker()
+        elif key == "d":
+            self._open_download()
         elif key == "x":
             self._remove_from_browse_playlist()
 
@@ -5092,6 +5525,8 @@ class HeadlessTidalPlayer:
             self._play_all_artist()
         elif key == "y":
             self._open_playlist_picker()
+        elif key == "d":
+            self._open_download()
 
     def _handle_queue_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:
@@ -5115,6 +5550,8 @@ class HeadlessTidalPlayer:
             self._remove_from_queue()
         elif key == "y":
             self._open_playlist_picker()
+        elif key == "d":
+            self._open_download()
 
     def _handle_playlists_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:
@@ -5167,6 +5604,28 @@ class HeadlessTidalPlayer:
                 self._picker_new_name = ""
             elif playlists and self._picker_cursor < len(playlists):
                 self._picker_add_to(playlists[self._picker_cursor])
+
+    def _handle_download_key(self, key: str):
+        """One column, so ↑/↓ is the whole navigation and Enter is the whole
+        action. ↑ at the top does *not* hand the arrows to the player here, the
+        same as the add-to-playlist picker: this is a chooser you came to on
+        purpose and leave on purpose, not a list you were browsing."""
+        if key == KEY_ESC or key == KEY_LEFT:
+            self._go_back()
+            return
+        if key == " ":
+            self._toggle_play_key()
+            return
+        if key in ("x", "X"):
+            self._cancel_download()
+            return
+        if key == KEY_UP:
+            self._download_cursor = max(0, self._download_cursor - 1)
+        elif key == KEY_DOWN:
+            self._download_cursor = min(len(QUALITY_CHOICES) - 1,
+                                        self._download_cursor + 1)
+        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
+            self._start_download_job(self._download_tier())
 
     def _handle_settings_key(self, key: str):
         # Typing a number into a row: digits extend it, Backspace shortens it,

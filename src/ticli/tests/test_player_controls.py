@@ -389,6 +389,7 @@ class TestTheVolumeOverlay:
         HeadlessTidalPlayer.MODE_QUEUE,
         HeadlessTidalPlayer.MODE_PLAYLISTS,
         HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
+        HeadlessTidalPlayer.MODE_DOWNLOAD,
         HeadlessTidalPlayer.MODE_SETTINGS,
     )
 
@@ -594,3 +595,73 @@ class TestTheVolumeOverlayAgainstTypingScreens:
             keys = [h.key for h in p._mode_hints()]
             assert ("v" in keys) is wanted, (mode, typing, keys)
             assert p._can_open_volume() is wanted or mode != p.MODE_ADD_TO_PLAYLIST
+
+
+class TestTheVolumeOverlayAndTheDownloadScreen:
+    """`d` opens a screen and `v` opens an overlay over whatever screen is
+    open. They are different keys doing different things and neither may eat
+    the other — including while a download is actually running."""
+
+    def _player(self, mode=None):
+        p = HeadlessTidalPlayer()
+        p.audio = _FakeAudio()
+        p._current_track = _fake_track(1)
+        p._download_track = p._current_track
+        if mode is not None:
+            p._mode = mode
+        return p
+
+    def test_d_opens_the_download_screen_and_v_does_not(self):
+        p = self._player()
+        p._handle_key("d")
+        assert p._mode == p.MODE_DOWNLOAD
+        assert p._volume_open is False
+
+    def test_v_opens_over_the_download_screen_without_leaving_it(self):
+        p = self._player(HeadlessTidalPlayer.MODE_DOWNLOAD)
+        p._handle_key("v")
+        assert p._volume_open is True
+        assert p._mode == p.MODE_DOWNLOAD
+
+    def test_a_running_job_keeps_its_progress_while_the_overlay_is_up(self):
+        """The overlay takes the footer's rows, not the screen's: a job's own
+        progress line lives in the body and must still be there — you turned
+        the volume down, you did not cancel anything."""
+        p = self._player(HeadlessTidalPlayer.MODE_DOWNLOAD)
+        p._download_job = {"state": "running", "tier": "LOSSLESS",
+                           "done": 1024, "total": 4096}
+        p._handle_key("v")
+        text = p._build_download_display().plain
+        assert "Downloading LOSSLESS" in text
+        assert "25%" in text
+        assert p._download_job["state"] == "running"
+
+    def test_the_overlay_does_not_pass_x_through_to_cancel_the_job(self):
+        """`x` cancels a download. While the overlay is up it must reach
+        nothing at all — an overlay that swallowed a key and acted on it
+        underneath would cancel a download from a volume bar."""
+        p = self._player(HeadlessTidalPlayer.MODE_DOWNLOAD)
+        cancelled = []
+        p._cancel_download = lambda: cancelled.append(1)
+        p._handle_key("v")
+        p._handle_key("x")
+        assert cancelled == []
+        p._handle_key(player_mod.KEY_ESC)
+        p._handle_key("x")
+        assert cancelled == [1], "and it works again once the overlay is shut"
+
+    def test_the_footer_offers_cancel_only_while_there_is_a_job(self):
+        p = self._player(HeadlessTidalPlayer.MODE_DOWNLOAD)
+        assert "x" not in [h.key for h in p._mode_hints()]
+        p._download_job = {"state": "running", "tier": "LOW", "done": 0, "total": 0}
+        assert "x" in [h.key for h in p._mode_hints()]
+        p._download_job = {"state": "done", "path": "/tmp/x.m4a", "tags": None}
+        assert "x" not in [h.key for h in p._mode_hints()]
+
+    def test_d_is_not_a_key_in_search(self):
+        """Search types every printable key, `d` included — same rule as `v`."""
+        p = self._player(HeadlessTidalPlayer.MODE_SEARCH)
+        p._search_query = ""
+        p._handle_key("d")
+        assert p._mode == p.MODE_SEARCH
+        assert p._search_query == "d"

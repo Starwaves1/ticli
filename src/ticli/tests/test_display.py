@@ -22,6 +22,7 @@ import time
 import types
 
 import pytest
+from rich.cells import cell_len
 from rich.console import Console
 
 from ticli.player import HeadlessTidalPlayer
@@ -40,6 +41,7 @@ MODES = (
     HeadlessTidalPlayer.MODE_QUEUE,
     HeadlessTidalPlayer.MODE_PLAYLISTS,
     HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
+    HeadlessTidalPlayer.MODE_DOWNLOAD,
     HeadlessTidalPlayer.MODE_SETTINGS,
 )
 
@@ -361,6 +363,8 @@ def _fill_lists(p):
         id=str(i), name=f"A playlist named {i}", num_tracks=20) for i in range(30)]
     p._editable_playlists = p._playlists
     p._artist = types.SimpleNamespace(id=7, name="An Artist With A Long Name")
+    p._download_track = tracks[0]
+    p._picker_track = tracks[0]
     p._artist_sections = {
         (p._artist_key(section)): {
             "state": "ready",
@@ -674,3 +678,192 @@ class TestScrubbingAndTheOverlayOnScreen:
             assert h.stranded() == []
         finally:
             h.live.stop()
+
+
+# ── the frame is never taller than the window ──
+
+# The owner's actual track, reported as ten stacked `Ticli` panels marching
+# down his terminal. Wide characters are two cells each and this title mixes
+# them with a long ASCII tail, so it is the fixture the suite never had. The
+# ASCII twin is the same length in characters and half the cells in the CJK
+# run: the pair is what tells a width bug from a length bug.
+WIDE_TITLE = "Super Idol 的笑容都没你的甜 (Schwank's easiest 96 . 41% of my life remix)"
+ASCII_TWIN = "Super Idol de xiao rong dou mei ni de tian (Schwanks easiest 96 . 41% remix)"
+
+WIDE_ARTIST = "Schwank 的笑容"
+WIDE_ALBUM = "Super Idol 的笑容都没你的甜"
+
+
+def _wide_track(title, i=0):
+    return types.SimpleNamespace(
+        id=i, name=title, duration=172,
+        artists=[types.SimpleNamespace(name=WIDE_ARTIST)],
+        album=types.SimpleNamespace(name=WIDE_ALBUM, cover=COVER),
+    )
+
+
+def _loaded(player, title, artwork=None):
+    """Every screen filled with the same track, so one player answers for all
+    of them without a session, a thread or a request."""
+    tracks = [_wide_track(title, i) for i in range(30)]
+    player._current_track = tracks[0]
+    player._queue = tracks
+    player._queue_index = 1
+    player._browse_tracks = tracks
+    player._search_query = "的笑容"
+    player._search_results = [
+        {"type": "track", "name": title, "artist": WIDE_ARTIST, "obj": t}
+        for t in tracks]
+    player._playlists = [types.SimpleNamespace(
+        id=str(i), name=title, num_tracks=9) for i in range(20)]
+    player._editable_playlists = player._playlists
+    player._artist = types.SimpleNamespace(id=7, name=title)
+    player._artist_sections = {
+        player._artist_key(section): {
+            "state": "ready",
+            "items": [{"type": "track", "obj": t} for t in tracks],
+            "message": "",
+        }
+        for section in HeadlessTidalPlayer.ARTIST_SECTIONS
+    }
+    player._download_track = tracks[0]
+    player._picker_track = tracks[0]
+    player._toast = "Track '345067195' is unavailable"
+    player._toast_until = time.time() + 60
+    player._show_more = True
+    if artwork:
+        player._show_artwork = True
+        player._artwork = (COVER, artwork[0], artwork[1], _grid(*artwork))
+    else:
+        player._show_artwork = False
+    return player
+
+
+def _frame(player):
+    """The frame as the terminal will receive it: a list of rows, and each
+    row's width in *cells*, which is what a terminal counts and what a
+    character count gets wrong for 的."""
+    lines = player.console.render_lines(
+        player._build_display(), player.console.options, pad=False)
+    return lines, [sum(cell_len(seg.text) for seg in line) for line in lines]
+
+
+class TestAFrameNeverOutgrowsTheWindow:
+    """The invariant the reported bug broke, and the one that would have
+    caught it.
+
+    A frame taller than the terminal is not clipped by the terminal — it
+    scrolls it. `Live` then homes the cursor and writes the next frame from
+    the top of a screen that has already moved, so the previous frame is
+    stranded above it and the panels stack, one per repaint, until the window
+    is full of them. Ten of them, in the screenshot this exists for.
+
+    Measured on the reported title and on an ASCII twin of the same length,
+    because the two answer different questions: the twin says whether the
+    cause is width or merely length.
+    """
+
+    @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
+    @pytest.mark.parametrize("mode", MODES)
+    @pytest.mark.parametrize("width", WIDTHS + (40,))
+    def test_every_mode_at_every_width(self, title, mode, width):
+        for height in (20, 24, 30):
+            h = Harness(width=width, height=height,
+                        artwork=art_mod.art_size(width, height))
+            p = _loaded(h.player, title, art_mod.art_size(width, height))
+            p._mode = mode
+            lines, widths = _frame(p)
+            assert len(lines) <= height, (title[:12], mode, width, height, len(lines))
+            assert max(widths) <= width, (title[:12], mode, width, height, max(widths))
+
+    def test_the_mini_player_too(self):
+        for width in WIDTHS + (40,):
+            h = Harness(width=width, height=24)
+            p = _loaded(h.player, WIDE_TITLE)
+            p._mini_player = True
+            lines, widths = _frame(p)
+            assert len(lines) <= 24, (width, len(lines))
+            assert max(widths) <= width, (width, max(widths))
+
+    def test_a_wide_title_is_cut_by_cells_not_by_characters(self):
+        """The clip has to agree with the terminal about how much room 的 takes.
+        Counting characters leaves a line that measures 74 and renders 82."""
+        h = Harness(width=80, height=24)
+        p = _loaded(h.player, WIDE_TITLE)
+        lines, widths = _frame(p)
+        track_line = [line for line in lines
+                      if any("Super Idol" in seg.text for seg in line)]
+        assert track_line, "the track never reached the screen"
+        for line in track_line:
+            assert sum(cell_len(seg.text) for seg in line) <= 80
+
+    def test_the_list_row_remainder_is_not_a_second_row(self):
+        """A row that wrapped was two rows on screen, which is how a page of 15
+        became 30 and the queue overflowed a 24-row window by 25 lines. The
+        reported symptom was the wrapped tail appearing twice."""
+        h = Harness(width=80, height=24)
+        p = _loaded(h.player, WIDE_TITLE)
+        p._mode = p.MODE_QUEUE
+        lines, _ = _frame(p)
+        tails = [line for line in lines
+                 if any("of my life remix" in seg.text for seg in line)]
+        assert tails == [], "a row wrapped instead of being clipped"
+
+    def test_it_survives_a_repaint_through_a_real_terminal(self):
+        """End to end: the escape sequences into the terminal model, four
+        repaints, and nothing stranded above or below the one panel."""
+        h = Harness(width=80, height=24)
+        _loaded(h.player, WIDE_TITLE)
+        h.player._mode = h.player.MODE_QUEUE
+        h.start()
+        try:
+            for _ in range(4):
+                h.repaint()
+            h.assert_one_frame("wide title in the queue")
+            assert h.stranded() == []
+        finally:
+            h.live.stop()
+
+
+class TestTheDownloadTiersFit:
+    """Three things want one line: the tier, `download now` on the hovered
+    row, and the size. A clipped size is the one outcome that must not
+    happen — `~24…` reads as a number, and a wrong number is worse than none."""
+
+    def _rows(self, width):
+        h = Harness(width=width, height=24,
+                    artwork=art_mod.art_size(width, 24))
+        p = _loaded(h.player, "Satisfied (Ambient Reprise)")
+        p._mode = p.MODE_DOWNLOAD
+        p._download_cursor = 2
+        lines, widths = _frame(p)
+        assert max(widths) <= width, (width, max(widths))
+        text = ["".join(seg.text for seg in line) for line in lines]
+        return [r for r in text if any(t in r for t in ("LOW", "HIGH", "LOSSLESS", "HIRES"))]
+
+    @pytest.mark.parametrize("width", WIDTHS + (40,))
+    def test_a_size_is_whole_or_absent_never_cut(self, width):
+        rows = self._rows(width)
+        assert rows, width
+        for row in rows:
+            assert "…" not in row, (width, row)
+            if "~" in row:
+                # A size that is there is a complete one: digits, a dot, a unit
+                tail = row.split("~")[1].strip().rstrip("│").strip()
+                assert re.match(r"^\d+(\.\d+)?\s(B|KB|MB|GB)$", tail), (width, row)
+
+    def test_the_action_gives_way_before_the_size(self):
+        """The action is in the footer and the cursor already says which row it
+        applies to; the size is the only thing on this screen you cannot get
+        anywhere else."""
+        wide = "".join(self._rows(80))
+        narrow = "".join(self._rows(40))
+        assert "download now" in wide and "~" in wide
+        assert "download now" not in narrow, "the action goes first"
+        assert "~" in narrow, "the size stays"
+
+    def test_every_tier_is_listed_at_every_width(self):
+        for width in WIDTHS + (40,):
+            rows = self._rows(width)
+            for tier in ("LOW", "HIGH", "LOSSLESS", "HIRES"):
+                assert any(tier in r for r in rows), (width, tier)
