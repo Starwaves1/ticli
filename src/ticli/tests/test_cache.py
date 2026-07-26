@@ -8,6 +8,7 @@ directory: CACHE_DIR and the config file are both redirected to tmp_path.
 """
 
 import json
+import os
 import tempfile
 import threading
 import time
@@ -728,22 +729,51 @@ class TestAudioRetention:
         assert _audio_files() == []
 
     def test_the_oldest_download_is_the_one_evicted(self, monkeypatch):
-        _fake_get(monkeypatch)
+        # Both files are placed directly, with times stated rather than
+        # measured: what is under test is "least recently used goes first",
+        # and nothing about that should depend on when the test ran, how long
+        # a download thread took, or whether a sweep it started is still in
+        # flight. The version of this that raced one was flaky about 1 run in 4.
         audio = self._audio()
-        self._download(audio, cache_key=12)
-        old = cache_mod.audio_dir() / "12.m4a"
-        past = time.time() - 10_000
-        import os
-        os.utime(old, (past, past))
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        old = directory / "12.m4a"
+        old.write_bytes(BODY)
+        os.utime(old, (1_000_000, 1_000_000))
         # A second track that only overshoots the budget with the first there
+        big = directory / "13.m4a"
+        big.write_bytes(b"x" * 1_040_000)
+        os.utime(big, (2_000_000, 2_000_000))
         monkeypatch.setattr(cache_mod, "BYTES_PER_GB", 1024 * 1024)
         audio.cache.budget_gb = 1
-        big = cache_mod.audio_dir() / "13.m4a"
-        big.write_bytes(b"x" * 1_040_000)
+
         audio._sweep_cache()
 
         assert not old.exists()
         assert big.exists()
+
+    def test_a_sweep_racing_another_stops_at_the_budget(self, monkeypatch):
+        """Two downloads landing together sweep at the same time. A file the
+        other sweep already unlinked has been freed, not kept — reading it the
+        other way evicts one file too many, which is what made the eviction
+        test flaky rather than wrong."""
+        audio = self._audio()
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        gone = directory / "12.m4a"
+        gone.write_bytes(b"x" * 600_000)
+        os.utime(gone, (1_000_000, 1_000_000))
+        keep = directory / "13.m4a"
+        keep.write_bytes(b"x" * 400_000)
+        os.utime(keep, (2_000_000, 2_000_000))
+        monkeypatch.setattr(cache_mod, "BYTES_PER_GB", 1024 * 1024)
+        audio.cache.budget_gb = 1
+        # The other sweep got there first
+        gone.unlink()
+
+        audio._sweep_cache()
+
+        assert keep.exists()
 
     def test_the_settings_row_does_not_promise_a_backend(self):
         """Caching songs is a plain HTTP GET, so it is the same on mpv and

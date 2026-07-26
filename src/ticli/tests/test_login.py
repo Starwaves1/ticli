@@ -10,6 +10,7 @@ nothing that touches a real session file.
 """
 
 import json
+import time
 import types
 
 import pytest
@@ -431,17 +432,26 @@ class _StreamSession(_FakeSession):
         self.is_pkce = is_pkce
 
 
+def _dash(urls, chunk=176128, last=102057, timescale=44100):
+    """A stand-in for tidalapi's DashInfo, shaped like the real one: urls[0] is
+    the initialization segment and is repeated as `first_url`."""
+    return types.SimpleNamespace(
+        urls=list(urls), first_url=urls[0], chunk_size=chunk,
+        last_chunk_size=last, timescale=timescale,
+    )
+
+
 class _Manifest:
-    def __init__(self, bts, urls, hls=""):
+    def __init__(self, bts, urls, dash_info=None):
         self.is_bts = bts
         self._urls = urls
-        self._hls = hls
+        self.dash_info = dash_info if dash_info is not None else _dash(urls)
 
     def get_urls(self):
         return self._urls
 
     def get_hls(self):
-        return self._hls
+        raise AssertionError("tidalapi's get_hls() omits #EXT-X-MAP")
 
 
 class _StreamTrack:
@@ -474,11 +484,11 @@ class TestStreamUrl:
     def test_a_segmented_stream_becomes_a_local_playlist(self, token_file, tmp_path, monkeypatch):
         monkeypatch.setattr(player_mod.tempfile, "gettempdir", lambda: str(tmp_path))
         player = _player(_StreamSession(is_pkce=True))
-        hls = "#EXTM3U\n#EXTINF:4.0,\nhttps://cdn/seg0.mp4\n#EXT-X-ENDLIST\n"
-        track = _StreamTrack(_Manifest(bts=False, urls=["https://cdn/seg0.mp4"], hls=hls))
+        segments = [f"https://cdn/{i}.mp4" for i in range(4)]
+        track = _StreamTrack(_Manifest(bts=False, urls=segments))
         source = player._stream_url(track)
         assert source.endswith("7.m3u8")
-        assert "https://cdn/seg0.mp4" in open(source).read()
+        assert "https://cdn/1.mp4" in open(source).read()
 
     def test_old_playlists_are_pruned_on_write(self, tmp_path, monkeypatch):
         monkeypatch.setattr(player_mod.tempfile, "gettempdir", lambda: str(tmp_path))
@@ -487,11 +497,221 @@ class TestStreamUrl:
         directory = player_mod.Path(path).parent
         assert len(list(directory.glob("*.m3u8"))) == player_mod.HLS_KEEP
 
-    def test_a_local_playlist_is_never_downloaded(self, tmp_path):
-        # requests.get on a filesystem path would raise; the guard is what
-        # keeps a segmented stream from looking like a broken download
+
+class TestSegmentedPlaylist:
+    """The generated playlist is the whole contract with ffmpeg. Every one of
+    these tags was missing at least once, and each omission plays silence."""
+
+    def test_the_initialization_segment_is_declared_as_a_map(self):
+        # Without EXT-X-MAP the fMP4 fragments have no moov and ffmpeg reports
+        # "trun track id unknown, no tfhd was found" for every one of them —
+        # which is exactly what the first version of this did.
+        hls = player_mod._hls_playlist(_dash([f"https://cdn/{i}.mp4" for i in range(4)]))
+        assert '#EXT-X-MAP:URI="https://cdn/0.mp4"' in hls
+        # and it is never also listed as if it were audio
+        assert "\nhttps://cdn/0.mp4\n" not in hls
+
+    def test_it_carries_the_tags_a_vod_playlist_needs(self):
+        hls = player_mod._hls_playlist(_dash([f"https://cdn/{i}.mp4" for i in range(4)]))
+        lines = hls.splitlines()
+        assert lines[0] == "#EXTM3U"
+        assert f"#EXT-X-VERSION:{player_mod.HLS_VERSION}" in lines
+        assert "#EXT-X-PLAYLIST-TYPE:VOD" in lines
+        assert "#EXT-X-MEDIA-SEQUENCE:1" in lines
+        assert any(ln.startswith("#EXT-X-TARGETDURATION:") for ln in lines)
+        assert lines[-1] == "#EXT-X-ENDLIST"
+
+    def test_every_segment_gets_a_duration_and_the_last_its_own(self):
+        hls = player_mod._hls_playlist(
+            _dash([f"https://cdn/{i}.mp4" for i in range(4)],
+                  chunk=44100, last=22050, timescale=44100))
+        assert hls.count("#EXTINF:") == 3  # three media segments, not four
+        assert "#EXTINF:1.000," in hls
+        assert "#EXTINF:0.500," in hls
+
+    def test_a_target_duration_is_never_rounded_down_to_zero(self):
+        hls = player_mod._hls_playlist(
+            _dash(["https://cdn/0.mp4", "https://cdn/1.mp4"],
+                  chunk=4410, last=4410, timescale=44100))
+        assert "#EXT-X-TARGETDURATION:1" in hls
+
+    def test_a_manifest_naming_nothing_is_an_error_not_a_silent_playlist(self):
+        with pytest.raises(ValueError):
+            player_mod._hls_playlist(_dash(["https://cdn/0.mp4"]))
+
+    def test_the_segments_can_be_read_back_out_of_the_playlist(self, tmp_path):
+        # How the downloader gets the whole track without a second interface:
+        # the path it is handed is the path the player was handed
+        segments = [f"https://cdn/{i}.mp4" for i in range(4)]
+        path = tmp_path / "7.m3u8"
+        path.write_text(player_mod._hls_playlist(_dash(segments)))
+        assert player_mod._hls_segments(str(path)) == segments
+
+    def test_a_playlist_that_is_not_there_names_no_segments(self, tmp_path):
+        assert player_mod._hls_segments(str(tmp_path / "gone.m3u8")) == []
+
+
+class TestSegmentedPlayback:
+    """Handing an .m3u8 to a player is not enough on its own — both backends
+    need telling what it is before they will follow it out to the network."""
+
+    def _audio(self, cmd):
         audio = player_mod.AudioPlayer.__new__(player_mod.AudioPlayer)
-        assert audio._start_download(str(tmp_path / "7.m3u8"), 7, 0) is None
+        audio.player_cmd = cmd
+        return audio
+
+    def test_mpv_is_told_to_demux_it_rather_than_treat_it_as_a_file_list(self):
+        flags = self._audio("mpv")._hls_flags()
+        assert "--demuxer=lavf" in flags
+        assert "--demuxer-lavf-format=hls" in flags
+        # mpv splits key-value lists on commas, so the whitelist has to arrive
+        # length-prefixed or it is truncated at "file"
+        whitelist = player_mod.HLS_PROTOCOLS
+        assert (f"--demuxer-lavf-o=protocol_whitelist="
+                f"%{len(whitelist)}%{whitelist}") in flags
+
+    def test_ffplay_is_given_the_protocols_it_needs(self):
+        flags = self._audio("ffplay")._hls_flags()
+        assert flags == ["-protocol_whitelist", player_mod.HLS_PROTOCOLS, "-f", "hls"]
+
+    def test_https_is_on_both_backends_whitelists(self):
+        # The default for a local file input is "file,crypto,data", which turns
+        # every remote segment into an error and the track into silence
+        assert "https" in player_mod.HLS_PROTOCOLS.split(",")
+
+    def test_a_segmented_track_is_cached_as_one_concatenated_file(self, tmp_path, monkeypatch):
+        segments = [f"https://cdn/{i}.mp4" for i in range(4)]
+        playlist = tmp_path / "7.m3u8"
+        playlist.write_text(player_mod._hls_playlist(_dash(segments)))
+        fetched = []
+
+        class _Response:
+            def __init__(self, url):
+                self.url = url
+                self.headers = {"Content-Type": "audio/mp4"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def raise_for_status(self):
+                pass
+
+            def iter_content(self, size):
+                yield self.url.rsplit("/", 1)[1].encode()
+
+        def _get(url, **kwargs):
+            fetched.append(url)
+            return _Response(url)
+
+        monkeypatch.setattr(player_mod.requests, "get", _get)
+        audio = player_mod.AudioPlayer.__new__(player_mod.AudioPlayer)
+        audio.player_cmd = "mpv"
+        audio.cache = None
+        audio._download_gen = 0
+        audio._cache_file = None
+        audio._cache_persistent = False
+        base = str(tmp_path / "keep")
+        monkeypatch.setattr(type(audio), "_audio_cache_base",
+                            lambda self, key: base, raising=False)
+        audio._start_download(str(playlist), 7, 0)
+        for _ in range(200):
+            if audio._cache_file:
+                break
+            time.sleep(0.01)
+        # init segment first, then every media segment, in order
+        assert fetched == segments
+        assert audio._cache_file == base + ".m4a"
+        assert open(audio._cache_file, "rb").read() == b"0.mp41.mp42.mp43.mp4"
+
+
+class TestFailedPlaybackIsVisible:
+    """The deepest bug in the segmented-stream regression was not the format —
+    it was that the backend died on every track and the UI said nothing. A
+    playback failure has to reach the screen."""
+
+    def _audio(self, tmp_path, cmd="mpv"):
+        audio = player_mod.AudioPlayer.__new__(player_mod.AudioPlayer)
+        audio.player_cmd = cmd
+        audio._lock = player_mod.threading.Lock()
+        audio._stderr_path = str(tmp_path / "player.log")
+        audio._stderr_handle = None
+        audio._process = None
+        return audio
+
+    def test_a_player_that_died_complaining_reports_what_it_said(self, tmp_path):
+        audio = self._audio(tmp_path)
+        open(audio._stderr_path, "w").write(
+            "[ffmpeg/demuxer] mov,mp4: trun track id unknown, no tfhd was found\n")
+        audio._process = types.SimpleNamespace(poll=lambda: 3)
+        assert "no tfhd was found" in audio.failure()
+
+    def test_a_player_that_died_silently_still_reports_its_status(self, tmp_path):
+        audio = self._audio(tmp_path)
+        open(audio._stderr_path, "w").write("\n  \n")
+        audio._process = types.SimpleNamespace(poll=lambda: 3)
+        assert audio.failure() == "mpv exited with status 3"
+
+    def test_a_track_that_simply_ended_is_not_a_failure(self, tmp_path):
+        audio = self._audio(tmp_path)
+        audio._process = types.SimpleNamespace(poll=lambda: 0)
+        assert audio.failure() is None
+
+    def test_a_player_we_killed_ourselves_is_not_a_failure(self, tmp_path):
+        # stop() and ffplay's pause both terminate the process; a negative
+        # return code is a signal, which is us, not the stream
+        audio = self._audio(tmp_path)
+        audio._process = types.SimpleNamespace(poll=lambda: -15)
+        assert audio.failure() is None
+
+    def test_a_running_player_is_not_a_failure(self, tmp_path):
+        audio = self._audio(tmp_path)
+        audio._process = types.SimpleNamespace(poll=lambda: None)
+        assert audio.failure() is None
+
+    def test_the_error_is_trimmed_to_something_a_toast_can_show(self, tmp_path):
+        audio = self._audio(tmp_path)
+        open(audio._stderr_path, "w").write("x" * 500 + "\n")
+        audio._process = types.SimpleNamespace(poll=lambda: 1)
+        assert len(audio._last_stderr()) == player_mod.PLAYER_ERROR_CHARS
+
+    def test_the_monitor_toasts_the_failure_instead_of_skipping_on(
+            self, token_file, monkeypatch):
+        player = _player(_StreamSession())
+        player.running = True
+        player._playing = True
+        player._track_changing = False
+        player._current_track = types.SimpleNamespace(id=7, duration=300)
+        player._queue = [player._current_track, types.SimpleNamespace(id=8, duration=300)]
+        player._queue_index = 0
+        player._play_start_time = time.time()
+        player._play_offset = 0
+        advanced = []
+        player._play_queue_index = lambda i: advanced.append(i)
+        player.audio = types.SimpleNamespace(
+            is_paused=False, is_playing=False,
+            failure=lambda: "mpv error: Failed to recognize file format.",
+            source_vanished=lambda: False,
+            get_time_pos=lambda: None,
+            poll_media_key=lambda: None,
+        )
+
+        def _tick():
+            # Two dead polls, then stop the loop the way quitting would
+            player.running = len(_ticks) < 2
+            _ticks.append(1)
+
+        _ticks = []
+        player._save_state = lambda: None
+        monkeypatch.setattr(player_mod.time, "sleep", lambda s: _tick())
+        player._monitor_playback()
+
+        assert advanced == []          # the rest of the queue is not burned through
+        assert player._playing is False
+        assert "Failed to recognize file format." in player._toast
+        assert player._toast_until > time.time()
 
 
 class TestEntitlementGating:

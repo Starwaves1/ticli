@@ -124,12 +124,29 @@ LOGIN_FLOWS = ("device", "pkce")
 # A one-time code is easy to truncate when it is being relayed by hand.
 PKCE_PASTE_TRIES = 3
 
-# A hi-res stream can arrive as an MPEG-DASH manifest — a list of segment URLs
-# rather than a file. Written out as an HLS playlist, which mpv and ffplay both
-# read, in a per-process directory so two ticlis can't tread on each other.
-# Only the newest few survive each write: a playlist is worthless once its
-# segment URLs expire an hour later, and pruning on write means no timer.
+# A lossless stream arrives as an MPEG-DASH manifest — a list of fragmented-MP4
+# segment URLs rather than a file. Written out as an HLS playlist, which is the
+# one segmented format ffmpeg (and therefore both backends) can demux, in a
+# per-process directory so two ticlis can't tread on each other. Only the
+# newest few survive each write: a playlist is worthless once its segment URLs
+# expire an hour later, and pruning on write means no timer.
 HLS_KEEP = 4
+# Version 7 is the floor for #EXT-X-MAP, and #EXT-X-MAP is not optional here:
+# the segments are fMP4 fragments with no moov of their own, so without the
+# initialization segment every one of them is undecodable on its own. That is
+# exactly how this broke — ffmpeg reported "trun track id unknown, no tfhd was
+# found" for each segment in turn and played nothing.
+HLS_VERSION = 7
+# ffmpeg refuses to follow a local playlist out to the network unless the
+# protocols are named. The default whitelist for a file input is
+# "file,crypto,data", which silently turns every segment into an error.
+HLS_PROTOCOLS = "file,http,https,tcp,tls,crypto"
+HLS_SUFFIX = ".m3u8"
+# How much of the backend's own complaint fits on the toast line, and how long
+# it stays up — longer than an ordinary toast, because it is the only notice
+# that the thing the user asked for did not happen.
+PLAYER_ERROR_CHARS = 90
+PLAYER_ERROR_SECONDS = 8.0
 
 # Ascending, so "did TIDAL give us less than we asked for?" is a comparison.
 # Keys are tidalapi's own Quality values, which is what a Stream reports back
@@ -150,18 +167,19 @@ KEY_REPEAT_WINDOW = 0.15
 ESC_TAIL_SECONDS = 0.05
 
 
-# Audio downloads. TIDAL serves a track as one contiguous, unencrypted HTTP
-# file, so keeping a copy is a plain GET — no ffmpeg, no remux, and nothing
-# that depends on which player is running.
+# Audio downloads. TIDAL serves a track unencrypted over plain HTTP — as one
+# file, or as a run of segments that concatenate into one — so keeping a copy
+# is a GET (or a run of them). No ffmpeg, no remux, and nothing that depends
+# on which player is running.
 DOWNLOAD_CHUNK = 256 * 1024
 # (connect, read). Generous on read: a slow link should finish the download
 # late, not abandon it. Nothing waits on either.
 DOWNLOAD_TIMEOUT = (10, 60)
 
 # What the CDN says the bytes are → the extension they belong in. The file is
-# named for what actually arrived, never for what was asked for: this session
-# gets AAC-in-MP4 even when it requests lossless, and a session entitled to
-# FLAC would get FLAC through the same code.
+# named for what actually arrived, never for what was asked for: a device-flow
+# session gets AAC-in-MP4 even when it requests lossless, and a PKCE one gets
+# FLAC-in-MP4 through the same code.
 AUDIO_MIME_EXTENSIONS = {
     "audio/mp4": ".m4a",
     "audio/m4a": ".m4a",
@@ -196,6 +214,71 @@ def _audio_extension(content_type: Optional[str], url: str) -> str:
             return AUDIO_MIME_EXTENSIONS[mime]
     suffix = os.path.splitext(urlsplit(url or "").path)[1].lower()
     return AUDIO_URL_EXTENSIONS.get(suffix, DEFAULT_AUDIO_EXT)
+
+
+def _hls_playlist(dash) -> str:
+    """An HLS playlist for a decoded MPEG-DASH manifest.
+
+    Written here rather than taken from tidalapi's own `get_hls()`, which
+    omits the initialization segment's #EXT-X-MAP and lists it as if it were
+    audio — a playlist no ffmpeg build can decode a sample from. The URLs are
+    absolute and already signed, so everything the player needs is inside.
+    """
+    urls = list(getattr(dash, "urls", None) or [])
+    if not urls:
+        raise ValueError("segmented stream named no segments")
+    # tidalapi numbers the segment template from 0, and segment 0 *is* the
+    # initialization segment — same URL as the manifest's own `initialization`.
+    init = getattr(dash, "first_url", None) or urls[0]
+    media = urls[1:] if urls[0] == init else urls
+    if not media:
+        raise ValueError("segmented stream named no audio segments")
+    timescale = float(getattr(dash, "timescale", 0) or 44100)
+    full = float(getattr(dash, "chunk_size", 0) or 0) / timescale
+    last = float(getattr(dash, "last_chunk_size", 0) or 0) / timescale
+    # A duration of 0 would make the playlist a lie; fall back to the one the
+    # rest of the segments report, and to something sane if there is no such
+    # thing. Only the target duration has to be an over-estimate.
+    full = full or last or 10.0
+    last = last or full
+    lines = [
+        "#EXTM3U",
+        f"#EXT-X-VERSION:{HLS_VERSION}",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+        f"#EXT-X-TARGETDURATION:{int(max(full, last)) + 1}",
+        "#EXT-X-MEDIA-SEQUENCE:1",
+        f'#EXT-X-MAP:URI="{init}"',
+    ]
+    for index, url in enumerate(media):
+        lines.append("#EXTINF:%0.3f," % (last if index == len(media) - 1 else full))
+        lines.append(url)
+    lines.append("#EXT-X-ENDLIST")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _hls_segments(path: str) -> list:
+    """The remote segment URLs a local playlist names, initialization first.
+
+    Reading them back out of the playlist keeps a segmented stream a single
+    string everywhere else — the same path that is handed to the player is
+    all the downloader needs to fetch the whole track.
+    """
+    urls = []
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return urls
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-MAP:"):
+            _, _, rest = line.partition('URI="')
+            uri = rest.rpartition('"')[0]
+            if uri:
+                urls.insert(0, uri)
+        elif line and not line.startswith("#"):
+            urls.append(line)
+    return urls
 
 
 def _write_hls_playlist(track_id, playlist: str) -> str:
@@ -313,6 +396,12 @@ class AudioPlayer:
         # True when _cache_file is a kept track, so stop() must not delete it —
         # the whole point of having cached it
         self._cache_persistent = False
+        # Where the running player writes its complaints. Kept rather than
+        # discarded: a backend that cannot play what it was handed says so on
+        # stderr, and that sentence is the difference between a visible error
+        # and a UI that pretends to be playing silence.
+        self._stderr_path: Optional[str] = None
+        self._stderr_handle = None
 
     def volume_ceiling(self) -> int:
         """The loudest this backend can actually be told to go.
@@ -371,16 +460,24 @@ class AudioPlayer:
     def _start_download(self, url: str, cache_key, gen: int):
         """Fetch the whole track to disk on a daemon thread.
 
-        TIDAL hands out one contiguous, unencrypted URL, so this is a plain
-        GET: the bytes that land are the bytes it sent, byte for byte. That
-        makes it independent of the player process — mpv and ffplay both get
-        a cached track — and it needs no ffmpeg. Nothing waits on it, and the
-        file only becomes an answer once it is whole.
+        TIDAL hands out unencrypted URLs, so this is a plain GET: the bytes
+        that land are the bytes it sent, byte for byte. That makes it
+        independent of the player process — mpv and ffplay both get a cached
+        track — and it needs no ffmpeg. Nothing waits on it, and the file only
+        becomes an answer once it is whole.
+
+        A segmented (MPEG-DASH) stream is the same job with more requests:
+        the initialization segment followed by every media segment, written
+        end to end, *is* the fragmented MP4 file. Verified by playing the
+        result — both backends open it with no flags at all.
         """
-        if not url.startswith(("http://", "https://")):
-            # A segmented (MPEG-DASH) stream reaches us as a local HLS playlist,
-            # not a file — there is no single thing to GET. Those tracks simply
-            # aren't cached; the player streams them and nothing else changes.
+        if url.endswith(HLS_SUFFIX):
+            sources = _hls_segments(url)
+            if not sources:
+                return
+        elif url.startswith(("http://", "https://")):
+            sources = [url]
+        else:
             return
         base = self._audio_cache_base(cache_key)
         keep = base is not None
@@ -403,15 +500,22 @@ class AudioPlayer:
         def _run():
             path = None
             try:
-                with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
-                    response.raise_for_status()
-                    ext = _audio_extension(response.headers.get("Content-Type"), url)
-                    with open(part, "wb") as handle:
-                        for chunk in response.iter_content(DOWNLOAD_CHUNK):
-                            if self._download_gen != gen:
-                                raise _DownloadSuperseded()
-                            if chunk:
-                                handle.write(chunk)
+                ext = DEFAULT_AUDIO_EXT
+                with open(part, "wb") as handle:
+                    for index, source in enumerate(sources):
+                        with requests.get(source, stream=True,
+                                          timeout=DOWNLOAD_TIMEOUT) as response:
+                            response.raise_for_status()
+                            if index == 0:
+                                # The first segment describes the container the
+                                # whole file is going to be
+                                ext = _audio_extension(
+                                    response.headers.get("Content-Type"), source)
+                            for chunk in response.iter_content(DOWNLOAD_CHUNK):
+                                if self._download_gen != gen:
+                                    raise _DownloadSuperseded()
+                                if chunk:
+                                    handle.write(chunk)
                 path = base + ext
                 os.replace(part, path)
             except Exception as e:
@@ -443,6 +547,82 @@ class AudioPlayer:
                 self._sweep_cache()
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _open_stderr(self):
+        """A fresh file for the next player process to complain into.
+
+        One file per AudioPlayer, truncated per spawn, so nothing accumulates
+        and the contents always belong to the process now running. A pipe
+        would be wrong here: nothing reads it until the process is already
+        dead, and a full pipe buffer would wedge the player mid-track.
+        """
+        try:
+            if self._stderr_handle is not None:
+                self._stderr_handle.close()
+        except OSError:
+            pass
+        self._stderr_handle = None
+        try:
+            path = os.path.join(tempfile.gettempdir(), f"ticli-player-{os.getpid()}.log")
+            self._stderr_handle = open(path, "w+")
+            self._stderr_path = path
+            return self._stderr_handle
+        except OSError:
+            # Losing the log costs an error message, never playback
+            self._stderr_path = None
+            return subprocess.DEVNULL
+
+    def _last_stderr(self) -> str:
+        """The last thing the player said, trimmed to fit a toast."""
+        if not self._stderr_path:
+            return ""
+        try:
+            lines = [ln.strip() for ln in
+                     Path(self._stderr_path).read_text(errors="replace").splitlines()]
+        except OSError:
+            return ""
+        said = [ln for ln in lines if ln]
+        if not said:
+            return ""
+        return said[-1][:PLAYER_ERROR_CHARS]
+
+    def failure(self) -> Optional[str]:
+        """Why playback stopped, when it stopped because it failed.
+
+        None while the process is running, when it reached the end of the
+        track (exit 0), and when *we* ended it (a signal, i.e. a negative
+        return code — that is stop() and pause() doing their job). Anything
+        else is the backend refusing the stream, which the user has to be
+        told about rather than left listening to silence.
+        """
+        with self._lock:
+            process = self._process
+            if process is None:
+                return None
+            code = process.poll()
+            if code is None or code <= 0:
+                return None
+            detail = self._last_stderr()
+        return f"{self.player_cmd} error: {detail}" if detail else \
+            f"{self.player_cmd} exited with status {code}"
+
+    def _hls_flags(self) -> list:
+        """What each backend needs to demux a local HLS playlist.
+
+        Both end up in the same ffmpeg HLS demuxer; only the spelling differs.
+        mpv would otherwise treat an .m3u8 as a list of files to play one
+        after another, and each fMP4 fragment on its own is not a file any
+        demuxer can open.
+        """
+        if self.player_cmd == "mpv":
+            return [
+                "--demuxer=lavf", "--demuxer-lavf-format=hls",
+                # mpv's key-value lists split on commas, so the whitelist has
+                # to be passed length-prefixed to survive intact
+                f"--demuxer-lavf-o=protocol_whitelist="
+                f"%{len(HLS_PROTOCOLS)}%{HLS_PROTOCOLS}",
+            ]
+        return ["-protocol_whitelist", HLS_PROTOCOLS, "-f", "hls"]
 
     def cache_audio_dir(self):
         """The audio cache directory, created if needed. Private like the rest
@@ -479,6 +659,7 @@ class AudioPlayer:
             self._cache_persistent = have_kept
             if have_kept:
                 self._cache_file = kept
+            segmented = source.endswith(HLS_SUFFIX)
             if self.player_cmd == "mpv":
                 self._ipc_path = f"/tmp/ticli-mpv-{os.getpid()}.sock"
                 try:
@@ -486,30 +667,37 @@ class AudioPlayer:
                 except OSError:
                     pass
                 cmd = [
-                    "mpv", "--no-video", "--really-quiet",
+                    "mpv", "--no-video",
+                    # Not --really-quiet: that is what made a stream mpv
+                    # could not decode look exactly like one it could
+                    "--msg-level=all=error",
                     f"--input-ipc-server={self._ipc_path}",
                     # --volume-max first: mpv refuses anything above it, and
                     # its default ceiling (130) is below what the setting allows
                     f"--volume-max={VOLUME_MAX}",
                     f"--volume={self.volume}",
-                    source,
                 ]
+                if segmented:
+                    cmd += self._hls_flags()
                 if seek > 0:
-                    cmd.insert(-1, f"--start={seek}")
+                    cmd.append(f"--start={seek}")
+                cmd.append(source)
             else:  # ffplay
                 self._ipc_path = None
                 # Plays from `source`: a kept file when there is one, the URL
                 # otherwise — a download that has only just started can't
                 # satisfy a seek yet
-                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
                        "-volume", str(self._ffplay_volume())]
+                if segmented:
+                    cmd += self._hls_flags()
                 if seek > 0:
                     cmd += ["-ss", str(seek)]
                 cmd.append(source)
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=self._open_stderr(),
             )
             gen = self._download_gen
         # Off the lock and off this thread: fetching the track must never hold
@@ -519,13 +707,13 @@ class AudioPlayer:
 
     def _play_from_cache(self, seek: float):
         """Resume ffplay from local cached file at given position."""
-        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
                "-volume", str(self._ffplay_volume()), "-ss", str(seek),
                self._cache_file]
         self._process = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=self._open_stderr(),
         )
         self._play_start = time.time()
         self._paused = False
@@ -1430,7 +1618,7 @@ class HeadlessTidalPlayer:
         manifest = stream.get_stream_manifest()
         if manifest.is_bts:
             return manifest.get_urls()[0]
-        return _write_hls_playlist(track.id, manifest.get_hls())
+        return _write_hls_playlist(track.id, _hls_playlist(manifest.dash_info))
 
     def _note_granted_quality(self, granted: Optional[str]) -> None:
         """Record a tier TIDAL served that was below the one we asked for.
@@ -1611,7 +1799,19 @@ class HeadlessTidalPlayer:
                 dead_polls = 0
             if dead_polls >= 2:
                 dead_polls = 0
-                if (self.audio and self._current_track is not None
+                failure = self.audio.failure() if self.audio else None
+                if (failure and self.audio and not self.audio.source_vanished()
+                        and self._track_has_time_left()):
+                    # The backend refused the stream. Say so and stop, rather
+                    # than advancing through the whole queue in silence —
+                    # whatever it could not play, the next track is usually
+                    # the same kind of thing.
+                    self._set_toast(f"Playback failed — {failure}",
+                                    seconds=PLAYER_ERROR_SECONDS)
+                    logger.warning("Playback failed: %s", failure)
+                    self._playing = False
+                    self._play_start_time = None
+                elif (self.audio and self._current_track is not None
                         and self.audio.source_vanished()
                         and self._track_has_time_left()):
                     # The cached file was deleted between "it exists" and the

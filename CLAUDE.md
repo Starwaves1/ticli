@@ -40,6 +40,45 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
 
 - ffplay: kills process on pause (instant silence), restarts from the downloaded local copy on resume
 - mpv (if available): uses IPC socket for pause/resume
+- Nothing fails silently. Neither backend is run quiet any more (`--msg-level=all=error`,
+  `-loglevel error`) and stderr goes to a per-player log rather than `/dev/null`.
+  `AudioPlayer.failure()` reads it back when the process has exited with a *positive*
+  status — a zero is the end of the track and a negative one is a signal, which is
+  `stop()`/`pause()` doing their job. `_monitor_playback` checks it on the same tick
+  that already notices a dead player, toasts what the backend actually said, and stops
+  rather than advancing: whatever it could not play, the next track is usually the same
+  kind of thing. This is not decoration — the regression it exists for played an entire
+  library as silence with a normal-looking UI.
+
+### Segmented (MPEG-DASH) streams
+
+A lossless/hi-res stream does not arrive as a file. It arrives as an MPEG-DASH
+manifest naming an initialization segment plus N fragmented-MP4 media segments,
+which is why `_stream_url` branches on `manifest.is_bts`. The segments are
+rewritten as an HLS playlist (`_hls_playlist` → `_write_hls_playlist`), because
+HLS is the one segmented format ffmpeg — and therefore both backends — can
+demux; this ffmpeg has no DASH demuxer built in at all.
+
+Two things make that work, and both were missing:
+
+- **`#EXT-X-MAP`.** The fragments carry no `moov` of their own, so without the
+  initialization segment declared as a map every one of them is undecodable
+  ("trun track id unknown, no tfhd was found", once per segment, then silence).
+  tidalapi's own `get_hls()` omits it and lists the init segment as if it were
+  audio, so it is not used; the playlist is built here, at `HLS_VERSION` 7.
+- **Telling the player what it is.** ffmpeg's default protocol whitelist for a
+  *file* input is `file,crypto,data`, so every remote segment fails; and mpv
+  would otherwise treat an `.m3u8` as a list of files to play in turn. Hence
+  `_hls_flags()`: `--demuxer=lavf --demuxer-lavf-format=hls` plus a
+  length-prefixed `protocol_whitelist` for mpv (its key-value lists split on
+  commas), `-protocol_whitelist … -f hls` for ffplay.
+
+Caching a segmented track is the same job with more requests: init segment
+followed by every media segment, written end to end, *is* the fMP4 file, and
+both backends then open the cached copy with no flags at all. `_start_download`
+reads the segment list back out of the playlist it was handed (`_hls_segments`),
+which keeps a stream a single string everywhere else in the player.
+
 - macOS media keys (mpv only): mpv registers with MPRemoteCommandCenter, so keyboard
   media keys / AirPods taps / Control Center reach it. Ticli rebinds those keys over
   IPC (`keybind`) to write `user-data/ticli/media-key`, which `_monitor_playback` polls
@@ -55,7 +94,14 @@ silently, with a byte-identical manifest. The **PKCE flow**
 (`pkce_login_url` → `pkce_get_auth_token` → `process_auth_token`, driven
 step by step rather than through tidalapi's `login_pkce()`, which
 `print()`s and `input()`s) uses the client tidalapi documents as "the
-only way how to get access to HiRes … FLAC files". It is opt-in: `[u]`
+only way how to get access to HiRes … FLAC files". It delivers: a PKCE
+session asking for hi-res is granted `LOSSLESS` and served **FLAC
+16/44.1** in an MPEG-DASH manifest, where the device flow got AAC in a
+BTS one. Measured, not assumed — one real `get_stream()` reported
+`codecs=FLAC`, `mimeType=audio/mp4`, `bit_depth=16`,
+`sample_rate=44100`, and ffmpeg then decoded `flac, 44100 Hz, stereo,
+s16` from those segments. The format change is the whole reason
+segmented playback matters (see above). It is opt-in: `[u]`
 on the settings page, or `--login-flow pkce` on a first run. The paste
 is unavoidable — the redirect URI is fixed to a tidal.com page in
 tidalapi's config and re-sent in the token exchange, so no localhost
@@ -109,16 +155,20 @@ eviction only ever unlink files ticli itself wrote (`is_owned_audio` /
 `owned_audio_files`: `{track_id}{ext}` and `.part`) — never the
 directory — so anything else living there survives.
 
-`cache_songs` also keeps the audio. TIDAL serves a track as one contiguous,
-unencrypted HTTP file, so `AudioPlayer._start_download` fetches it with a
-plain `requests` GET on a daemon thread while the player streams the same
-URL — no ffmpeg, and identical on mpv and ffplay because the download no
-longer rides on the player process. The file is named `{track_id}{ext}`
-where the extension comes from the CDN's `Content-Type` (AAC-in-MP4 today,
-FLAC for a session entitled to it), written as `.part` and renamed only
+`cache_songs` also keeps the audio. TIDAL serves it unencrypted over plain
+HTTP either way, so `AudioPlayer._start_download` is a `requests` GET on a
+daemon thread while the player streams the same source — no ffmpeg, and
+identical on mpv and ffplay because the download no longer rides on the
+player process. A BTS stream is one file and therefore one GET; a segmented
+one is the init segment plus every media segment written end to end into
+the same handle (see above). The file is named `{track_id}{ext}` where the
+extension comes from the CDN's `Content-Type` (AAC-in-MP4 on a device-flow
+session, FLAC-in-MP4 on a PKCE one), written as `.part` and renamed only
 when whole, so a lookup by stem can never serve a partial file. A `stop()`
 bumps a generation counter, which is how an abandoned download knows to
-delete itself.
+delete itself. Eviction unlinks with `missing_ok`: two sweeps racing (two
+downloads landing together) must not read "already gone" as "still costing
+us" and go on to evict a file that fits.
 
 ### Key Files
 
