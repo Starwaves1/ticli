@@ -82,6 +82,7 @@ ticli --quality LOW        # 320kbps
 | `n` `→` | Next track |
 | `←` | Previous track |
 | `s` | Search |
+| `v` | Volume (`←` `→` to adjust, `Enter` or `Esc` to close) |
 | `q` | Queue |
 | `p` | Playlists |
 | `l` | Like / unlike track |

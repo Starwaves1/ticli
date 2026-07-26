@@ -17,6 +17,7 @@ No network, no session, no TIDAL: the track is a stub and the artwork is a
 grid of one colour.
 """
 
+import re
 import time
 import types
 
@@ -30,6 +31,23 @@ from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
 
 COVER = "3f2d1c0b-1111-2222-3333-444455556666"
+
+MODES = (
+    HeadlessTidalPlayer.MODE_PLAYER,
+    HeadlessTidalPlayer.MODE_SEARCH,
+    HeadlessTidalPlayer.MODE_BROWSE,
+    HeadlessTidalPlayer.MODE_QUEUE,
+    HeadlessTidalPlayer.MODE_PLAYLISTS,
+    HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
+    HeadlessTidalPlayer.MODE_SETTINGS,
+)
+
+# The widths a real window gets dragged to. 60 is where the old fixed-width
+# progress bar started wrapping and 120 is past every ceiling in the layout.
+WIDTHS = (60, 80, 100, 120)
+
+# A `[key] label` pair, or a bare `[key]` — the two shapes a hint may take.
+HINT = re.compile(r"\[[^\[\]]+\](?: [^\[\]]+?)?(?:  |$)")
 
 ALT_SCREEN_ON = "\x1b[?1049h"
 ALT_SCREEN_OFF = "\x1b[?1049l"
@@ -177,14 +195,18 @@ class TestNothingIsStranded:
         h.assert_one_frame("back to full")
 
     def test_artwork_appearing_and_vanishing(self, h):
+        # The size the window in the fixture actually gets, not a constant:
+        # art_size answers to the width as well as the height now
+        size = art_mod.art_size(100, 30)
+        h.set_artwork(size)
         h.repaint()
         h.set_artwork(None)          # a cover with no picture: pane gets shorter
         h.repaint()
         assert h.art_rows() == []
         h.assert_one_frame("no artwork")
-        h.set_artwork((20, 10))
+        h.set_artwork(size)
         h.repaint()
-        assert len(h.art_rows()) == 10
+        assert len(h.art_rows()) == size[1]
         h.assert_one_frame("artwork back")
 
     def test_artwork_stepping_down_a_size(self, h):
@@ -296,3 +318,236 @@ class TestThePaneFits:
             rows = len(p.console.render_lines(
                 p._build_display(), p.console.options, pad=False))
             assert rows <= height, (height, size, rows)
+
+    def test_the_pane_fits_every_width_and_mode(self):
+        """The whole matrix, because the pane is not one shape: each mode
+        draws a different body and each width lays the footer out differently.
+        A pane that is one row too tall is not a cosmetic problem — Rich
+        answers it by replacing the bottom line, which is the controls."""
+        for width in (60, 80, 100, 120):
+            for height in (24, 30):
+                for mode in MODES:
+                    for more in (False, True):
+                        harness = Harness(width=width, height=height,
+                                          artwork=art_mod.art_size(width, height))
+                        p = harness.player
+                        p._mode = mode
+                        p._show_more = more
+                        _fill_lists(p)
+                        rows = len(p.console.render_lines(
+                            p._build_display(), p.console.options, pad=False))
+                        assert rows <= height, (width, height, mode, more, rows)
+
+
+# ── the footer, at every width ──
+
+
+def _fill_lists(p):
+    """Enough rows in every list that no screen is empty for want of data."""
+    tracks = [_track(f"Track number {i} with a longish name") for i in range(40)]
+    p._queue = tracks
+    p._queue_index = 3
+    p._browse_tracks = tracks
+    p._search_results = [{"type": "track", "name": t.name,
+                          "artist": "Catching Flies", "obj": t} for t in tracks]
+    p._search_query = "a query"
+    p._playlists = [types.SimpleNamespace(
+        id=str(i), name=f"A playlist named {i}", num_tracks=20) for i in range(30)]
+    p._editable_playlists = p._playlists
+
+
+def _body(h):
+    """The panel's content rows, borders stripped."""
+    rows = []
+    for line in h.screen.text():
+        if line.startswith("│") and line.endswith("│"):
+            rows.append(line[1:-1])
+    return rows
+
+
+def _footer(h):
+    """The hint rows as they are on screen.
+
+    Asked for by content rather than by position: the player says what it laid
+    out for this window, and every one of those lines has to be on the screen
+    verbatim. That is stricter than reading the bottom rows back — it catches a
+    footer that was composed and then cropped away — and it does not confuse a
+    hint with the settings page's own [x] and [o] action lines.
+    """
+    laid = [line.plain.strip() for line in h.player._compose(h.player._fit)[1]]
+    rows = [line.strip() for line in _body(h)]
+    for line in laid:
+        assert line in rows, ("the footer never reached the screen", line, rows)
+    return laid
+
+
+class TestTheFooterNeverBreaksAPair:
+    """`[space] play/pause` is one thing. It may be shortened, it may move to
+    the next line, it may be dropped entirely when the window is too narrow to
+    hold it — but it may never be cut in half, and half of it may never be the
+    last thing on a line with its other half on the next one."""
+
+    def _harness(self, width, mode, more=False, height=24):
+        h = Harness(width=width, height=height,
+                    artwork=art_mod.art_size(width, height))
+        h.player._mode = mode
+        h.player._show_more = more
+        _fill_lists(h.player)
+        h.start()
+        h.repaint()
+        return h
+
+    @pytest.mark.parametrize("width", WIDTHS)
+    @pytest.mark.parametrize("mode", MODES)
+    def test_every_hint_on_screen_is_whole(self, width, mode):
+        h = self._harness(width, mode)
+        try:
+            footer = _footer(h)
+            assert footer, (width, mode, "no hints at all")
+            for line in footer:
+                text = line.strip()
+                assert text.count("[") == text.count("]"), (width, mode, line)
+                assert "…" not in text, (width, mode, "a hint was clipped", line)
+                # Consumed entirely by whole hints: nothing left over means
+                # nothing was split across the line break
+                assert "".join(HINT.findall(text)) == text, (width, mode, line)
+            h.assert_one_frame(f"{width} {mode}")
+        finally:
+            h.live.stop()
+
+    @pytest.mark.parametrize("width", WIDTHS)
+    def test_the_more_menu_too(self, width):
+        h = self._harness(width, HeadlessTidalPlayer.MODE_PLAYER, more=True)
+        try:
+            for line in _footer(h):
+                text = line.strip()
+                assert "…" not in text, (width, line)
+                assert "".join(HINT.findall(text)) == text, (width, line)
+            h.assert_one_frame(f"more at {width}")
+        finally:
+            h.live.stop()
+
+    def test_a_narrow_window_drops_hints_rather_than_truncating_them(self):
+        """40 columns cannot hold six hints. What it must not do is hold five
+        and a half."""
+        h = self._harness(40, HeadlessTidalPlayer.MODE_PLAYER)
+        try:
+            for line in _footer(h):
+                text = line.strip()
+                assert "…" not in text, line
+                assert "".join(HINT.findall(text)) == text, line
+            h.assert_one_frame("40 columns")
+        finally:
+            h.live.stop()
+
+
+class TestTheProgressLine:
+    """It used to be laid out at a fixed 50 columns whatever the window was,
+    which at 60 columns arrived as four wrapped pieces."""
+
+    @pytest.mark.parametrize("width", WIDTHS + (40, 30))
+    def test_the_times_stay_on_one_line_with_the_bar(self, width):
+        h = Harness(width=width, height=24,
+                    artwork=art_mod.art_size(width, 24))
+        h.start()
+        h.repaint()
+        try:
+            elapsed = [r for r in _body(h) if "0:00" in r]
+            assert len(elapsed) == 1, (width, elapsed)
+            assert "3:20" in elapsed[0], (width, elapsed[0])
+            h.assert_one_frame(str(width))
+        finally:
+            h.live.stop()
+
+    def test_the_bar_grows_with_the_window_up_to_its_ceiling(self):
+        """Derived from the width, which is the whole change — and only up to
+        progress_bar_max, which stopped being a size and became a ceiling."""
+        widths, player = {}, None
+        for width in (40, 50, 60, 100):
+            h = Harness(width=width, height=24)
+            player = h.player
+            player._build_display()          # lays the pane out for this width
+            widths[width] = player._build_progress_line(0, 200).plain.count("─")
+        assert widths[40] < widths[50] < widths[60], widths
+        assert widths[100] == player._bar_max - 1, widths
+
+
+class TestTheVolumeOverlayOnScreen:
+    """What `v` actually replaces, and what it puts back."""
+
+    def _harness(self, width=100, mode=None):
+        h = Harness(width=width, height=24,
+                    artwork=art_mod.art_size(width, 24))
+        if mode is not None:
+            h.player._mode = mode
+        _fill_lists(h.player)
+        h.start()
+        h.repaint()
+        return h
+
+    def test_v_replaces_the_footer_and_enter_puts_it_back(self):
+        h = self._harness()
+        try:
+            before = _body(h)
+            assert any("play/pause" in r for r in before)
+            assert not any("Volume" in r for r in before)
+
+            h.player._handle_key("v")
+            h.repaint()
+            during = _body(h)
+            assert any("Volume" in r for r in during), during
+            assert any("█" in r for r in during), "no bar on screen"
+            assert any("[←/→] adjust" in r for r in during), during
+            assert not any("play/pause" in r for r in during), "the footer is still there"
+            h.assert_one_frame("overlay up")
+
+            h.player._handle_key("\r")
+            h.repaint()
+            after = _body(h)
+            assert not any("Volume" in r for r in after), after
+            assert any("play/pause" in r for r in after)
+            h.assert_one_frame("overlay closed")
+            assert h.stranded() == []
+        finally:
+            h.live.stop()
+
+    def test_esc_closes_it_too(self):
+        h = self._harness()
+        try:
+            h.player._handle_key("v")
+            h.repaint()
+            assert any("Volume" in r for r in _body(h))
+            h.player._handle_key("\x1b")
+            h.repaint()
+            assert not any("Volume" in r for r in _body(h))
+            h.assert_one_frame("esc")
+        finally:
+            h.live.stop()
+
+    @pytest.mark.parametrize("width", WIDTHS + (40,))
+    def test_the_overlay_fits_every_width(self, width):
+        h = self._harness(width=width)
+        try:
+            h.player._handle_key("v")
+            h.repaint()
+            body = _body(h)
+            assert any("Volume" in r for r in body), (width, body)
+            h.assert_one_frame(f"overlay at {width}")
+        finally:
+            h.live.stop()
+
+    @pytest.mark.parametrize("mode", MODES)
+    def test_it_covers_the_footer_of_whatever_screen_is_underneath(self, mode):
+        h = self._harness(mode=mode)
+        try:
+            h.player._handle_key("v")
+            h.repaint()
+            body = _body(h)
+            if mode == HeadlessTidalPlayer.MODE_SEARCH:
+                # Search types the letter instead; the query is what changed
+                assert not any("Volume " in r for r in body)
+                return
+            assert any("Volume" in r for r in body), (mode, body)
+            h.assert_one_frame(f"overlay over {mode}")
+        finally:
+            h.live.stop()

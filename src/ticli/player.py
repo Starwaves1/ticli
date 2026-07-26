@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import threading
+from collections import namedtuple
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlsplit
@@ -29,6 +30,7 @@ except ImportError:
     sys.exit(1)
 
 try:
+    from rich.cells import cell_len
     from rich.console import Console
     from rich.live import Live
     from rich.panel import Panel
@@ -46,6 +48,186 @@ def format_time(seconds):
         return "0:00"
     m, s = divmod(seconds, 60)
     return f"{m}:{s:02d}"
+
+
+# ── Fitting the pane to the window ──
+#
+# One rule underneath all of it: every line the pane draws is cut to the
+# panel's inner width before Rich ever sees it. Rich only reflows a line that
+# is too long and none ever is, so nothing wraps mid-word, no progress bar
+# arrives in two pieces and no `[key] label` pair comes apart. The same rule
+# makes the pane's height *countable* — with no wrapping, one line is one row
+# — which is what lets _build_display measure itself against the terminal and
+# give ground before it overflows. Overflowing is not cosmetic: Rich answers
+# it by replacing the bottom line, and the bottom line is the controls.
+
+# What the panel costs around its content. The full pane pads (1, 2), the mini
+# player (0, 1); the rows are the two borders plus the blank padding row above
+# and below.
+PANEL_CHROME = 6
+MINI_PANEL_CHROME = 4
+PANEL_ROWS = 4
+MINI_PANEL_ROWS = 2
+# A window narrower than this has nothing to lay out; the clamp only keeps the
+# arithmetic positive.
+MIN_INNER_WIDTH = 12
+
+# Where the pane's text starts, and the gap between two hints.
+INDENT = 3
+HINT_GAP = 2
+
+# Under this a progress bar is not a bar, it is a smear — three cells that
+# round to the same place for half the track. The times alone say more.
+MIN_BAR_WIDTH = 8
+# The volume bar has 0–250 to say and says it in a fixed 30 cells at most: it
+# is a level, not a position in a track, so growing it with the window would
+# only make a wide terminal look like it had a second progress bar.
+VOLUME_BAR_MAX = 30
+
+# One `[key] label` pair: the unit that is never split across a line break,
+# and the unit that gets dropped whole when even the keys don't fit. `short`
+# is the same thing said in fewer columns; `rank` orders the dropping, higher
+# first, and has nothing to do with the order they are shown in.
+Hint = namedtuple("Hint", "key label short rank")
+Hint.__new__.__defaults__ = (None, 0)
+
+HINT_FULL, HINT_SHORT, HINT_KEYS = 0, 1, 2
+
+
+def _clip_lines(text: "Text", width: int) -> list:
+    """`text` as a list of lines, each cut to `width` with an ellipsis."""
+    lines = text.split("\n", allow_blank=True)
+    for line in lines:
+        line.truncate(width, overflow="ellipsis")
+    return list(lines)
+
+
+def _hint_piece(hint: Hint, level: int) -> str:
+    if level >= HINT_KEYS:
+        return f"[{hint.key}]"
+    label = hint.short if (level == HINT_SHORT and hint.short) else hint.label
+    return f"[{hint.key}] {label}"
+
+
+def _wrap_hints(hints, width: int, level: int) -> list:
+    """Hints packed into lines of `width`, breaking only between pairs."""
+    rows, row, used = [], [], 0
+    for hint in hints:
+        piece = _hint_piece(hint, level)
+        cost = cell_len(piece) + (HINT_GAP if row else 0)
+        if row and used + cost > width:
+            rows.append(row)
+            row, used, cost = [], 0, cell_len(piece)
+        row.append(piece)
+        used += cost
+    if row:
+        rows.append(row)
+    return rows
+
+
+def _fit_hints(hints, width: int, max_rows: int) -> list:
+    """The richest form of these hints that fits `max_rows` lines of `width`.
+
+    Ranked by (lines used, terseness) in that order, which is the one thing
+    here that was chosen rather than derived: a footer that stays on one line
+    by saying `[Space] pause` beats the same hints spread over two lines
+    saying `pause/play`, because the second line is a row the music does not
+    get. Only when nothing fits one line do two lines with full labels win —
+    at that width the alternative is keys with no labels at all, and a key
+    without its label is a footer that has stopped explaining anything.
+
+    Below that: keys alone, and then keys with the least important dropped one
+    at a time. A pair is never split and a line never overflows at any step —
+    the footer gets terser as the window narrows instead of turning into
+    `[space]` above `play/pause`.
+    """
+    laid = [_wrap_hints(hints, width, level) for level in (HINT_FULL, HINT_SHORT)]
+    best = min(
+        (rows for rows in laid if len(rows) <= max_rows),
+        key=len, default=None)
+    if best is not None:
+        return best
+    rows = _wrap_hints(hints, width, HINT_KEYS)
+    if len(rows) <= max_rows:
+        return rows
+    kept = list(hints)
+    while len(kept) > 1:
+        # Highest rank goes first; ties break to the right, so whatever
+        # survives is still in the order it was declared in
+        kept.pop(max(range(len(kept)), key=lambda i: (kept[i].rank, i)))
+        rows = _wrap_hints(kept, width, HINT_KEYS)
+        if len(rows) <= max_rows:
+            return rows
+    return _wrap_hints(kept, width, HINT_KEYS)[:max(max_rows, 1)]
+
+
+def _hints_text(rows, indent: int) -> "Text":
+    text = Text()
+    for i, row in enumerate(rows):
+        if i:
+            text.append("\n")
+        text.append(" " * indent)
+        for j, piece in enumerate(row):
+            if j:
+                text.append(" " * HINT_GAP)
+            key, sep, label = piece.partition("] ")
+            # A keys-only piece has no "] " in it and must not be given one
+            text.append(key + sep[:1] if sep else key, style="bold")
+            if sep:
+                text.append(" " + label, style="dim")
+    return text
+
+
+class _Fit:
+    """One attempt at the pane, and the order in which it gives ground.
+
+    Four things are elastic — the cover, the prose under the settings table,
+    how many rows a page shows and how many rows the footer gets — and which
+    of them goes first is per screen, because the cheapest thing to lose is
+    not the same on all of them. Each screen names its own order (`levers`),
+    and _build_display pulls them in turn until the pane fits. What is never
+    given up on any screen is the track, the progress line and at least one
+    row of hints; see _build_display for the crop that enforces that when
+    even this runs out.
+    """
+
+    __slots__ = ("inner", "rows", "page_rows", "artwork", "hint_rows",
+                 "prose", "_levers")
+
+    def __init__(self, inner, rows, page_rows, hint_rows, levers=()):
+        self.inner = inner
+        self.rows = rows
+        self.page_rows = page_rows
+        self.artwork = True
+        self.prose = True
+        self.hint_rows = hint_rows
+        self._levers = list(levers)
+
+    def relax(self, over: int) -> bool:
+        """Give up `over` rows if there are any left to give."""
+        while self._levers:
+            lever = self._levers.pop(0)
+            if lever == "page_rows" and self.page_rows > 1:
+                self.page_rows = max(1, self.page_rows - over)
+                # A page can go on shrinking, so it stays on the list
+                self._levers.insert(0, lever)
+                return True
+            if lever == "artwork" and self.artwork:
+                self.artwork = False
+                return True
+            if lever == "prose" and self.prose:
+                self.prose = False
+                return True
+            if lever == "hint_rows" and self.hint_rows > 1:
+                self.hint_rows = 1
+                return True
+        return False
+
+
+# The fit a display builder assumes when it is called outside _build_display
+# (tests do, and so does anything that only wants the text): a wide window
+# with room for everything, so nothing is elided for reasons of layout.
+ROOMY_FIT = _Fit(inner=74, rows=1000, page_rows=1000, hint_rows=2)
 
 
 # Key constants
@@ -67,7 +249,7 @@ KEY_SHIFT_TAB = "\x1b[Z"
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
     QUALITY_CHOICES,
-    SETTINGS_SPEC,
+    SETTINGS_ROWS,
     coerce,
     cycle_value,
     display_value,
@@ -1051,7 +1233,7 @@ class HeadlessTidalPlayer:
         # mutates this dict; every edit is written through immediately.
         self.config = load_config()
         self._page_size = self.config["page_size"]
-        self._bar_width = self.config["progress_bar_width"]
+        self._bar_max = self.config["progress_bar_max"]
         # Disk cache. Nothing is read or written until a list actually asks
         # for it, so building a player never touches the cache directory.
         self._cache = MetadataCache(
@@ -1138,6 +1320,12 @@ class HeadlessTidalPlayer:
         self._mini_player = False
         # Show more controls
         self._show_more = False
+        # The [v] volume overlay, which takes the footer's rows while it is up
+        self._volume_open = False
+        # How the pane was last laid out. Replaced on every _build_display;
+        # ROOMY_FIT until then, so a display builder called on its own (the
+        # tests do) elides nothing for want of a window.
+        self._fit = ROOMY_FIT
         # Timestamp of the last play/pause key, for repeat suppression
         self._last_toggle_key = 0.0
         # Last rendered frame *and the size it was rendered for*, so an idle
@@ -1956,7 +2144,7 @@ class HeadlessTidalPlayer:
         failed fetch, an undecodable image — comes out here as None too.
         """
         if (not self._show_artwork or self._mini_player
-                or self._mode != self.MODE_PLAYER):
+                or self._mode != self.MODE_PLAYER or not self._fit.artwork):
             return None
         cover = artwork.cover_id_of(self._current_track)
         if not cover or not artwork.supports_art(self.console):
@@ -2043,20 +2231,7 @@ class HeadlessTidalPlayer:
         if album:
             album_line.append(f"   {album}", style="dim")
 
-        progress_pct = (position / duration * 100) if duration > 0 else 0
-        pos_str = format_time(position)
-        dur_str = format_time(duration) if duration > 0 else "--:--"
-
-        bar_width = self._bar_width
-        filled = int(bar_width * min(progress_pct, 100) / 100)
-        if duration > 0:
-            bar = "\u2501" * filled + "\u2578" + "\u2500" * max(0, bar_width - filled - 1)
-        else:
-            bar = "\u2500" * bar_width
-        progress_line = Text()
-        progress_line.append(f"   {pos_str} ", style="cyan")
-        progress_line.append(bar, style="bold cyan" if self._playing else "dim")
-        progress_line.append(f" {dur_str}", style="cyan")
+        progress_line = self._build_progress_line(position, duration)
 
         # Queue info
         status_line = Text()
@@ -2092,6 +2267,42 @@ class HeadlessTidalPlayer:
         content.append_text(up_next)
         return content
 
+    def _build_progress_line(self, position, duration) -> Text:
+        """Elapsed, the bar, and the duration — on one line, always.
+
+        The bar used to be laid out at `progress_bar_width` columns whatever
+        the window was, so a narrow one wrapped it: the elapsed time, half a
+        bar, the other half, and the duration stranded on a fourth line. It
+        reads as a broken display, and it is the reason that setting is a
+        ceiling now. What the bar actually gets is whatever the two times and
+        the indent leave over, and under MIN_BAR_WIDTH there is no honest bar
+        to draw at all — the times alone are more informative than four cells
+        that round to the same place for half the track.
+        """
+        pos_str = format_time(position)
+        dur_str = format_time(duration) if duration > 0 else "--:--"
+        room = self._fit.inner - INDENT - len(pos_str) - len(dur_str) - 2
+        width = min(self._bar_max, room)
+        line = Text()
+        if width < MIN_BAR_WIDTH:
+            line.append(f"{' ' * INDENT}{pos_str} / {dur_str}", style="cyan")
+            return line
+        if duration > 0:
+            filled = int(width * min(position / duration, 1.0))
+            bar = "━" * filled + "╸" + "─" * max(0, width - filled - 1)
+        else:
+            bar = "─" * width
+        line.append(f"{' ' * INDENT}{pos_str} ", style="cyan")
+        line.append(bar, style="bold cyan" if self._playing else "dim")
+        line.append(f" {dur_str}", style="cyan")
+        return line
+
+    def _page_rows(self) -> int:
+        """How many rows a list page may show: the setting, capped by what the
+        window actually has room for (see _Fit). The setting is a preference
+        about density; the window is a fact."""
+        return max(1, min(self._page_size, self._fit.page_rows))
+
     def _build_search_display(self) -> Text:
         content = Text()
         content.append("   Search: ", style="bold yellow")
@@ -2099,14 +2310,23 @@ class HeadlessTidalPlayer:
         content.append("\u2588", style="bold white")
 
         # The scope row. It is always on screen, so Tab has something to point
-        # at and the active scope is never hidden state.
-        content.append("\n   [Tab]", style="bold")
+        # at and the active scope is never hidden state. Where the five don't
+        # fit, the active one alone still says both of those things \u2014 better
+        # than a row of scopes with the answer cut off the end of it.
+        scopes = Text()
+        scopes.append("\n   [Tab]", style="bold")
         for i, name in enumerate(self.SEARCH_FILTERS):
-            content.append("  " if i == 0 else " \u00b7 ", style="dim")
+            scopes.append("  " if i == 0 else " \u00b7 ", style="dim")
             active = name == self._search_filter
-            content.append(
+            scopes.append(
                 self.SEARCH_FILTER_LABELS[name],
                 style="bold cyan" if active else "dim")
+        if len(scopes.plain) - 1 > self._fit.inner:
+            scopes = Text("\n   [Tab]", style="bold")
+            scopes.append(
+                f"  {self.SEARCH_FILTER_LABELS[self._search_filter]}",
+                style="bold cyan")
+        content.append_text(scopes)
 
         if self._search_loading:
             content.append("\n\n   Searching...", style="dim yellow")
@@ -2114,7 +2334,7 @@ class HeadlessTidalPlayer:
             content.append(f"\n\n   {self._search_message}", style="dim green")
         elif self._search_results:
             total = len(self._search_results)
-            page = self._page_size
+            page = self._page_rows()
             page_start = (self._search_cursor // page) * page
             page_end = min(page_start + page, total)
             content.append("\n", style="")
@@ -2162,7 +2382,7 @@ class HeadlessTidalPlayer:
             content.append(f"\n\n   {self._browse_message}", style="dim green")
         elif self._browse_tracks:
             total = len(self._browse_tracks)
-            page = self._page_size
+            page = self._page_rows()
             # browse_cursor -1 = "Play All" row, 0..N-1 = tracks
             page_start = max(0, ((self._browse_cursor - 1) // page) * page) if self._browse_cursor > 0 else 0
             page_end = min(page_start + page, total)
@@ -2205,7 +2425,7 @@ class HeadlessTidalPlayer:
             content.append("\n\n   Queue is empty", style="dim")
         else:
             total = len(self._queue)
-            page = self._page_size
+            page = self._page_rows()
             page_start = (self._queue_cursor // page) * page
             page_end = min(page_start + page, total)
             content.append(f"  ({total} tracks)", style="dim")
@@ -2249,7 +2469,7 @@ class HeadlessTidalPlayer:
             content.append(f"\n\n   {self._playlists_message}", style="dim green")
         elif self._playlists:
             total = len(self._playlists)
-            page = self._page_size
+            page = self._page_rows()
             page_start = (self._playlists_cursor // page) * page
             page_end = min(page_start + page, total)
             content.append(f"  ({total})", style="dim")
@@ -2290,7 +2510,7 @@ class HeadlessTidalPlayer:
             content.append("\n\n   Loading playlists...", style="dim yellow")
         elif self._editable_playlists:
             total = len(self._editable_playlists)
-            page = self._page_size
+            page = self._page_rows()
             page_start = (self._picker_cursor // page) * page
             page_end = min(page_start + page, total)
             content.append("\n", style="")
@@ -2318,16 +2538,32 @@ class HeadlessTidalPlayer:
     def _build_settings_display(self) -> Text:
         content = Text()
         content.append("   Settings", style="bold magenta")
+
+        # The page scrolls now rather than running off the bottom of a short
+        # window: a window of rows around the cursor, and a (n/N) beside the
+        # title whenever it is a window rather than the whole table — so a
+        # table with rows above or below it never looks like the whole table.
+        room = max(1, min(len(SETTINGS_ROWS), self._fit.page_rows))
+        first = 0
+        if room < len(SETTINGS_ROWS):
+            first = max(0, min(self._settings_cursor - room // 2,
+                               len(SETTINGS_ROWS) - room))
+            content.append(f"  ({self._settings_cursor + 1}/{len(SETTINGS_ROWS)})",
+                           style="dim")
         content.append("\n", style="")
 
-        for i, spec in enumerate(SETTINGS_SPEC):
+        for i in range(first, first + room):
+            spec = SETTINGS_ROWS[i]
             selected = (i == self._settings_cursor)
             content.append("\n")
             if selected:
                 content.append("  ▸ ", style="bold cyan")
             else:
                 content.append("    ", style="")
-            content.append(f"{spec['label']:<20}", style="bold white" if selected else "white")
+            # The value column only lines up while there is width to line it
+            # up in; below that the padding is just columns the value needed
+            label = f"{spec['label']:<20}" if self._fit.inner >= 46 else spec["label"] + " "
+            content.append(label, style="bold white" if selected else "white")
             value = self.config.get(spec["key"], spec["default"])
             editing = selected and self._settings_edit is not None
             if editing:
@@ -2348,29 +2584,23 @@ class HeadlessTidalPlayer:
                 songs = self._cache.audio_count()
                 content.append(
                     f"  {songs} song{'' if songs == 1 else 's'} on disk", style="dim")
-            if spec["key"] == "volume":
-                # Deliberately blue, not dim: past unity mpv is amplifying a
-                # finished master, and that is a thing to notice, not to skim
-                if not editing and int(value) >= 105:
-                    content.append("  louder than the master — quality suffers", style="blue")
-                # The ceiling in effect, not the spec's — the row must never
-                # advertise a number this backend cannot reach. Named, so the
-                # limit reads as a fact about ffplay rather than a mystery
-                ceiling = self._setting_ceiling(spec)
-                if self.audio and ceiling < spec["max"]:
-                    content.append(
-                        f"  {self.audio.player_cmd} caps at {ceiling}%", style="blue")
 
-        spec = SETTINGS_SPEC[self._settings_cursor]
+        # What is below the table is two different kinds of thing, and only one
+        # of them is expendable: the prose explains the selected row, and the
+        # three lines under it are the *only* place [x], [o] and [u] are
+        # written down. A short window drops the prose and keeps the actions.
+        spec = SETTINGS_ROWS[self._settings_cursor]
+        prose = self._fit.prose
         if self._settings_edit is not None:
             content.append(
                 "\n\n   Typing a number — Enter or Esc saves it, Backspace deletes",
                 style="dim",
             )
-        content.append(f"\n\n   {spec['desc']}", style="dim")
+        if prose:
+            content.append(f"\n\n   {spec['desc']}", style="dim")
         # The whole ladder, so ←/→ lands somewhere you already understand.
         # Fits 80 columns for the four quality tiers.
-        if spec.get("value_desc"):
+        if prose and spec.get("value_desc"):
             content.append("\n   ", style="")
             current = str(self.config.get(spec["key"], spec["default"])).upper()
             for i, choice in enumerate(spec["choices"]):
@@ -2445,11 +2675,14 @@ class HeadlessTidalPlayer:
             return line
         line.append("\n   [u]", style="bold")
         line.append(" sign in for higher quality", style="dim")
-        line.append(
-            "\n   A clunkier sign-in — you paste back the address your browser lands on —"
-            "\n   and in exchange LOSSLESS and HI-RES stream as real FLAC instead of AAC.",
-            style="dim",
-        )
+        # The offer is the line that matters; the two lines saying what the
+        # trade is are prose, and go with the rest of it in a short window
+        if self._fit.prose:
+            line.append(
+                "\n   A clunkier sign-in — you paste back the address your browser lands on —"
+                "\n   and in exchange LOSSLESS and HI-RES stream as real FLAC instead of AAC.",
+                style="dim",
+            )
         return line
 
     def _build_quit_confirm(self) -> Text:
@@ -2491,129 +2724,177 @@ class HeadlessTidalPlayer:
         content.append(" to confirm, any other key to cancel", style="dim")
         return content
 
-    def _build_display(self) -> Panel:
-        player = self._build_player_display()
+    # ── The pane ──
 
-        controls = Text()
-        if self._mode == self.MODE_PLAYER:
-            controls.append("   [space]", style="bold")
-            controls.append(" play/pause  ", style="dim")
-            controls.append("[\u2190/\u2192]", style="bold")
-            controls.append(" prev/next  ", style="dim")
-            controls.append("[s]", style="bold")
-            controls.append(" search  ", style="dim")
-            controls.append("[t]", style="bold")
-            controls.append(" tiny  ", style="dim")
-            controls.append("[m]", style="bold")
-            controls.append(" more", style="dim")
-            if self._show_more:
-                controls.append("\n   [l]", style="bold")
-                controls.append(" like  ", style="dim")
-                controls.append("[r]", style="bold")
-                controls.append(" radio  ", style="dim")
-                controls.append("[y]", style="bold")
-                controls.append(" add to playlist  ", style="dim")
-                controls.append("[q]", style="bold")
-                controls.append(" queue  ", style="dim")
-                controls.append("[p]", style="bold")
-                controls.append(" playlists  ", style="dim")
-                controls.append("[c]", style="bold")
-                controls.append(" settings  ", style="dim")
-                controls.append("[Esc]", style="bold")
-                controls.append(" quit", style="dim")
-        elif self._mode == self.MODE_SEARCH:
-            controls.append("   [Enter/\u2192]", style="bold")
-            controls.append(" search/open  ", style="dim")
-            controls.append("[\u2191/\u2193]", style="bold")
-            controls.append(" navigate  ", style="dim")
-            controls.append("[Tab]", style="bold")
-            controls.append(" filter  ", style="dim")
+    def _mode_hints(self) -> list:
+        """What this mode's footer offers, in the order it is shown.
+
+        `short` is the same thing in fewer columns and `rank` decides what is
+        dropped first when even the keys won't fit; neither has anything to do
+        with the order. Every mode that isn't typing a query carries [v],
+        because the volume overlay is reachable from all of them.
+        """
+        if self._mini_player:
+            # Tiny mode is the whole point of tiny mode: one line, no footer
+            return []
+        if self._mode == self.MODE_SEARCH:
+            hints = [
+                Hint("Enter/→", "search/open", "open", 0),
+                Hint("↑/↓", "navigate", "move", 2),
+                Hint("Tab", "filter", None, 3),
+            ]
             if self._search_results:
-                controls.append("[Space]", style="bold")
-                controls.append(" pause/play  ", style="dim")
-            controls.append("[\u2190/Esc]", style="bold")
-            controls.append(" back  ", style="dim")
-            controls.append("[Bksp]", style="bold")
-            controls.append(" delete", style="dim")
-        elif self._mode == self.MODE_BROWSE:
-            controls.append("   [Enter/\u2192]", style="bold")
-            controls.append(" play track  ", style="dim")
-            controls.append("[\u2191/\u2193]", style="bold")
-            controls.append(" navigate  ", style="dim")
-            controls.append("[Space]", style="bold")
-            controls.append(" pause/play  ", style="dim")
-            controls.append("[a]", style="bold")
-            controls.append(" play all  ", style="dim")
-            controls.append("[y]", style="bold")
-            controls.append(" add to playlist  ", style="dim")
+                hints.append(Hint("Space", "pause/play", "pause", 4))
+            hints.append(Hint("←/Esc", "back", None, 1))
+            hints.append(Hint("Bksp", "delete", "del", 5))
+            return hints
+        if self._mode == self.MODE_BROWSE:
+            hints = [
+                Hint("Enter/→", "play track", "play", 0),
+                Hint("↑/↓", "navigate", "move", 2),
+                Hint("Space", "pause/play", "pause", 4),
+                Hint("a", "play all", "all", 5),
+                Hint("y", "add to playlist", "add", 6),
+            ]
             if self._browse_playlist is not None:
-                controls.append("[x]", style="bold")
-                controls.append(" remove  ", style="dim")
-            controls.append("[\u2190/Esc]", style="bold")
-            controls.append(" back", style="dim")
-        elif self._mode == self.MODE_QUEUE:
-            controls.append("   [Enter]", style="bold")
-            controls.append(" play  ", style="dim")
-            controls.append("[\u2191/\u2193]", style="bold")
-            controls.append(" navigate  ", style="dim")
-            controls.append("[Space]", style="bold")
-            controls.append(" pause/play  ", style="dim")
-            controls.append("[x]", style="bold")
-            controls.append(" remove  ", style="dim")
-            controls.append("[y]", style="bold")
-            controls.append(" add to playlist  ", style="dim")
-            controls.append("[\u2190/Esc]", style="bold")
-            controls.append(" back", style="dim")
-        elif self._mode == self.MODE_PLAYLISTS:
-            controls.append("   [Enter/\u2192]", style="bold")
-            controls.append(" open  ", style="dim")
-            controls.append("[\u2191/\u2193]", style="bold")
-            controls.append(" navigate  ", style="dim")
-            controls.append("[Space]", style="bold")
-            controls.append(" pause/play  ", style="dim")
-            controls.append("[\u2190/Esc]", style="bold")
-            controls.append(" back", style="dim")
-        elif self._mode == self.MODE_ADD_TO_PLAYLIST:
-            controls.append("   [Enter]", style="bold")
-            controls.append(" add  ", style="dim")
-            controls.append("[\u2191/\u2193]", style="bold")
-            controls.append(" navigate  ", style="dim")
-            controls.append("[\u2190/Esc]", style="bold")
-            controls.append(" cancel", style="dim")
-        elif self._mode == self.MODE_SETTINGS:
-            controls.append("   [\u2191/\u2193]", style="bold")
-            controls.append(" select  ", style="dim")
-            controls.append("[\u2190/\u2192]", style="bold")
-            controls.append(" change  ", style="dim")
-            controls.append("[Space]", style="bold")
-            controls.append(" pause/play  ", style="dim")
-            # No [x] here on purpose: this row already fills 74 columns, which
-            # is exactly the panel's inner width at an 80-column terminal, and
-            # clear cache has its own line above (the way logout does)
-            controls.append("[o]", style="bold")
-            controls.append(" log out  ", style="dim")
-            controls.append("[Esc]", style="bold")
-            controls.append(" back", style="dim")
+                hints.append(Hint("x", "remove", "del", 7))
+            hints.append(Hint("v", "volume", "vol", 3))
+            hints.append(Hint("←/Esc", "back", None, 1))
+            return hints
+        if self._mode == self.MODE_QUEUE:
+            return [
+                Hint("Enter", "play", None, 0),
+                Hint("↑/↓", "navigate", "move", 2),
+                Hint("Space", "pause/play", "pause", 4),
+                Hint("x", "remove", "del", 6),
+                Hint("y", "add to playlist", "add", 7),
+                Hint("v", "volume", "vol", 3),
+                Hint("←/Esc", "back", None, 1),
+            ]
+        if self._mode == self.MODE_PLAYLISTS:
+            return [
+                Hint("Enter/→", "open", None, 0),
+                Hint("↑/↓", "navigate", "move", 2),
+                Hint("Space", "pause/play", "pause", 4),
+                Hint("v", "volume", "vol", 3),
+                Hint("←/Esc", "back", None, 1),
+            ]
+        if self._mode == self.MODE_ADD_TO_PLAYLIST:
+            return [
+                Hint("Enter", "add", None, 0),
+                Hint("↑/↓", "navigate", "move", 1),
+                Hint("←/Esc", "cancel", None, 2),
+            ]
+        if self._mode == self.MODE_SETTINGS:
+            return [
+                Hint("↑/↓", "select", None, 1),
+                Hint("←/→", "change", None, 0),
+                Hint("Space", "pause/play", "pause", 4),
+                Hint("v", "volume", "vol", 3),
+                Hint("o", "log out", "out", 5),
+                Hint("Esc", "back", None, 2),
+            ]
+        hints = [
+            Hint("space", "play/pause", "play", 0),
+            Hint("←/→", "prev/next", "skip", 1),
+            Hint("s", "search", None, 2),
+            Hint("v", "volume", "vol", 3),
+            Hint("t", "tiny", None, 5),
+            Hint("m", "more", None, 4),
+        ]
+        if self._show_more:
+            hints += [
+                Hint("l", "like", None, 6),
+                Hint("r", "radio", None, 6),
+                Hint("y", "add to playlist", "add", 7),
+                Hint("q", "queue", None, 6),
+                Hint("p", "playlists", "lists", 6),
+                Hint("c", "settings", "config", 6),
+                Hint("Esc", "quit", None, 6),
+            ]
+        return hints
 
+    def _build_hints(self, fit, room=None) -> list:
+        hints = self._mode_hints()
+        if not hints:
+            return []
+        # The "more" set is asked for, so it is allowed more room than the
+        # single row of hints a player screen normally spends
+        rows = fit.hint_rows + (2 if self._show_more and self._mode == self.MODE_PLAYER else 0)
+        if room is not None:
+            rows = max(rows, room)
+        laid = _fit_hints(hints, max(fit.inner - INDENT, 8), rows)
+        return _clip_lines(_hints_text(laid, INDENT), fit.inner)
+
+    def _build_volume_overlay(self, fit) -> list:
+        """The [v] overlay, drawn where the hints would have been.
+
+        Every number on it comes from the place the settings page's volume row
+        used to read them from — `get_spec("volume")`, `_setting_ceiling()`
+        and, for the arrows, `_adjust_setting()` — so the backend's real
+        ceiling, the clamping, the live apply and the write to disk cannot
+        drift from what is on screen. Moving the control did not fork it.
+        """
+        spec = get_spec("volume")
+        value = coerce(spec, self.config.get("volume", spec["default"]))
+        ceiling = self._setting_ceiling(spec)
+
+        label, pct = "Volume ", f" {value}%"
+        bar = Text(" " * INDENT)
+        bar.append(label, style="bold blue")
+        # Two more columns for the end caps, and never wider than the pane
+        width = min(VOLUME_BAR_MAX, fit.inner - INDENT - len(label) - len(pct) - 2)
+        if width >= MIN_BAR_WIDTH:
+            # Filled against the ceiling actually in effect, so a full bar
+            # means "as loud as this backend goes" rather than as loud as some
+            # other backend would have gone
+            filled = max(0, min(width, int(round(width * value / max(ceiling, 1)))))
+            bar.append("▕", style="blue")
+            bar.append("█" * filled, style="bold blue")
+            bar.append("░" * (width - filled), style="dim blue")
+            bar.append("▏", style="blue")
+        bar.append(pct, style="bold blue")
+        rows = [bar]
+
+        # The two things that made the old settings row honest, kept
+        notes = []
+        if value >= 105:
+            notes.append("louder than the master — quality suffers")
+        if self.audio and ceiling < spec["max"]:
+            notes.append(f"{self.audio.player_cmd} caps at {ceiling}%")
+        if notes and fit.hint_rows > 1:
+            rows.append(Text(" " * INDENT + "  ".join(notes), style="blue"))
+
+        keys = [Hint("←/→", "adjust", "±", 1), Hint("Enter/Esc", "close", "ok", 0)]
+        rows.append(_hints_text(_fit_hints(keys, max(fit.inner - INDENT, 8), 1), INDENT))
+        out = []
+        for row in rows:
+            out.extend(_clip_lines(row, fit.inner))
+        return out
+
+    def _compose(self, fit) -> tuple:
+        """The pane under one fit: the lines above the footer, and the footer.
+
+        Both are already clipped to the panel's inner width, so a line is
+        exactly a row and _build_display can count them. The body is built
+        first because the footer is allowed the rows the body did not use —
+        `[m]` at 40 columns is thirteen hints that fit no line, and a window
+        with ten spare rows should spend them on labels rather than show a
+        row of bare keys.
+        """
         content = Text()
-        content.append_text(player)
+        content.append_text(self._build_player_display())
         if time.time() < self._toast_until:
             content.append(f"\n   {self._toast}", style="bold green")
 
         if self._mini_player:
-            # Tiny mode: just the player line, no controls
             if self._quit_pending:
                 content.append_text(self._build_quit_confirm())
-            return Panel(
-                content,
-                title="[bold cyan]Ticli[/bold cyan]",
-                border_style="cyan",
-                padding=(0, 1),
-            )
+            return self._with_footer(content, fit)
 
         if self._mode != self.MODE_PLAYER:
             content.append("\n\n")
-            content.append("  " + "\u2500" * 56, style="dim")
+            content.append("  " + "─" * max(fit.inner - 4, 4), style="dim")
             content.append("\n\n")
             if self._mode == self.MODE_SEARCH:
                 content.append_text(self._build_search_display())
@@ -2637,15 +2918,103 @@ class HeadlessTidalPlayer:
         elif self._clear_cache_pending:
             content.append_text(self._build_clear_cache_confirm())
 
-        content.append("\n\n")
-        content.append_text(controls)
+        return self._with_footer(content, fit)
 
+    def _with_footer(self, content: "Text", fit) -> tuple:
+        """Body lines plus the footer that goes under them, blank row and all.
+
+        The footer's row allowance is whatever the body left, floored at the
+        fit's own `hint_rows` — the floor is what makes a body that already
+        overflows relax instead of squeezing the footer to nothing, and the
+        allowance is what lets a short body pay for full labels.
+        """
+        body = _clip_lines(content, fit.inner)
+        room = max(fit.hint_rows, fit.rows - len(body) - 1)
+        footer = (self._build_volume_overlay(fit) if self._volume_open
+                  else self._build_hints(fit, room))
+        if footer:
+            # One blank row between the pane and its footer
+            body = body + [Text("")]
+        return body, footer
+
+    def _build_display(self) -> Panel:
+        """The pane, laid out for the window it is actually in.
+
+        Composed more than once on purpose. Every line comes back clipped to
+        the inner width, so the height is countable; if it overflows the
+        terminal the fit gives ground — in this screen's own order — and it is
+        composed again. Only when there is nothing left to give does the pane
+        get cropped, and it is cropped from the bottom of the *content* rather
+        than by Rich, which would take the last line — and the last line is
+        the one that says how to get out.
+        """
+        width, height = self._console_size()
+        mini = self._mini_player
+        levers = self._fit_levers()
+        fit = _Fit(
+            inner=max(width - (MINI_PANEL_CHROME if mini else PANEL_CHROME),
+                      MIN_INNER_WIDTH),
+            rows=max(height - (MINI_PANEL_ROWS if mini else PANEL_ROWS), 1),
+            # The settings page windows over its own rows, not the list setting
+            page_rows=(len(SETTINGS_ROWS) if self._mode == self.MODE_SETTINGS
+                       else self._page_size),
+            # Two rows of hints, until the window is short enough that the
+            # rows are worth more to the music than to the footer
+            hint_rows=2 if height >= 16 else 1,
+            levers=levers,
+        )
+        self._fit = fit
+        body, footer = self._compose(fit)
+        # One pass per lever this screen has, plus the one that finds out
+        # nothing is left
+        for _ in range(len(levers) + 1):
+            over = len(body) + len(footer) - fit.rows
+            if over <= 0 or not fit.relax(over):
+                break
+            body, footer = self._compose(fit)
+
+        lines = body + footer
+        if len(lines) > fit.rows:
+            footer = footer[:max(fit.rows - 1, 0)] or footer[:fit.rows]
+            lines = body[:fit.rows - len(footer)] + footer
+
+        content = Text("\n").join(lines)
+        content.no_wrap = True
         return Panel(
             content,
             title="[bold cyan]Ticli[/bold cyan]",
             border_style="cyan",
-            padding=(1, 2),
+            padding=(0, 1) if mini else (1, 2),
         )
+
+    def _fit_levers(self) -> tuple:
+        """What this screen gives up, cheapest first, when it doesn't fit.
+
+        The order is per screen because the cheapest thing to lose is not the
+        same on all of them. On the player screen it is the cover — the one
+        thing on the pane that says nothing. On a list it is rows, which ↑/↓
+        reaches anyway. On the settings page it is the *prose*, not the rows:
+        the rows are seven and the prose is eleven lines, so shrinking the
+        table first bought four rows and cost six of the seven settings — a
+        page showing one row out of seven at 80x24, which is what the first
+        attempt at this actually did. The footer is last everywhere, and only
+        ever from two rows to one.
+        """
+        if self._mini_player:
+            return ()
+        if self._mode == self.MODE_PLAYER:
+            return ("artwork", "hint_rows")
+        if self._mode == self.MODE_SETTINGS:
+            return ("prose", "page_rows", "hint_rows")
+        return ("page_rows", "hint_rows")
+
+    def _console_size(self):
+        try:
+            width, height = self.console.size
+        except Exception:
+            # A console that can't be measured is not a reason to stop drawing
+            return 80, 24
+        return max(int(width), 1), max(int(height), 1)
 
     # ── Actions ──
 
@@ -3275,7 +3644,13 @@ class HeadlessTidalPlayer:
 
     def _change_setting(self, step: int):
         """Move the selected setting one step, apply it live, and persist it."""
-        spec = SETTINGS_SPEC[self._settings_cursor]
+        self._adjust_setting(SETTINGS_ROWS[self._settings_cursor], step)
+
+    def _adjust_setting(self, spec: dict, step: int):
+        """One step of one setting, whichever surface asked for it — the
+        settings page's ←/→, or the [v] overlay's. Shared rather than
+        reimplemented so the clamp against the backend's real ceiling can
+        never apply to one of them and not the other."""
         current = self.config.get(spec["key"], spec["default"])
         value = cycle_value(spec, current, step)
         if spec["kind"] == "int":
@@ -3289,7 +3664,7 @@ class HeadlessTidalPlayer:
     def _begin_setting_edit(self, digit: str) -> bool:
         """Start typing a number into the selected row. False if that row isn't
         a number — a digit on a choice row means nothing."""
-        if SETTINGS_SPEC[self._settings_cursor]["kind"] != "int":
+        if SETTINGS_ROWS[self._settings_cursor]["kind"] != "int":
             return False
         self._settings_edit = digit
         return True
@@ -3303,7 +3678,7 @@ class HeadlessTidalPlayer:
         typed, self._settings_edit = self._settings_edit, None
         if not typed:
             return
-        spec = SETTINGS_SPEC[self._settings_cursor]
+        spec = SETTINGS_ROWS[self._settings_cursor]
         value = min(coerce(spec, int(typed)), self._setting_ceiling(spec))
         self._set_setting(spec, value)
 
@@ -3331,8 +3706,8 @@ class HeadlessTidalPlayer:
             self.session.audio_quality = self.QUALITY_MAP[value]
         elif key == "page_size":
             self._page_size = value
-        elif key == "progress_bar_width":
-            self._bar_width = value
+        elif key == "progress_bar_max":
+            self._bar_max = value
         elif key == "show_artwork":
             self._show_artwork = value
             if not value:
@@ -3398,6 +3773,15 @@ class HeadlessTidalPlayer:
                 self._clear_cached_songs()
             return
 
+        # The volume overlay is over whatever mode is underneath, so it takes
+        # the key first — and gives it back only by closing.
+        if self._volume_open:
+            self._handle_volume_key(key)
+            return
+        if key in ("v", "V") and self._can_open_volume():
+            self._volume_open = True
+            return
+
         if self._mode == self.MODE_SEARCH:
             self._handle_search_key(key)
         elif self._mode == self.MODE_BROWSE:
@@ -3412,6 +3796,36 @@ class HeadlessTidalPlayer:
             self._handle_settings_key(key)
         else:
             self._handle_player_key(key)
+
+    def _can_open_volume(self) -> bool:
+        """Whether `v` means "volume" right now.
+
+        Everywhere except the two places where it means the letter v: a search
+        query, which types every printable key it gets, and a settings row
+        being typed into. Nothing else binds v — the player screen, browse,
+        the queue, playlists, the picker and the settings page were all
+        checked, and none of them wanted it.
+        """
+        return self._mode != self.MODE_SEARCH and self._settings_edit is None
+
+    def _handle_volume_key(self, key: str):
+        """The overlay's keys. Arrows move the level by the same step the
+        settings row moved it by (the spec's), Enter and Esc close it, and v
+        closes it too so the key that opened it also puts it away. Play/pause
+        keeps working, because reaching for the volume is not a reason to lose
+        the spacebar. Anything else is ignored rather than acted on
+        underneath — an overlay that swallowed a `q` and opened the queue
+        would be worse than one that did nothing."""
+        if key in (KEY_ENTER, KEY_ENTER2, KEY_ESC, "v", "V"):
+            self._volume_open = False
+            return
+        spec = get_spec("volume")
+        if key in (KEY_RIGHT, KEY_UP):
+            self._adjust_setting(spec, 1)
+        elif key in (KEY_LEFT, KEY_DOWN):
+            self._adjust_setting(spec, -1)
+        elif key in (" ", "k"):
+            self._toggle_play_key()
 
     def _handle_player_key(self, key: str):
         if key in (" ", "k"):
@@ -3624,7 +4038,7 @@ class HeadlessTidalPlayer:
         if key == KEY_UP:
             self._settings_cursor = max(0, self._settings_cursor - 1)
         elif key == KEY_DOWN:
-            self._settings_cursor = min(len(SETTINGS_SPEC) - 1, self._settings_cursor + 1)
+            self._settings_cursor = min(len(SETTINGS_ROWS) - 1, self._settings_cursor + 1)
         elif key == KEY_LEFT:
             self._change_setting(-1)
         elif key in (KEY_RIGHT, KEY_ENTER, KEY_ENTER2):

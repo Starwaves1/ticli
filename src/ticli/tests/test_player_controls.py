@@ -374,3 +374,104 @@ class TestDeletedCacheFile:
         self._monitor_once(p)
 
         assert p._queue_index == 2
+
+
+class TestTheVolumeOverlay:
+    """`v` is reachable from every screen, which is the point of it — the
+    volume is the one setting you reach for in the middle of a track, and
+    walking to the settings page to find it was the thing being fixed. So the
+    interesting question is not that it opens, but everywhere it must not."""
+
+    MODES_THAT_OPEN = (
+        HeadlessTidalPlayer.MODE_PLAYER,
+        HeadlessTidalPlayer.MODE_BROWSE,
+        HeadlessTidalPlayer.MODE_QUEUE,
+        HeadlessTidalPlayer.MODE_PLAYLISTS,
+        HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
+        HeadlessTidalPlayer.MODE_SETTINGS,
+    )
+
+    def _player(self, mode=None):
+        p = HeadlessTidalPlayer()
+        p.audio = _FakeAudio()
+        if mode is not None:
+            p._mode = mode
+        return p
+
+    @pytest.mark.parametrize("mode", MODES_THAT_OPEN)
+    def test_v_opens_it_from_every_mode_that_is_not_typing(self, mode):
+        p = self._player(mode)
+        p._handle_key("v")
+        assert p._volume_open is True
+        assert p._mode == mode, "the overlay is over the screen, not a place you go"
+
+    def test_search_types_a_v_instead_of_opening_it(self):
+        """Search mode consumes every printable key, so `v` there is the
+        letter v and nothing else — an overlay stealing it would make the
+        query untypeable."""
+        p = self._player(HeadlessTidalPlayer.MODE_SEARCH)
+        p._search_query = ""
+        p._handle_key("v")
+        assert p._volume_open is False
+        assert p._search_query == "v"
+
+    def test_a_settings_row_being_typed_into_keeps_its_keys(self):
+        p = self._player(HeadlessTidalPlayer.MODE_SETTINGS)
+        p._settings_cursor = 1          # a number row: Songs per page
+        p._handle_key("2")
+        assert p._settings_edit == "2", "the row is being typed into"
+        p._handle_key("v")
+        assert p._volume_open is False
+
+    def test_arrows_move_it_and_apply_it_live(self):
+        p = self._player()
+        p._handle_key("v")
+        p._handle_key(player_mod.KEY_LEFT)
+        assert p.config["volume"] == 95
+        assert p.audio.volumes == [95]
+        p._handle_key(player_mod.KEY_RIGHT)
+        assert p.config["volume"] == 100
+
+    def test_enter_and_esc_and_v_all_close_it(self):
+        for key in (player_mod.KEY_ENTER, player_mod.KEY_ENTER2,
+                    player_mod.KEY_ESC, "v"):
+            p = self._player()
+            p._handle_key("v")
+            p._handle_key(key)
+            assert p._volume_open is False, key
+
+    def test_closing_it_does_not_also_do_what_the_key_means_underneath(self):
+        """Esc on the player screen asks to quit. Esc closing the overlay must
+        not also arm that — the overlay takes the key, it does not pass it on."""
+        p = self._player()
+        p._handle_key("v")
+        p._handle_key(player_mod.KEY_ESC)
+        assert p._quit_pending is False
+
+    def test_it_swallows_the_keys_that_would_have_changed_screen(self):
+        p = self._player()
+        p._handle_key("v")
+        for key in ("q", "p", "s", "c", "t", "m"):
+            p._handle_key(key)
+            assert p._mode == p.MODE_PLAYER, key
+            assert p._volume_open is True, key
+
+    def test_space_still_works_because_reaching_for_the_volume_is_not_a_stop(self):
+        p = self._player()
+        toggles = []
+        p._toggle_play_key = lambda: toggles.append(1)
+        p._handle_key("v")
+        p._handle_key(" ")
+        assert toggles == [1]
+        assert p._volume_open is True
+
+    def test_the_backend_ceiling_still_applies(self):
+        p = self._player()
+        p.audio.player_cmd = "ffplay"
+        p.audio.volume_ceiling = lambda: 100
+        p.config["volume"] = 90
+        p._handle_key("v")
+        for _ in range(40):
+            p._handle_key(player_mod.KEY_RIGHT)
+        assert p.config["volume"] == 100
+        assert max(p.audio.volumes) == 100

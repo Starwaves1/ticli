@@ -49,8 +49,17 @@ IMAGE_URL = "https://resources.tidal.com/images/{path}/{size}x{size}.jpg"
 # on any connection.
 SOURCE_SIZE = 320
 
-# Cell sizes, widest first. Square on screen, since a cell is ~2:1.
-ART_SIZES = ((20, 10), (16, 8), (12, 6))
+# Cell sizes, widest first. Square on screen, since a cell is ~2:1 — every
+# entry here is (n, n/2) and the renderer packs two pixels into a cell.
+ART_SIZES = ((32, 16), (28, 14), (24, 12), (20, 10), (16, 8), (12, 6))
+
+# The most of the terminal's width a cover may take. Height alone used to
+# choose the size, so a tall, narrow window put a 20-column cover above a
+# track line with eight columns of room left — the picture looked fine and
+# everything around it looked cramped. Two fifths keeps the cover the second
+# thing you look at at any width, and steps the size down as the window
+# narrows without any thresholds of its own.
+ART_WIDTH_SHARE = 0.4
 
 # Rows the rest of the player pane needs, below which artwork is not worth
 # its vertical cost, and the narrowest terminal art is offered in at all.
@@ -544,14 +553,18 @@ def art_size(width: int, height: int):
     """Cell size for a terminal this big, or None if artwork doesn't fit.
 
     Artwork sits above the track line rather than beside it: the progress bar
-    is already 50 columns wide by default, and an 80-column terminal has no
-    room to put anything next to it without wrapping. Stacked, the only
-    question is how many rows can be spared.
+    can be 50 columns wide, and an 80-column terminal has no room to put
+    anything next to it. Stacked, the size answers to both axes — the rows it
+    costs must be spared by the rest of the pane, and its width has to stay a
+    fraction of the window's or a narrow terminal ends up as a big cover and
+    a cramped everything-else.
     """
     if width < MIN_ART_WIDTH:
         return None
+    share = int(width * ART_WIDTH_SHARE)
     for cols, rows in ART_SIZES:
-        if cols + ART_MARGIN <= width and rows + MIN_ROWS_AROUND_ART <= height:
+        if (cols + ART_MARGIN <= width and cols <= share
+                and rows + MIN_ROWS_AROUND_ART <= height):
             return cols, rows
     return None
 

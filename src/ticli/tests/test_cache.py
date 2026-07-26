@@ -949,7 +949,7 @@ class TestDisableSongsPrompt:
     def _settings(self):
         p = _player()
         p._mode = p.MODE_SETTINGS
-        p._settings_cursor = [s["key"] for s in config_mod.SETTINGS_SPEC].index("cache_songs")
+        p._settings_cursor = [s["key"] for s in config_mod.SETTINGS_ROWS].index("cache_songs")
         return p
 
     def _song(self, name="12.m4a"):

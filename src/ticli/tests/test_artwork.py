@@ -216,10 +216,24 @@ class TestArtSize:
         assert art_mod.art_size(80, 20) is None
         assert art_mod.art_size(20, 60) is None
 
-    def test_a_narrow_terminal_gets_a_narrow_picture(self):
-        assert art_mod.art_size(29, 60) == (20, 10)
-        assert art_mod.art_size(28, 60) == (16, 8)
-        assert art_mod.art_size(21, 60) == (12, 6)
+    def test_a_wide_terminal_gets_a_bigger_one(self):
+        assert art_mod.art_size(100, 60) == (32, 16)
+        assert art_mod.art_size(60, 60) == (24, 12)
+
+    def test_the_size_steps_down_with_the_width(self):
+        """Width, not only height: a tall narrow window used to keep the
+        20-column cover and cramp everything beside it."""
+        assert art_mod.art_size(50, 60) == (20, 10)
+        assert art_mod.art_size(40, 60) == (16, 8)
+        assert art_mod.art_size(30, 60) == (12, 6)
+        assert art_mod.art_size(29, 60) is None
+
+    def test_the_picture_never_takes_most_of_the_width(self):
+        for height in (20, 24, 40, 60):
+            for width in range(10, 200):
+                size = art_mod.art_size(width, height)
+                if size is not None:
+                    assert size[0] <= width * art_mod.ART_WIDTH_SHARE
 
     def test_the_picture_always_fits_the_pane(self):
         """Panel border and padding take six columns and the indent three;

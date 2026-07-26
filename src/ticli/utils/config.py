@@ -9,6 +9,12 @@ A single SETTINGS_SPEC table drives defaults, load-time validation and the
 settings page rendering — a future setting (artwork toggle, cache budget, ...)
 is one new row here. Keys this build doesn't know about are preserved verbatim
 on save, so an older ticli can never silently eat a newer build's settings.
+
+A `hidden` row is in the table but not on the page (SETTINGS_ROWS is what the
+page lists): it is defaulted, coerced, clamped and written exactly like the
+rest, and only the surface it is *edited* on is elsewhere. Volume is the one —
+it lives on the [v] overlay, because it is the setting you reach for in the
+middle of a track.
 """
 
 import json
@@ -18,7 +24,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 CONFIG_DIR = Path.home() / ".config" / "ticli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -76,22 +82,30 @@ SETTINGS_SPEC: list[dict] = [
         "min": 5,
         "max": 40,
         "step": 1,
-        "desc": "Rows per page in search, browse, queue and playlist lists.",
+        "desc": "Most rows per page in a list. A short window shows fewer.",
     },
     {
-        "key": "progress_bar_width",
+        "key": "progress_bar_max",
         "label": "Progress bar width",
         "kind": "int",
         "default": 50,
         "min": 20,
-        "max": 120,
+        # Wider than any bar was allowed to be before, because it is a ceiling
+        # now rather than a size: on a 200-column terminal a 120-cap bar leaves
+        # half the pane empty, and nothing here can overflow a narrow one.
+        "max": 200,
         "step": 2,
-        "desc": "Width of the player progress bar, in characters.",
+        "desc": "Widest the progress bar gets. It always shrinks to fit the window.",
     },
     {
         "key": "volume",
         "label": "Volume",
         "kind": "int",
+        # A setting like any other — defaulted, coerced, clamped and saved
+        # through this same table — but not a row on the settings page. It is
+        # the one setting you reach for in the middle of a track, so it is
+        # edited on the [v] overlay instead, over whatever is on screen.
+        "hidden": True,
         "default": 100,
         "min": 0,
         # The loudest any supported backend can go, not what the running one
@@ -138,6 +152,10 @@ SETTINGS_SPEC: list[dict] = [
 ]
 
 DEFAULTS = {spec["key"]: spec["default"] for spec in SETTINGS_SPEC}
+
+# What the settings page actually lists, in order. Everything else about a
+# hidden setting is unchanged: only where it is edited moved.
+SETTINGS_ROWS = [spec for spec in SETTINGS_SPEC if not spec.get("hidden")]
 
 
 def get_spec(key: str) -> dict:
@@ -230,6 +248,14 @@ def _migrate(cfg: dict) -> dict:
             # budget the user actually set stays at least 1 GB rather than 0
             gigabytes = round(megabytes / 1024)
             cfg["cache_budget_gb"] = gigabytes if gigabytes else (1 if megabytes > 0 else 0)
+    if version < 4:
+        # The bar was laid out at exactly this many columns and wrapped when
+        # the window was narrower; it is derived from the width now and this
+        # is only its ceiling. Same number, so a wide window looks unchanged —
+        # what the user set is what the bar still grows to.
+        columns = cfg.pop("progress_bar_width", None)
+        if isinstance(columns, (int, float)) and not isinstance(columns, bool):
+            cfg["progress_bar_max"] = int(columns)
     cfg["version"] = CONFIG_VERSION
     return cfg
 

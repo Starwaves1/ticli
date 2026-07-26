@@ -17,6 +17,7 @@ from ticli.player import HeadlessTidalPlayer
 from ticli.utils import config as config_mod
 from ticli.utils.config import (
     DEFAULTS,
+    SETTINGS_ROWS,
     SETTINGS_SPEC,
     coerce,
     cycle_value,
@@ -63,7 +64,7 @@ class TestLoadConfig:
         cfg = load_config()
         assert cfg["quality"] == "LOSSLESS"
         assert cfg["page_size"] == 15
-        assert cfg["progress_bar_width"] == 50
+        assert cfg["progress_bar_max"] == 50
         assert cfg["volume"] == 100
 
     def test_defaults_when_file_corrupt(self, config_file):
@@ -86,7 +87,7 @@ class TestLoadConfig:
         config_file.write_text(json.dumps({
             "quality": "PLATINUM",
             "page_size": "not a number",
-            "progress_bar_width": None,
+            "progress_bar_max": None,
         }))
         cfg = load_config()
         assert cfg == {**DEFAULTS, "version": config_mod.CONFIG_VERSION}
@@ -176,7 +177,7 @@ class TestCacheMigrationV2:
         save_config(load_config())
         saved = json.loads(config_file.read_text())
         assert "cache_mode" not in saved and "cache_budget_mb" not in saved
-        assert saved["version"] == 3
+        assert saved["version"] == config_mod.CONFIG_VERSION
 
     def test_the_budget_becomes_whole_gigabytes(self, config_file):
         assert self._v2(config_file, cache_budget_mb=1536)["cache_budget_gb"] == 2
@@ -207,6 +208,102 @@ class TestCacheMigrationV2:
         assert cfg["quality"] == "HIGH"  # v1 rename still applies
         assert cfg["cache_songs"] is True
         assert cfg["cache_budget_gb"] == 1
+
+
+class TestBarWidthMigrationV3:
+    """v3's `progress_bar_width` was the width the bar was laid out at. It is
+    `progress_bar_max` now, and only a ceiling — the bar itself comes from the
+    window. Same number, so nobody's bar changes on a wide terminal.
+
+    Every test here goes through a written file and, where it is about what
+    survives, a save and a re-load: the v1 migration shipped a bug that was
+    invisible to a unit test of _migrate, because the value it computed was
+    thrown away by the loop that ran after it.
+    """
+
+    def _v3(self, config_file, **extra):
+        config_file.write_text(json.dumps({"version": 3, **extra}))
+        return load_config()
+
+    def test_the_width_becomes_the_ceiling(self, config_file):
+        assert self._v3(config_file, progress_bar_width=80)["progress_bar_max"] == 80
+
+    def test_it_survives_a_save_and_a_reload(self, config_file):
+        self._v3(config_file, progress_bar_width=80)
+        save_config(load_config())
+        assert load_config()["progress_bar_max"] == 80
+
+    def test_the_old_key_is_gone_after_a_save(self, config_file):
+        self._v3(config_file, progress_bar_width=80)
+        save_config(load_config())
+        saved = json.loads(config_file.read_text())
+        assert "progress_bar_width" not in saved
+        assert saved["progress_bar_max"] == 80
+        assert saved["version"] == config_mod.CONFIG_VERSION
+
+    def test_a_v3_file_without_it_gets_the_default(self, config_file):
+        assert self._v3(config_file)["progress_bar_max"] == DEFAULTS["progress_bar_max"]
+
+    def test_junk_never_raises_and_falls_back(self, config_file):
+        for junk in (None, "wide", True, [50]):
+            cfg = self._v3(config_file, progress_bar_width=junk)
+            assert cfg["progress_bar_max"] == DEFAULTS["progress_bar_max"], junk
+
+    def test_migration_is_idempotent(self, config_file):
+        self._v3(config_file, progress_bar_width=80)
+        for _ in range(3):
+            save_config(load_config())
+        assert load_config()["progress_bar_max"] == 80
+
+    def test_the_player_starts_with_the_migrated_ceiling(self, config_file):
+        """End to end, which is the point: the number in the v3 file is the
+        one the running player caps its bar at."""
+        self._v3(config_file, progress_bar_width=80)
+        assert HeadlessTidalPlayer()._bar_max == 80
+
+    def test_a_v1_file_gets_this_migration_too(self, config_file):
+        config_file.write_text(json.dumps(
+            {"version": 1, "quality": "LOW", "progress_bar_width": 96}))
+        cfg = load_config()
+        assert cfg["quality"] == "HIGH"
+        assert cfg["progress_bar_max"] == 96
+
+
+class TestVolumeSurvivesLeavingThePage:
+    """The volume row moved off the settings page and onto the [v] overlay.
+    That is a schema change even though no key changed name — a `hidden` spec
+    that stopped being defaulted, coerced or written would silently reset
+    everyone's volume on the first save after the upgrade."""
+
+    def test_an_existing_value_survives_the_upgrade(self, config_file):
+        config_file.write_text(json.dumps({"version": 3, "volume": 140}))
+        assert load_config()["volume"] == 140
+        save_config(load_config())
+        assert json.loads(config_file.read_text())["volume"] == 140
+        assert load_config()["volume"] == 140
+
+    def test_it_is_still_defaulted_coerced_and_clamped(self, config_file):
+        config_file.write_text(json.dumps({"version": 3, "volume": 9000}))
+        assert load_config()["volume"] == get_spec("volume")["max"]
+        assert "volume" in DEFAULTS
+
+    def test_a_file_written_before_the_move_still_loads(self, config_file):
+        """The whole v3 record, exactly as the last release wrote it."""
+        config_file.write_text(json.dumps({
+            "version": 3, "quality": "HIRES", "page_size": 20,
+            "progress_bar_width": 64, "volume": 120, "show_artwork": False,
+            "cache_metadata": True, "cache_songs": True, "cache_budget_gb": 4,
+        }))
+        cfg = load_config()
+        assert cfg["volume"] == 120
+        assert cfg["progress_bar_max"] == 64
+        assert cfg["page_size"] == 20
+        assert cfg["quality"] == "HIRES"
+        assert cfg["cache_budget_gb"] == 4
+
+    def test_the_page_no_longer_lists_it_but_the_spec_still_holds_it(self):
+        assert "volume" in [s["key"] for s in SETTINGS_SPEC]
+        assert "volume" not in [s["key"] for s in SETTINGS_ROWS]
 
 
 class TestBooleanSettings:
@@ -257,11 +354,11 @@ class TestQualityTiers:
 
 class TestSaveLoadRoundTrip:
     def test_round_trip(self, config_file):
-        save_config({"quality": "HIRES", "page_size": 25, "progress_bar_width": 80})
+        save_config({"quality": "HIRES", "page_size": 25, "progress_bar_max": 80})
         cfg = load_config()
         assert cfg["quality"] == "HIRES"
         assert cfg["page_size"] == 25
-        assert cfg["progress_bar_width"] == 80
+        assert cfg["progress_bar_max"] == 80
 
     def test_missing_keys_are_saved_as_defaults(self, config_file):
         save_config({"quality": "LOW"})
@@ -299,9 +396,9 @@ class TestCoerce:
         assert coerce(spec, 20) == 20
 
     def test_bar_width_clamped_to_bounds(self):
-        spec = get_spec("progress_bar_width")
+        spec = get_spec("progress_bar_max")
         assert coerce(spec, 5) == 20
-        assert coerce(spec, 5000) == 120
+        assert coerce(spec, 5000) == 200
 
     def test_volume_clamped_to_bounds(self):
         spec = get_spec("volume")
@@ -352,10 +449,10 @@ class TestCycleValue:
         assert value == spec["choices"][0]
 
     def test_int_steps_and_stops_at_bounds(self):
-        spec = get_spec("progress_bar_width")
+        spec = get_spec("progress_bar_max")
         assert cycle_value(spec, 50, 1) == 52
         assert cycle_value(spec, 50, -1) == 48
-        assert cycle_value(spec, 120, 1) == 120
+        assert cycle_value(spec, 200, 1) == 200
         assert cycle_value(spec, 20, -1) == 20
 
     def test_volume_steps_by_five_and_stops_at_bounds(self):
@@ -388,9 +485,9 @@ class TestSettingsKeyHandler:
         p = self._player()
         p._handle_settings_key(player_mod.KEY_UP)
         assert p._settings_cursor == 0
-        for _ in range(len(SETTINGS_SPEC) + 3):
+        for _ in range(len(SETTINGS_ROWS) + 3):
             p._handle_settings_key(player_mod.KEY_DOWN)
-        assert p._settings_cursor == len(SETTINGS_SPEC) - 1
+        assert p._settings_cursor == len(SETTINGS_ROWS) - 1
 
     def test_quality_cycles_and_wraps(self, config_file):
         p = self._player()
@@ -427,25 +524,20 @@ class TestSettingsKeyHandler:
         p = self._player()
         p._settings_cursor = 2  # progress bar width row
         p._handle_settings_key(player_mod.KEY_LEFT)
-        assert p._bar_width == 48
-        assert json.loads(config_file.read_text())["progress_bar_width"] == 48
+        assert p._bar_max == 48
+        assert json.loads(config_file.read_text())["progress_bar_max"] == 48
 
-    def test_volume_change_applies_live_and_saves(self, config_file):
+    def test_no_row_on_this_page_edits_the_volume(self, config_file):
+        """Volume moved to the [v] overlay, and the page it left has to be
+        clean about it: no row of it, and nothing here can change it."""
         p = self._player()
         p.audio = _FakeAudio()
-        p._settings_cursor = 3  # volume row
-        p._handle_settings_key(player_mod.KEY_LEFT)
-        assert p.config["volume"] == 95
-        assert p.audio.volumes == [95]  # pushed to the running player
-        assert json.loads(config_file.read_text())["volume"] == 95
-
-    def test_volume_change_without_audio_player(self, config_file):
-        """Settings can be edited before run() ever built an AudioPlayer."""
-        p = self._player()
-        p.audio = None
-        p._settings_cursor = 3
-        p._handle_settings_key(player_mod.KEY_LEFT)  # must not raise
-        assert p.config["volume"] == 95
+        for i in range(len(SETTINGS_ROWS)):
+            p._settings_cursor = i
+            p._handle_settings_key(player_mod.KEY_LEFT)
+            p._handle_settings_key(player_mod.KEY_RIGHT)
+        assert p.config["volume"] == 100
+        assert p.audio.volumes == []
 
     def test_clamped_edit_writes_nothing(self, config_file):
         p = self._player()
@@ -469,12 +561,16 @@ class TestSettingsKeyHandler:
         p = self._player()
         text = p._build_settings_display().plain
         assert "Settings" in text
-        for spec in SETTINGS_SPEC:
+        for spec in SETTINGS_ROWS:
             assert spec["label"] in text
+        assert "Volume" not in text, "the volume row lives behind [v] now"
 
 
 def _row(key):
-    return [spec["key"] for spec in SETTINGS_SPEC].index(key)
+    """Where a setting sits on the page. Deliberately SETTINGS_ROWS and not
+    SETTINGS_SPEC: a hidden setting has no row, and asking for one raises
+    rather than silently pointing the cursor at its neighbour."""
+    return [spec["key"] for spec in SETTINGS_ROWS].index(key)
 
 
 class TestNumericEntry:
@@ -530,7 +626,7 @@ class TestNumericEntry:
         self._type(p, "20")
         p._handle_settings_key(player_mod.KEY_DOWN)
         assert p.config["page_size"] == 20
-        assert p._settings_cursor == _row("progress_bar_width")
+        assert p._settings_cursor == _row("progress_bar_max")
 
     def test_out_of_range_clamps_to_the_bound(self, config_file):
         p = self._player()
@@ -582,70 +678,76 @@ class TestNumericEntry:
         assert p._cache.budget_bytes == 5 * 1024 ** 3
 
 
+def _overlay_player(audio=None):
+    """A player with the [v] overlay up, which is where the volume is edited
+    now. The mode underneath is the player screen, because the overlay is over
+    whatever is on screen rather than a place you navigate to."""
+    p = HeadlessTidalPlayer()
+    p.audio = audio
+    p._handle_key("v")
+    assert p._volume_open is True
+    return p
+
+
+def _overlay_text(p, fit=None):
+    """What the overlay actually puts on screen, as plain text."""
+    lines = p._build_volume_overlay(fit or player_mod.ROOMY_FIT)
+    return "\n".join(line.plain for line in lines)
+
+
 class TestVolumeAboveUnity:
     def _player(self, audio=None):
-        p = HeadlessTidalPlayer()
-        p._mode = p.MODE_SETTINGS
-        p._settings_cursor = _row("volume")
-        p.audio = audio
-        return p
+        return _overlay_player(audio)
+
+    def _up(self, p, times=1):
+        for _ in range(times):
+            p._handle_key(player_mod.KEY_RIGHT)
 
     def test_mpv_may_be_taken_to_250(self, config_file):
         p = self._player(_FakeAudio())
-        for _ in range(40):
-            p._handle_settings_key(player_mod.KEY_RIGHT)
+        self._up(p, 40)
         assert p.config["volume"] == 250
         assert p.audio.volumes[-1] == 250
 
     def test_ffplay_is_capped_at_what_it_can_do(self, config_file):
         """ffplay's -volume is 0=min 100=max and it says so on stderr, so the
-        row must stop there rather than pretend."""
+        overlay must stop there rather than pretend."""
         audio = _FakeAudio(ceiling=100)
         audio.player_cmd = "ffplay"
         p = self._player(audio)
-        for _ in range(40):
-            p._handle_settings_key(player_mod.KEY_RIGHT)
-        assert p.config["volume"] == 100
-
-    def test_typing_a_number_respects_the_backend_ceiling(self, config_file):
-        audio = _FakeAudio(ceiling=100)
-        audio.player_cmd = "ffplay"
-        p = self._player(audio)
-        for digit in "250":
-            p._handle_settings_key(digit)
-        p._handle_settings_key(player_mod.KEY_ENTER)
+        self._up(p, 40)
         assert p.config["volume"] == 100
 
     def test_the_value_reads_as_a_percentage(self, config_file):
         p = self._player(_FakeAudio())
-        assert "100%" in p._build_settings_display().plain
+        assert "100%" in _overlay_text(p)
 
     def test_the_caution_starts_at_105(self, config_file):
         p = self._player(_FakeAudio())
         p.config["volume"] = 100
-        assert "quality suffers" not in p._build_settings_display().plain
+        assert "quality suffers" not in _overlay_text(p)
         p.config["volume"] = 105
-        assert "quality suffers" in p._build_settings_display().plain
+        assert "quality suffers" in _overlay_text(p)
 
     def test_the_caution_is_blue_not_dim(self, config_file):
         """Deliberately louder than the page's dim idiom — the owner asked for
         it to be noticed."""
         p = self._player(_FakeAudio())
         p.config["volume"] = 150
-        rendered = p._build_settings_display()
-        styles = {str(span.style) for span in rendered.spans
-                  if "quality suffers" in rendered.plain[span.start:span.end]}
+        note = next(line for line in p._build_volume_overlay(player_mod.ROOMY_FIT)
+                    if "quality suffers" in line.plain)
+        styles = {str(note.style)} | {str(span.style) for span in note.spans}
         assert styles == {"blue"}
 
     def test_ffplay_says_it_caps(self, config_file):
         audio = _FakeAudio(ceiling=100)
         audio.player_cmd = "ffplay"
         p = self._player(audio)
-        assert "ffplay caps at 100%" in p._build_settings_display().plain
+        assert "ffplay caps at 100%" in _overlay_text(p)
 
     def test_mpv_says_nothing_because_it_caps_at_nothing(self, config_file):
         p = self._player(_FakeAudio())
-        assert "caps at" not in p._build_settings_display().plain
+        assert "caps at" not in _overlay_text(p)
 
     def test_ffplay_is_never_handed_more_than_it_takes(self):
         from ticli.player import AudioPlayer
@@ -682,11 +784,7 @@ class TestVolumeCeilingIsDurable:
     ways the two can disagree."""
 
     def _player(self, audio=None):
-        p = HeadlessTidalPlayer()
-        p._mode = p.MODE_SETTINGS
-        p._settings_cursor = _row("volume")
-        p.audio = audio
-        return p
+        return _overlay_player(audio)
 
     def test_the_ceiling_comes_from_the_running_backend_not_the_platform(self, monkeypatch):
         """Same mpv, same answer, whichever OS it is running on — nothing here
@@ -725,7 +823,7 @@ class TestVolumeCeilingIsDurable:
 
         p = self._player(_Broken())
         assert p._setting_ceiling(get_spec("volume")) == 100
-        assert "100%" in p._build_settings_display().plain
+        assert "100%" in _overlay_text(p)
 
     def test_a_backend_with_no_ceiling_method_at_all_gets_unity(self, config_file):
         p = self._player(type("_Old", (), {"player_cmd": "mpv"})())
@@ -749,7 +847,7 @@ class TestVolumeCeilingIsDurable:
         assert p.config["volume"] == 100
         assert audio.volumes == [100], "the backend is told the clamped value"
         assert json.loads(config_file.read_text())["volume"] == 100
-        assert "100%" in p._build_settings_display().plain
+        assert "100%" in _overlay_text(p)
 
     def test_the_clamp_leaves_a_reachable_value_alone(self, config_file):
         save_config({**DEFAULTS, "volume": 250})
@@ -811,21 +909,21 @@ class TestVolumeCeilingIsDurable:
             p = self._player(audio)
             p.config["volume"] = volume
             p._clamp_volume_to_backend()
-            rendered = p._build_settings_display().plain
+            rendered = _overlay_text(p)
             assert not ("quality suffers" in rendered and "caps at" in rendered), cmd
             console = Console(width=80)
             with console.capture() as cap:
                 console.print(p._build_display())
             assert all(len(line) <= 80 for line in cap.get().splitlines()), cmd
 
-    def test_the_row_never_shows_a_value_the_backend_cannot_reach(self, config_file):
+    def test_the_overlay_never_shows_a_value_the_backend_cannot_reach(self, config_file):
         audio = _FakeAudio(ceiling=100)
         audio.player_cmd = "ffplay"
         p = self._player(audio)
         p._clamp_volume_to_backend()
         for _ in range(40):
-            p._handle_settings_key(player_mod.KEY_RIGHT)
-        rendered = p._build_settings_display().plain
+            p._handle_key(player_mod.KEY_RIGHT)
+        rendered = _overlay_text(p)
         assert "100%" in rendered
         assert "250%" not in rendered
         assert "ffplay caps at 100%" in rendered
@@ -834,10 +932,10 @@ class TestVolumeCeilingIsDurable:
 
 class TestConfiguredValuesUsed:
     def test_player_reads_sizes_from_config(self, config_file):
-        save_config({"quality": "HIGH", "page_size": 7, "progress_bar_width": 30})
+        save_config({"quality": "HIGH", "page_size": 7, "progress_bar_max": 30})
         p = HeadlessTidalPlayer()
         assert p._page_size == 7
-        assert p._bar_width == 30
+        assert p._bar_max == 30
 
     def test_configured_quality_used_when_flag_omitted(self, config_file):
         import tidalapi
