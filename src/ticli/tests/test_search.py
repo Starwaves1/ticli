@@ -218,9 +218,9 @@ class TestBrowseListsHonourPageSize:
         p._page_size = 40
         artist = types.SimpleNamespace(name="Miles Davis", get_top_tracks=get_top_tracks)
         p._open_artist(artist)
-        assert _wait_for(lambda: not p._browse_loading)
+        assert _wait_for(lambda: p._artist_rows())
         assert seen["limit"] >= 40
-        assert len(p._browse_tracks) >= 40
+        assert len(p._artist_rows()) >= 40
 
     def test_small_page_still_gets_a_useful_list(self, config_file):
         """Shrinking the page must not shrink what the artist page offers."""
@@ -233,7 +233,7 @@ class TestBrowseListsHonourPageSize:
         p = HeadlessTidalPlayer()
         p._page_size = 5
         p._open_artist(types.SimpleNamespace(name="X", get_top_tracks=get_top_tracks))
-        assert _wait_for(lambda: not p._browse_loading)
+        assert _wait_for(lambda: p._artist_rows())
         assert seen["limit"] == 20
 
 

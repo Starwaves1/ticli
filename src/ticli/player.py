@@ -1063,6 +1063,33 @@ class HeadlessTidalPlayer:
     MODE_PLAYLISTS = "playlists"
     MODE_ADD_TO_PLAYLIST = "add_to_playlist"
     MODE_SETTINGS = "settings"
+    MODE_ARTIST = "artist"
+
+    # The artist page's tabs, in the order Tab walks them. Each one is a
+    # different TIDAL endpoint and each is fetched the first time you land on
+    # it — see _load_artist_section.
+    ARTIST_SECTIONS = ("tracks", "albums", "playlists", "suggestions")
+    ARTIST_SECTION_LABELS = {
+        "tracks": "Top Tracks",
+        "albums": "Albums",
+        "playlists": "Playlists",
+        "suggestions": "Suggestions",
+    }
+    # Empty and failed are different facts and get different words: the first
+    # says what TIDAL knows about this artist, the second that we never got to
+    # ask. A blank screen would say neither.
+    ARTIST_SECTION_EMPTY = {
+        "tracks": "No tracks for this artist",
+        "albums": "No albums for this artist",
+        "playlists": "No playlists feature this artist",
+        "suggestions": "No suggestions for this artist",
+    }
+    ARTIST_SECTION_FAILED = {
+        "tracks": "Failed to load top tracks",
+        "albums": "Failed to load albums",
+        "playlists": "Failed to load playlists",
+        "suggestions": "Failed to load suggestions",
+    }
 
     # Setting name → tidalapi quality, and the terse badge shown on the player.
     # One name per tidalapi tier, same spelling as tidalapi uses, so the setting
@@ -1178,6 +1205,16 @@ class HeadlessTidalPlayer:
         self._browse_message = ""
         # Set when browse is showing one of the user's own (editable) playlists
         self._browse_playlist = None
+        # Artist page state. Every section is its own request, so none of them
+        # runs until you tab onto it, and the answer is kept for the session in
+        # _artist_sections keyed by (artist id, section): walking the tabs back
+        # and forth costs one request per tab, ever, and never a second.
+        # _artist_cursors remembers where you were in each of them.
+        self._artist = None
+        self._artist_section = self.ARTIST_SECTIONS[0]
+        self._artist_cursor = 0
+        self._artist_sections: dict = {}
+        self._artist_cursors: dict = {}
         self._browse_remove_busy = False
         # Queue view state
         self._queue_cursor = 0
@@ -2369,6 +2406,86 @@ class HeadlessTidalPlayer:
 
         return content
 
+    def _build_artist_display(self) -> Text:
+        content = Text()
+        name = getattr(self._artist, "name", "") or "Artist"
+        content.append(f"   {name}", style="bold magenta")
+
+        # The tab row, always on screen for the same reason search's scope row
+        # is: which section you are in is never hidden state, and Tab has
+        # something to point at.
+        content.append("\n   [Tab]", style="bold")
+        for i, key in enumerate(self.ARTIST_SECTIONS):
+            content.append("  " if i == 0 else " · ", style="dim")
+            active = key == self._artist_section
+            content.append(
+                self.ARTIST_SECTION_LABELS[key],
+                style="bold cyan" if active else "dim")
+
+        record = self._artist_record()
+        label = self.ARTIST_SECTION_LABELS[self._artist_section].lower()
+        if record is None or record["state"] == "loading":
+            content.append(f"\n\n   Loading {label}...", style="dim yellow")
+            return content
+        if record["state"] == "failed":
+            # Red and with a way out: a failure is not "there is nothing here",
+            # and the difference has to be visible at a glance
+            content.append(f"\n\n   {record['message']}", style="bold red")
+            content.append("\n   [Enter] retry  [Tab] another section", style="dim")
+            return content
+
+        rows = record["items"]
+        if not rows:
+            content.append(f"\n\n   {record['message']}", style="dim green")
+            return content
+
+        total = len(rows)
+        page = self._page_size
+        cursor = min(max(self._artist_cursor, 0), total - 1)
+        page_start = (cursor // page) * page
+        page_end = min(page_start + page, total)
+        content.append(f"  ({total})", style="dim")
+        content.append("\n", style="")
+        type_styles = {"track": "bold green", "album": "bold magenta",
+                       "playlist": "bold cyan", "artist": "bold yellow"}
+        for i in range(page_start, page_end):
+            row = rows[i]
+            obj = row["obj"]
+            selected = (i == cursor)
+            content.append("\n")
+            content.append("  ▸ " if selected else "    ",
+                           style="bold cyan" if selected else "")
+            content.append(f"[{row['type'].upper()}]",
+                           style=type_styles.get(row["type"], "dim"))
+            item_name = getattr(obj, "name", None) or "?"
+            content.append(f" {item_name}", style="bold white" if selected else "white")
+            if row["type"] == "track":
+                artists = getattr(obj, "artists", None)
+                if artists:
+                    content.append(f"  {artists[0].name}", style="dim")
+                content.append(f"  {format_time(getattr(obj, 'duration', 0) or 0)}",
+                               style="dim cyan")
+            elif row["type"] == "album":
+                artist = getattr(obj, "artist", None)
+                if artist is not None and getattr(artist, "name", None):
+                    content.append(f"  {artist.name}", style="dim")
+                year = getattr(obj, "year", None)
+                if year:
+                    content.append(f"  {year}", style="dim cyan")
+            elif row["type"] == "playlist":
+                num_tracks = getattr(obj, "num_tracks", None)
+                if num_tracks:
+                    content.append(f"  {num_tracks} tracks", style="dim cyan")
+                creator = getattr(obj, "creator", None)
+                if creator is not None and getattr(creator, "name", None):
+                    content.append(f"  by {creator.name}", style="dim")
+        if total > page:
+            page_num = (cursor // page) + 1
+            total_pages = (total + page - 1) // page
+            content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+
+        return content
+
     def _build_queue_display(self) -> Text:
         content = Text()
         content.append("   Queue", style="bold yellow")
@@ -2729,6 +2846,17 @@ class HeadlessTidalPlayer:
                 controls.append(" remove  ", style="dim")
             controls.append("[\u2190/Esc]", style="bold")
             controls.append(" back", style="dim")
+        elif self._mode == self.MODE_ARTIST:
+            controls.append("   [Enter/→]", style="bold")
+            controls.append(" open  ", style="dim")
+            controls.append("[↑/↓]", style="bold")
+            controls.append(" navigate  ", style="dim")
+            controls.append("[Tab]", style="bold")
+            controls.append(" section  ", style="dim")
+            controls.append("[a]", style="bold")
+            controls.append(" play all  ", style="dim")
+            controls.append("[←/Esc]", style="bold")
+            controls.append(" back", style="dim")
         elif self._mode == self.MODE_QUEUE:
             controls.append("   [Enter]", style="bold")
             controls.append(" play  ", style="dim")
@@ -2797,6 +2925,8 @@ class HeadlessTidalPlayer:
                 content.append_text(self._build_search_display())
             elif self._mode == self.MODE_BROWSE:
                 content.append_text(self._build_browse_display())
+            elif self._mode == self.MODE_ARTIST:
+                content.append_text(self._build_artist_display())
             elif self._mode == self.MODE_QUEUE:
                 content.append_text(self._build_queue_display())
             elif self._mode == self.MODE_PLAYLISTS:
@@ -2848,6 +2978,13 @@ class HeadlessTidalPlayer:
                 "tracks": list(self._browse_tracks),
                 "cursor": self._browse_cursor,
             })
+        elif self._mode == self.MODE_ARTIST:
+            self._nav_history.append({
+                "mode": self.MODE_ARTIST,
+                "artist": self._artist,
+                "section": self._artist_section,
+                "cursor": self._artist_cursor,
+            })
         elif self._mode == self.MODE_QUEUE:
             self._nav_history.append({
                 "mode": self.MODE_QUEUE,
@@ -2887,6 +3024,14 @@ class HeadlessTidalPlayer:
             self._browse_cursor = state.get("cursor", 0)
             self._browse_loading = False
             self._browse_message = ""
+        elif mode == self.MODE_ARTIST:
+            # The sections are still in _artist_sections, so coming back lands
+            # on the same tab with the same rows and makes no request at all
+            self._mode = self.MODE_ARTIST
+            self._artist = state.get("artist")
+            self._artist_section = state.get("section", self.ARTIST_SECTIONS[0])
+            self._artist_cursor = state.get("cursor", 0)
+            self._load_artist_section()
         elif mode == self.MODE_QUEUE:
             self._mode = self.MODE_QUEUE
             self._queue_cursor = state.get("cursor", 0)
@@ -3182,29 +3327,170 @@ class HeadlessTidalPlayer:
         threading.Thread(target=_run, daemon=True).start()
 
     def _open_artist(self, artist):
+        """Open the artist page on its first tab. Nothing but that tab is
+        fetched: the other three are several more requests, and opening a page
+        is one keystroke."""
         self._push_nav()
-        self._mode = self.MODE_BROWSE
-        self._browse_playlist = None
-        self._browse_title = f"{artist.name} - Top Tracks"
-        self._browse_tracks = []
-        self._browse_cursor = -1
-        self._browse_loading = True
-        self._browse_message = ""
+        self._mode = self.MODE_ARTIST
+        self._artist = artist
+        self._artist_section = self.ARTIST_SECTIONS[0]
+        self._artist_cursor = self._artist_cursors.get(self._artist_key(), 0)
+        self._load_artist_section()
+
+    # ── Artist page ──
+
+    def _artist_key(self, section: Optional[str] = None):
+        """What a section's results are filed under: the artist and the tab.
+        Keyed by id rather than by object so the same artist reached from two
+        places is still the same page."""
+        return (str(getattr(self._artist, "id", "") or ""), section or self._artist_section)
+
+    def _artist_record(self):
+        """The record for the tab on screen: state, rows and a message. None
+        only before the first visit, which the display reads as loading."""
+        return self._artist_sections.get(self._artist_key())
+
+    def _artist_rows(self) -> list:
+        record = self._artist_record()
+        return record["items"] if record and record["state"] == "ready" else []
+
+    def _load_artist_section(self, force: bool = False):
+        """Fetch the tab on screen, once. The presence of a record — loading,
+        ready or failed — *is* the answer to "has this tab been visited", so a
+        held-down Tab cannot fan out into requests and a second look costs
+        nothing. `force` is the retry a failed tab offers."""
+        artist = self._artist
+        if artist is None:
+            return
+        key = self._artist_key()
+        if key in self._artist_sections and not force:
+            return
+        section = self._artist_section
+        limit = max(20, self._page_size)
+        self._artist_sections = {
+            **self._artist_sections, key: {"state": "loading", "items": [], "message": ""}}
 
         def _run():
             try:
-                # At least a page — a 40-row page must not show 20 tracks and
-                # claim that's all the artist has
-                tracks = artist.get_top_tracks(limit=max(20, self._page_size))
-                self._browse_tracks = list(tracks)
-                if not self._browse_tracks:
-                    self._browse_message = "No tracks found"
+                items = self._fetch_artist_section(artist, section, limit)
             except Exception:
-                self._browse_message = "Failed to load artist"
-            finally:
-                self._browse_loading = False
+                record = {"state": "failed", "items": [],
+                          "message": self.ARTIST_SECTION_FAILED[section]}
+            else:
+                record = {"state": "ready", "items": items,
+                          "message": "" if items else self.ARTIST_SECTION_EMPTY[section]}
+            # Whole-dict assignment: the paint thread only ever reads a record
+            # that is already complete
+            self._artist_sections = {**self._artist_sections, key: record}
+            self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _fetch_artist_section(self, artist, section: str, limit: int) -> list:
+        """One tab, one round of requests, off the UI thread. Rows are tagged
+        with what they are, because a section can hold more than one kind."""
+        if section == "tracks":
+            # At least a page — a 40-row page must not show 20 tracks and
+            # claim that's all the artist has
+            return [{"type": "track", "obj": t}
+                    for t in (artist.get_top_tracks(limit=limit) or [])]
+        if section == "albums":
+            return [{"type": "album", "obj": a}
+                    for a in (artist.get_albums(limit=limit) or [])]
+        if section == "playlists":
+            return [{"type": "playlist", "obj": p}
+                    for p in self._artist_page_playlists(artist)]
+        return self._artist_suggestions(artist, limit)
+
+    def _artist_page_playlists(self, artist) -> list:
+        """The playlists an artist appears on. There is no
+        artists/{id}/playlists endpoint — tidalapi's Artist has no accessor for
+        one — so this comes from the artist page itself (pages/artist), which
+        is where listen.tidal.com gets the same rows. One request; keep the
+        playlist items out of it and drop everything else."""
+        page = artist.page()
+        found = []
+        seen = set()
+        for category in (getattr(page, "categories", None) or []):
+            for item in (getattr(category, "items", None) or []):
+                if not isinstance(item, tidalapi.Playlist):
+                    continue
+                pid = str(getattr(item, "id", "") or "")
+                if pid and pid in seen:
+                    continue
+                seen.add(pid)
+                found.append(item)
+        return found
+
+    def _artist_suggestions(self, artist, limit: int) -> list:
+        """What TIDAL suggests off the back of this artist: the artist radio —
+        the same tracks its mix is made of — then the artists it considers
+        similar. Two endpoints in one tab, and either half alone is still a
+        useful page, so only losing both counts as a failure."""
+        rows = []
+        failed = 0
+        try:
+            rows += [{"type": "track", "obj": t}
+                     for t in (artist.get_radio(limit=limit) or [])]
+        except Exception:
+            failed += 1
+        try:
+            rows += [{"type": "artist", "obj": a}
+                     for a in (artist.get_similar() or [])]
+        except Exception:
+            failed += 1
+        if failed == 2:
+            raise RuntimeError("neither radio nor similar artists answered")
+        return rows
+
+    def _cycle_artist_section(self, step: int = 1):
+        """Tab between the tabs, wrapping, and landing on one for the first
+        time is what fetches it. The cursor is per tab, so coming back to
+        Albums comes back to where you were in them."""
+        order = self.ARTIST_SECTIONS
+        self._artist_cursors = {**self._artist_cursors, self._artist_key(): self._artist_cursor}
+        self._artist_section = order[(order.index(self._artist_section) + step) % len(order)]
+        self._artist_cursor = self._artist_cursors.get(self._artist_key(), 0)
+        self._load_artist_section()
+
+    def _artist_section_tracks(self) -> list:
+        return [row["obj"] for row in self._artist_rows() if row["type"] == "track"]
+
+    def _select_artist_row(self):
+        """Enter on a row does the obvious thing for what the row is, through
+        the same navigation everything else uses. On a failed tab it is the
+        retry instead — a section that lost its one request would otherwise
+        stay lost for the session."""
+        record = self._artist_record()
+        if record is not None and record["state"] == "failed":
+            self._load_artist_section(force=True)
+            return
+        rows = self._artist_rows()
+        if not rows or not (0 <= self._artist_cursor < len(rows)):
+            return
+        row = rows[self._artist_cursor]
+        obj = row["obj"]
+        if row["type"] == "album":
+            self._open_album(obj)
+        elif row["type"] == "playlist":
+            self._open_playlist(obj)
+        elif row["type"] == "artist":
+            self._open_artist(obj)
+        else:
+            # Position counted rather than searched for: a section can hold
+            # tracks and artists at once, and two tracks can compare equal
+            tracks = self._artist_section_tracks()
+            index = sum(1 for r in rows[:self._artist_cursor] if r["type"] == "track")
+            self._queue = tracks
+            self._queue_index = index
+            self._play_track(obj)
+
+    def _play_all_artist(self):
+        tracks = self._artist_section_tracks()
+        if not tracks:
+            return
+        self._queue = tracks
+        self._play_queue_index(0)
 
     def _play_browse_track(self):
         if not self._browse_tracks:
@@ -3370,6 +3656,14 @@ class HeadlessTidalPlayer:
             return self._queue[self._queue_cursor]
         if self._mode == self.MODE_BROWSE and self._browse_tracks and self._browse_cursor >= 0:
             return self._browse_tracks[self._browse_cursor]
+        if self._mode == self.MODE_ARTIST:
+            rows = self._artist_rows()
+            if rows and 0 <= self._artist_cursor < len(rows):
+                row = rows[self._artist_cursor]
+                # Only a track row is addable; on an album or an artist row the
+                # sensible target is still whatever is playing
+                if row["type"] == "track":
+                    return row["obj"]
         return self._current_track
 
     def _open_playlist_picker(self):
@@ -3604,6 +3898,8 @@ class HeadlessTidalPlayer:
             self._handle_search_key(key)
         elif self._mode == self.MODE_BROWSE:
             self._handle_browse_key(key)
+        elif self._mode == self.MODE_ARTIST:
+            self._handle_artist_key(key)
         elif self._mode == self.MODE_QUEUE:
             self._handle_queue_key(key)
         elif self._mode == self.MODE_PLAYLISTS:
@@ -3770,6 +4066,39 @@ class HeadlessTidalPlayer:
             self._open_playlist_picker()
         elif key == "x":
             self._remove_from_browse_playlist()
+
+    def _handle_artist_key(self, key: str):
+        """Tab is the only key the artist page adds. ↑ from the top still hands
+        the arrows to the player for scrubbing, ←/Esc still goes back, and Tab
+        works while a section is loading or failed — there is no state this
+        page can be in that you cannot leave."""
+        if key == KEY_ESC or key == KEY_LEFT:
+            self._go_back()
+            return
+        if key == " ":
+            self._toggle_play_key()
+            return
+        if key == KEY_TAB:
+            self._cycle_artist_section(1)
+            return
+        if key == KEY_SHIFT_TAB:
+            self._cycle_artist_section(-1)
+            return
+        rows = self._artist_rows()
+        if key == KEY_UP:
+            if rows and self._artist_cursor > 0:
+                self._artist_cursor -= 1
+            else:
+                self._focus_player()
+        elif key == KEY_DOWN:
+            if rows:
+                self._artist_cursor = min(len(rows) - 1, self._artist_cursor + 1)
+        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
+            self._select_artist_row()
+        elif key == "a":
+            self._play_all_artist()
+        elif key == "y":
+            self._open_playlist_picker()
 
     def _handle_queue_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:

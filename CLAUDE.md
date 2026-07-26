@@ -154,6 +154,47 @@ every row, which matches everything or nothing. Each row says which playlist it
 came from and resolves through `_resolve_track` before playback. An empty index
 or `cache_metadata` turned off says so instead of looking like a query with no
 hits.
+### The artist page
+
+Four tabs — Top Tracks, Albums, Playlists, Suggestions — and `Tab` /
+`Shift-Tab` walk them, the same key search uses for its scope and free here
+because nothing on this screen types. It could not be `←`/`→` (back and open)
+and it could not be `↑` (that hands the arrows to the player for scrubbing);
+the tab row under the artist's name is always on screen, so which section you
+are in is never hidden state.
+
+**Each tab is its own request and none of them runs until you land on it.**
+Opening the page costs one; browsing all four costs five, because Suggestions
+is two endpoints. The results are kept for the session in `_artist_sections`
+keyed by `(artist id, section)`, and the *presence* of a record — loading,
+ready or failed — is the whole answer to "has this tab been visited", so a
+held-down `Tab` cannot fan out into requests, coming back is instant, and
+`_go_back` from an album lands on the same tab with the same rows and asks
+TIDAL for nothing. Cursors are remembered per tab in `_artist_cursors`.
+
+Which sections are real is decided by what tidalapi's `Artist` actually has.
+Top Tracks is `get_top_tracks()`, Albums is `get_albums()`, Suggestions is
+`get_radio()` (the artist mix's tracks) followed by `get_similar()`. There is
+**no `artists/{id}/playlists` endpoint and no accessor for one**, so Playlists
+comes from `artist.page()` — the `pages/artist` document listen.tidal.com
+itself renders — filtered for `tidalapi.Playlist` items and deduped. One
+request, real rows, and an artist nobody has playlisted says so.
+
+Loading, empty and failed are three different screens on purpose: `Loading
+albums…` in yellow, `No albums for this artist` in green (information), and
+`Failed to load albums` in **red** with `[Enter] retry`, because a section
+that lost its one request would otherwise stay lost for the session. Losing
+one half of Suggestions still shows the other half; only both failing is a
+failure. Nothing is a dead end — `Tab` works while a section is loading or
+failed, `←`/`Esc` always leaves, and `↑` at the top of the list still gives
+the player the arrows.
+
+Selecting a row goes through the existing navigation and nothing parallel:
+album → `_open_album`, playlist → `_open_playlist`, artist → `_open_artist`
+(a similar artist opens their page, with its own tabs), track → play, with
+the queue set to that section's tracks only — the position is counted, not
+searched for, because a mixed section holds artists too.
+
 ### Album artwork
 
 `utils/artwork.py` paints the cover above the track line as half-block pixel
