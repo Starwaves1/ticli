@@ -206,14 +206,14 @@ class TestRender:
 
 class TestArtSize:
     def test_a_normal_terminal_gets_the_big_size(self):
-        assert art_mod.art_size(80, 24) == (20, 10)
+        assert art_mod.art_size(80, 26) == (20, 10)
 
     def test_a_short_terminal_gets_a_smaller_one(self):
-        assert art_mod.art_size(80, 22) == (16, 8)
-        assert art_mod.art_size(80, 20) == (12, 6)
+        assert art_mod.art_size(80, 24) == (16, 8)
+        assert art_mod.art_size(80, 22) == (12, 6)
 
     def test_no_room_at_all(self):
-        assert art_mod.art_size(80, 18) is None
+        assert art_mod.art_size(80, 20) is None
         assert art_mod.art_size(20, 60) is None
 
     def test_a_narrow_terminal_gets_a_narrow_picture(self):
@@ -370,7 +370,7 @@ class TestLoad:
 def _player(console=None, cover=COVER):
     player = HeadlessTidalPlayer()
     player.console = console or Console(
-        width=80, height=24, color_system="truecolor")
+        width=80, height=26, color_system="truecolor")
     album = types.SimpleNamespace(name="An Album", cover=cover)
     player._current_track = types.SimpleNamespace(
         id=1, name="A Track", duration=200, artists=[], album=album)
@@ -436,7 +436,7 @@ class TestPlayerArtwork:
         player = _player()
         player._artwork_text()
         assert _wait_for(lambda: player._artwork is not None)
-        player.console = Console(width=80, height=20, color_system="truecolor")
+        player.console = Console(width=80, height=22, color_system="truecolor")
         player._artwork_text()
         assert _wait_for(lambda: len(sizes) == 2)
         assert sizes == [(20, 10), (12, 6)]

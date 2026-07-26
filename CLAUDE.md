@@ -235,6 +235,57 @@ delete itself. Eviction unlinks with `missing_ok`: two sweeps racing (two
 downloads landing together) must not read "already gone" as "still costing
 us" and go on to evict a file that fits.
 
+### The display loop
+
+`Live` runs with `auto_refresh=False` — repaints are driven by `_repaint()`,
+inline with input (231ms → 1.1ms) and otherwise only when the frame actually
+changed — and with **`screen=True`**, the alternate screen buffer, which is
+load-bearing rather than cosmetic.
+
+Without it Rich repaints by counting: it walks the cursor up exactly as many
+rows as the last frame was tall, erasing each one, then prints the new frame
+over the top. Measured at 100x30 with artwork, one repaint was 22 erase-line
+and 21 cursor-up sequences against a 22-row frame. That arithmetic is only
+true while the terminal has not moved underneath it, and a resize breaks both
+halves of it at once: terminals *reflow* on a width change, so a 22-row frame
+laid out for 100 columns becomes 44 rows at 60 and Rich erases 22 of them;
+and a window that got shorter has already scrolled the top of that frame into
+the scrollback, where no cursor-up can reach it. Whatever is left over stays
+on screen forever and the next repaint strands another one above it — the
+reported artifact was eight bands of album art and three stacked `Ticli`
+panels showing three different timestamps. On the alternate screen there is
+no arithmetic to get wrong: every refresh homes the cursor and writes every
+row of the terminal (0 cursor-ups, 30 rows, ~6% more bytes), so nothing can
+be stranded by a resize, by a frame that shrank (full player to mini), or by
+artwork appearing, vanishing or changing size. The player also stops
+scribbling on the scrollback it was launched from: the `console.clear()`s in
+`run()` and `_suspended_tui` are gone, and on exit the terminal comes back
+exactly as it was.
+
+A resize still has to be *noticed*, since nothing else would repaint until
+the next key or idle tick: `SIGWINCH` sets `_resized` and `_wake()`s the loop
+— no new thread, no timer — and the loop forces the next repaint. `_repaint`
+also keys its skip-if-identical cache on `console.size` as well as the
+segments, because most of the panel does not depend on the terminal's height:
+a window that only got shorter renders byte-identical segments, and that is
+the one repaint that must not be skipped.
+
+`MIN_ROWS_AROUND_ART` is part of this. A pane that overflows is not harmless
+— Rich answers it by replacing the bottom line, the controls, with a red
+ellipsis — and the pane is not one height: `[m]` adds a controls row and a
+toast adds another, which overflowed a 24-row terminal by exactly one. Known
+and *not* fixed: the paged lists size their page from `page_size` in the
+config rather than from the terminal, and the settings page does not scroll
+at all, so both can still overflow a short window (queue: 43 rows for 40
+tracks; settings: 32 rows at any width).
+
+`tests/vt.py` is a small terminal model — enough of the escape sequences Rich
+emits to replay a session into a fixed-size grid, *including reflow on
+resize*, which is the part a merely-clipping model would let the bug through.
+`tests/test_display.py` drives the real `Live` against it and asserts on what
+the eye asks: one whole panel on screen, nothing above or below it, nothing
+in the scrollback.
+
 ### Key Files
 
 | File | Purpose |

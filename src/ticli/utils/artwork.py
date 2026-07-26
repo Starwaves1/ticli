@@ -54,7 +54,13 @@ ART_SIZES = ((20, 10), (16, 8), (12, 6))
 
 # Rows the rest of the player pane needs, below which artwork is not worth
 # its vertical cost, and the narrowest terminal art is offered in at all.
-MIN_ROWS_AROUND_ART = 14
+# Sixteen, not fourteen: the pane is not one height. Borders, padding, the
+# four track rows, the next-track line and the controls come to fourteen,
+# but `[m]` adds a second controls row and a toast adds another, and at
+# fourteen a 24-row terminal showing both overflowed by a row — which Rich
+# answers by replacing the bottom line with a red ellipsis, i.e. eating the
+# controls. Two rows of headroom means every state of the pane fits.
+MIN_ROWS_AROUND_ART = 16
 # Columns a picture costs beyond its own width: the panel's border and
 # padding (6) plus the indent that lines it up with the track title (3). A
 # picture that doesn't clear this would wrap, which looks like corruption.

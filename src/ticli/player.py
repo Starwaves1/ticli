@@ -1140,8 +1140,15 @@ class HeadlessTidalPlayer:
         self._show_more = False
         # Timestamp of the last play/pause key, for repeat suppression
         self._last_toggle_key = 0.0
-        # Last rendered frame, so an idle repaint can skip an identical write
+        # Last rendered frame *and the size it was rendered for*, so an idle
+        # repaint can skip an identical write. The size belongs in the key:
+        # most of the panel does not depend on the terminal's height, so a
+        # window that only got shorter renders byte-identical segments and
+        # would otherwise be skipped — the one repaint that must not be.
         self._last_segments = None
+        # Set by the SIGWINCH handler; read by the main loop, which repaints
+        # the whole screen rather than trusting anything already on it
+        self._resized = False
         # Self-pipe: a background thread with fresh data writes a byte, which
         # wakes the input select immediately instead of leaving the new list
         # to wait for the next idle tick. Costs nothing while nothing happens.
@@ -1388,7 +1395,8 @@ class HeadlessTidalPlayer:
                 yield
             finally:
                 self._raw_tty()
-                self.console.clear()
+                # No clear() either: live.start() goes back to the alternate
+                # screen, so what was typed here stays in the scrollback
                 if live is not None:
                     live.start(refresh=False)
                 # The screen was someone else's for a while, so the cached
@@ -3673,11 +3681,44 @@ class HeadlessTidalPlayer:
         is touching costs one cheap render per poll and no terminal traffic.
         """
         display = self._build_display()
-        segments = tuple(self.console.render(display, self.console.options))
-        if not force and segments == self._last_segments:
+        key = (self.console.size, tuple(self.console.render(display, self.console.options)))
+        if not force and key == self._last_segments:
             return
-        self._last_segments = segments
+        self._last_segments = key
         live.update(display, refresh=True)
+
+    def _make_live(self) -> "Live":
+        """The session's one Live display.
+
+        `screen=True` — the alternate screen buffer — is load-bearing, not
+        cosmetic. Without it Rich repaints by counting: it walks the cursor
+        up exactly as many rows as the last frame was tall, erasing each one,
+        and prints the new frame over the top. That accounting is only true
+        while the terminal has not moved underneath it. Resize the window and
+        both halves of it are wrong at once — the old frame's lines reflow or
+        clip to a width they were not laid out for, and a window that got
+        shorter has already scrolled part of that frame into the scrollback
+        where no cursor-up can reach it. What is left over stays on screen
+        forever, and the next repaint strands another one above it: the
+        reported artifact was eight bands of album art and three stacked
+        `Ticli` panels showing three different timestamps.
+
+        On the alternate screen there is no accounting to get wrong. Every
+        refresh homes the cursor and writes every row of the terminal, so a
+        frame cannot be stranded by anything — a resize, a frame that shrank
+        (full player to mini), artwork that appeared or changed size. It also
+        means the player no longer scribbles on the scrollback it was
+        launched from: on exit the terminal is handed back exactly as it was,
+        the way `less` and `htop` do it.
+        """
+        return Live(
+            self._build_display(),
+            console=self.console,
+            # auto_refresh off: repaints are driven by _repaint, immediately
+            # after input and otherwise only when the screen actually changed
+            auto_refresh=False,
+            screen=True,
+        )
 
     def run(self):
         """Start the headless player."""
@@ -3715,6 +3756,18 @@ class HeadlessTidalPlayer:
             except (ValueError, OSError):
                 pass
 
+        # A resize changes what a frame should look like *and* what is
+        # already on screen. The handler only records it and wakes the loop —
+        # no new thread and no timer; the repaint happens where every other
+        # repaint happens.
+        def _on_resize(signum, frame):
+            self._resized = True
+            self._wake()
+        try:
+            signal.signal(signal.SIGWINCH, _on_resize)
+        except (AttributeError, ValueError, OSError):
+            pass  # no SIGWINCH here; the idle tick still picks the size up
+
         import tty
         import termios
         import select
@@ -3735,16 +3788,10 @@ class HeadlessTidalPlayer:
         self._tty_settings = old_settings
         try:
             tty.setcbreak(sys.stdin.fileno())
-            self.console.clear()
+            # No clear(): the TUI lives on the alternate screen now, so the
+            # scrollback it was launched from is none of its business
 
-            # auto_refresh off: repaints are driven by _repaint, immediately
-            # after input and otherwise only when the screen actually changed
-            with Live(
-                self._build_display(),
-                console=self.console,
-                auto_refresh=False,
-                screen=False,
-            ) as live:
+            with self._make_live() as live:
                 self._live = live
                 self._repaint(live, force=True)
                 while self.running:
@@ -3753,7 +3800,9 @@ class HeadlessTidalPlayer:
                         self._handle_key(key)
                         if not self.running:
                             break
-                    self._repaint(live, force=bool(keys))
+                    resized = self._resized
+                    self._resized = False
+                    self._repaint(live, force=bool(keys) or resized)
         finally:
             self._live = None
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
