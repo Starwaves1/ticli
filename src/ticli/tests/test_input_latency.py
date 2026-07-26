@@ -25,6 +25,7 @@ from ticli.player import (
     _incomplete_escape,
     _split_keys,
 )
+from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
 
 POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="pty/termios input path is POSIX-only")
@@ -35,6 +36,8 @@ def config_file(tmp_path, monkeypatch):
     """Keep every player built here off the real ~/.config/ticli."""
     monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(config_mod, "CONFIG_FILE", tmp_path / "config.json")
+    # ...and off the real cache, which is where the download index lives
+    monkeypatch.setattr(cache_mod, "CACHE_DIR", tmp_path / "cache")
 
 
 def _fake_track(tid, duration=200):
@@ -52,7 +55,7 @@ class _FakeAudio:
         self.plays = []
         self.is_paused = False
 
-    def play_url(self, url, seek=0, title="", cache_key=None):
+    def play_url(self, url, seek=0, title="", cache_key=None, local=None):
         self.plays.append((url, seek, title))
 
 

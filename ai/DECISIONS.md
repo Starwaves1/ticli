@@ -92,7 +92,23 @@ Last updated: 2026-07-24 (initial brainstorm with Garrett).
       `seek 0 absolute` on TIDAL streams (NACK → audible-gap respawn
       fallback, still correct) and ffplay `-volume` acceptance.
 
-## Downloads + play-count eviction (spec'd 2026-07-25, not yet built)
+## Downloads + play-count eviction (downloads **built** 2026-07-26)
+
+**Downloads shipped.** `[d]` from the player, browse, artist and queue screens
+opens a single-column quality picker, cursor pre-placed on the settings tier;
+the hovered tier says `download now` and every tier shows its estimate. Files
+land in `~/Music/Ticli/<Album artist>/<Album>/<NN> Title.m4a`, exempt from the
+budget and from eviction by construction (both work from `audio_dir()`), and
+are tagged in place by a stdlib MP4/FLAC tagger (`utils/tags.py`) — no mutagen,
+no ffmpeg. **Play-count eviction below is still deferred at Garrett's request.**
+
+Size-estimate calibration, redone for FLAC with zero network (the numbers in
+the research doc were AAC-only): a real 24/88.2 PKCE track out of this
+machine's own cache, transcoded locally to 16/44.1, came to 765 kbps — 54% of
+PCM — with twelve-second windows spanning 502-852 kbps. Nominal is 850 kbps
+for LOSSLESS and 2500 kbps for HIRES, and the screen says out loud that FLAC
+is variable where it says AAC is not.
+
 
 Research: `ai/reference/download-research-2026-07-25.md` (live-probed).
 
