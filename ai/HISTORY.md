@@ -394,6 +394,55 @@ counted as a song. Filed as INCIDENTS #6 — it is INCIDENTS #2's lesson again.
 The `important.txt` decoy tests still pass: the predicate only widened over
 names that are already `{track_id}`-shaped.
 
+### F2 — a stream that died mid-track looked exactly like one that finished
+
+Measured against a loopback HLS server returning `403 Request has expired`
+from segment 3 of 45: **both** mpv and ffplay play out whatever they had
+buffered and then exit **`0` with an empty stderr**, 12.1 s into a 176 s
+track. That is byte for byte what reaching the end of a song looks like, so
+`failure()` says nothing — correctly, by its own contract — and
+`_monitor_playback` fell through to the auto-advance. The user heard twelve
+seconds of a three-minute song and the player moved on with nothing said. If
+the cause is systemic (an expired session, the network down) it walks the
+whole queue like that. INCIDENTS #3 through a door its fix does not cover.
+
+Reachable without anything exotic: a pause longer than the ~1 h life of a
+signed URL, because ffplay's `resume()` respawns against the *same* expired
+string and `AudioPlayer` has no session to get a fresh one with; or any
+network blip mid-track.
+
+The clock is the only witness, so `_stream_ended_early()` is the whole fix:
+duration known, and the position more than `STREAM_TRUNCATED_MARGIN` (15 s)
+short of it. **Stop and say so** — `Playback stopped early — the stream ended
+at 0:12 of 2:56. [space] to resume` — rather than retry. The audit proposed an
+automatic restart with a one-retry latch; the owner's established answer for a
+stream the backend could not play is a stop with an honest toast, and a silent
+retry loop against a dead URL would be the same silence with more requests.
+The position is kept, so `[space]` restarts through `_play_track`, which
+fetches a fresh URL.
+
+Deliberately the **opposite** of `_track_has_time_left`'s rule on an unknown
+duration. There, "can't say" means resume: a wrong guess costs one extra
+spawn. Here a wrong "yes" stops the queue on a track that really did end, so
+"can't say" advances exactly as before. The 15 s margin is for the same
+reason — TIDAL's `duration` is metadata and disagrees with the audio by a
+second or two, and the measured failure stopped 164 s short.
+
+Tests assert what the brief asked for: the queue index does not move, no
+restart is attempted, and the toast carries both times. Plus the premise, run
+against the real backends over loopback — exit 0, `failure()` None, dead well
+short of the end.
+
+**Found on the way, and fixed:** `_split` in `test_buffering.py` returned the
+whole 24-second track as a *single* segment (it kept only the first `sidx`),
+so the segment the buffering tests delay was never requested and those
+assertions were passing over a stream with nothing to buffer. Fixed to cut at
+every `moof`. With 12 real segments the delayed one had to move from index 2
+to 6: at the very start of a track nothing is buffered yet, so a slow segment
+there stalls any player — measured, mpv reports `paused-for-cache` once at
+2.1 s and then runs 21 s ahead for the rest of the track, which is the
+property the test means to assert.
+
 ---
 
 ## In flight at time of writing

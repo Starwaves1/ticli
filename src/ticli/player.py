@@ -431,6 +431,18 @@ HLS_CACHE_SECONDS = 60
 PLAYER_ERROR_CHARS = 90
 PLAYER_ERROR_SECONDS = 8.0
 
+# How far short of a track's stated end a clean exit has to fall before it is
+# read as a dead stream rather than as the end of the song. Both backends
+# answer a mid-track 403 (an expired signed URL, a network blip) by playing
+# what they had buffered and then exiting **0 with an empty stderr** — byte for
+# byte what finishing a track looks like, so `failure()` cannot tell them apart
+# and is right not to try. The clock can. Generous on purpose: TIDAL's
+# `duration` is metadata and can disagree with the audio by a second or two,
+# and a false positive here stops the queue on a track that really did end,
+# which is worse than the occasional missed truncation. The measured failure
+# stopped 164 seconds short.
+STREAM_TRUNCATED_MARGIN = 15.0
+
 # Ascending, so "did TIDAL give us less than we asked for?" is a comparison.
 # Keys are tidalapi's own Quality values, which is what a Stream reports back
 # as the tier it actually granted.
@@ -2588,6 +2600,25 @@ class HeadlessTidalPlayer:
                     # finished playing needs no rescue — clearing the cache
                     # mid-track leaves its file gone at the natural end too.
                     self._play_track(self._current_track, seek=self._get_position())
+                elif self._stream_ended_early():
+                    # The stream died mid-track. Both backends answer a dead
+                    # source by playing their buffer out and exiting 0 with an
+                    # empty stderr, which is indistinguishable from the end of
+                    # a song — except by the clock. Stop and say so rather
+                    # than advancing: a track that died must not look like a
+                    # track that finished (ai/INCIDENTS #3, by another door).
+                    position = self._get_position()
+                    duration = getattr(self._current_track, "duration", 0) or 0
+                    self._set_toast(
+                        "Playback stopped early — the stream ended at "
+                        f"{format_time(position)} of {format_time(duration)}."
+                        " [space] to resume",
+                        seconds=PLAYER_ERROR_SECONDS)
+                    logger.warning("Stream ended early at %.0fs of %.0fs",
+                                   position, duration)
+                    self._playing = False
+                    self._play_start_time = None
+                    self._play_offset = position
                 elif self._queue and self._queue_index < len(self._queue) - 1:
                     self._play_queue_index(self._queue_index + 1)
                 else:
@@ -2626,6 +2657,36 @@ class HeadlessTidalPlayer:
         if duration <= 0:
             return True
         return self._get_position() < duration - margin
+
+    def _stream_ended_early(self) -> bool:
+        """Whether the backend stopped a long way short of the end of the track.
+
+        The thing this exists to catch is invisible to `failure()`. Measured
+        against a loopback HLS server returning `403 Request has expired` from
+        segment 3 of 45, **both** mpv and ffplay played their buffer out and
+        exited `0` with an **empty stderr**, 12.1 s into a 176 s track — which
+        is byte for byte what reaching the end of a song looks like. So the
+        monitor advanced, and the user heard twelve seconds of a three-minute
+        track and nothing to say why. If the cause is systemic (an expired
+        session, the network down) it walks the whole queue in near-silence.
+
+        That is reachable without any exotic failure: a pause longer than the
+        ~1 h life of a signed URL, since ffplay's `resume()` respawns against
+        the *same* expired string, and any network blip mid-track.
+
+        The clock is the only witness. Deliberately the opposite of
+        `_track_has_time_left`'s handling of an unknown duration: there, "can't
+        say" means resume, because a wrong guess costs one extra spawn. Here a
+        wrong "yes" **stops the queue on a track that really did end**, so
+        "can't say" means advance exactly as before.
+        """
+        track = self._current_track
+        if track is None:
+            return False
+        duration = getattr(track, "duration", None) or 0
+        if duration <= 0:
+            return False
+        return self._get_position() < duration - STREAM_TRUNCATED_MARGIN
 
     def _get_position(self) -> float:
         if self._play_start_time and self._playing:

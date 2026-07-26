@@ -140,6 +140,12 @@ already `{track_id}`-shaped, so the `important.txt` decoy test still passes
 
 ### F2 — A stream that dies mid-track exits 0, so the monitor reads it as "the track ended" and silently skips
 
+> **FIXED 2026-07-26.** `_stream_ended_early()` + a branch in
+> `_monitor_playback` before the auto-advance. The owner chose **stop with an
+> honest toast** over the automatic restart proposed below — a silent retry
+> against a dead URL is the same silence with more requests. `[space]` resumes
+> from where it died. Everything below is the diagnosis as written.
+
 **Measured. This is INCIDENT #3's failure mode on a path the INCIDENT #3 fix
 does not cover.**
 

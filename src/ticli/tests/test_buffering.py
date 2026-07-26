@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ import pytest
 from ticli.player import (
     HLS_CACHE_SECONDS,
     AudioPlayer,
+    HeadlessTidalPlayer,
     _hls_playlist,
     _write_hls_playlist,
 )
@@ -45,10 +47,18 @@ MPV = shutil.which("mpv")
 
 SEGMENT_SECONDS = 2.0
 TRACK_SECONDS = 24
-# Longer than the one second of buffer the old flags left, shorter than a
-# segment — a hiccup a correctly-buffered player absorbs without a gap.
-SLOW_SEGMENT = 2
+# Longer than the one second of buffer the old flags left — a hiccup a
+# correctly-buffered player absorbs without a gap. Not one of the first
+# segments: at the very start of a track *nothing* is buffered yet, so a slow
+# segment there stalls any player, cache flags or not (measured: with segment
+# 2 delayed, mpv reports paused-for-cache once at 2.1 s and then runs 21 s
+# ahead for the rest of the track). Mid-track is where the cache is the whole
+# difference.
+SLOW_SEGMENT = 6
 SLOW_BY = 2.5
+# Where a signed URL stops working part way through a track. Early enough
+# that what plays is unmistakably a fraction of the song.
+EXPIRE_FROM = 3
 
 
 def _fragmented_flac(path: Path) -> Path:
@@ -65,9 +75,17 @@ def _fragmented_flac(path: Path) -> Path:
 
 def _split(path: Path):
     """The file cut back into the init segment and the media segments it was
-    concatenated from — the same shape `_start_download` writes out."""
+    concatenated from — the same shape `_start_download` writes out.
+
+    One fragment is one `moof`/`mdat` pair, preceded by its own `sidx` when
+    ffmpeg wrote one. This walked the boxes and kept the first `sidx` only, so
+    it returned the whole 24-second track as a **single** segment: the delayed
+    segment was never requested and the buffering assertions were passing over
+    a stream that had nothing to buffer. Found while building the expiry test,
+    which needs segment 3 to exist before it can refuse to serve it.
+    """
     data = path.read_bytes()
-    starts, off = [], 0
+    boxes, off = [], 0
     while off + 8 <= len(data):
         size = struct.unpack(">I", data[off:off + 4])[0]
         typ = data[off + 4:off + 8]
@@ -75,19 +93,29 @@ def _split(path: Path):
             size = struct.unpack(">Q", data[off + 8:off + 16])[0]
         if size <= 0:
             break
-        if typ in (b"sidx", b"moof") and (not starts or starts[-1][1] != b"sidx"):
-            starts.append((off, typ))
+        boxes.append((off, typ))
         off += size
-    cuts = [o for o, _ in starts]
+    cuts = []
+    for index, (start, typ) in enumerate(boxes):
+        if typ != b"moof":
+            continue
+        previous = boxes[index - 1] if index else None
+        # The index box belongs to the fragment it describes
+        cuts.append(previous[0] if previous and previous[1] == b"sidx" else start)
     init = data[:cuts[0]]
     segments = [data[a:b] for a, b in zip(cuts, cuts[1:] + [len(data)])]
     return init, segments
 
 
 class _Server:
-    """Serves the segments, delaying one of them."""
+    """Serves the segments, delaying one of them.
 
-    def __init__(self, init, segments):
+    `expire_from` makes every segment at or past that index answer
+    `403 Request has expired` — which is what a signed TIDAL URL does about an
+    hour after it was issued, and what any network blip looks like from here.
+    """
+
+    def __init__(self, init, segments, expire_from=None):
         served = []
         self.served = served
 
@@ -103,6 +131,18 @@ class _Server:
                     body = init
                 else:
                     index = int(name.split(".")[0])
+                    if expire_from is not None and index >= expire_from:
+                        served.append(name)
+                        body = b"Request has expired"
+                        self.send_response(403)
+                        self.send_header("Content-Type", "text/plain")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        try:
+                            self.wfile.write(body)
+                        except OSError:
+                            pass
+                        return
                     body = segments[index]
                     if index == SLOW_SEGMENT:
                         time.sleep(SLOW_BY)
@@ -209,6 +249,68 @@ def _play(seconds=9.0):
                     proc.kill()
         finally:
             server.close()
+
+
+def _play_until_it_dies(backend, seconds=25.0):
+    """Play a stream that expires part way through, with ticli's real flags,
+    through a real AudioPlayer. Returns (exit status, failure(), how long)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        source = _fragmented_flac(Path(tmp) / "frag.mp4")
+        init, segments = _split(source)
+        server = _Server(init, segments, expire_from=EXPIRE_FROM)
+        try:
+            playlist = _write_hls_playlist(
+                "test-expiry", _hls_playlist(_Dash(server.port, len(segments))))
+            audio = AudioPlayer(backend)
+            audio.volume = 0
+            started = time.monotonic()
+            audio.play_url(playlist, cache_key=None)
+            proc = audio._process
+            try:
+                proc.wait(timeout=seconds)
+            except subprocess.TimeoutExpired:  # pragma: no cover
+                proc.kill()
+                pytest.fail(f"{backend} never exited")
+            return proc.returncode, audio.failure(), time.monotonic() - started
+        finally:
+            try:
+                audio.stop()
+            except Exception:  # pragma: no cover
+                pass
+            server.close()
+
+
+@pytest.mark.skipif(not FFMPEG, reason="needs ffmpeg to build real segments")
+class TestADeadStreamIsIndistinguishableFromAnEnding:
+    """The measurement finding 2 rests on, against real backends.
+
+    A stream that expires mid-track does not error. Both backends play out
+    what they had buffered and then exit **0 with an empty stderr** — byte for
+    byte what reaching the end of the track looks like. So `failure()` says
+    nothing (correctly, by its own contract) and the monitor cannot tell the
+    difference from the process alone. Only the clock can, which is what
+    `_stream_ended_early` is.
+    """
+
+    @pytest.mark.parametrize("backend", ["mpv", "ffplay"])
+    def test_the_backend_exits_zero_with_nothing_to_say(self, backend):
+        if not shutil.which(backend):
+            pytest.skip(f"{backend} is not installed")
+        status, failure, elapsed = _play_until_it_dies(backend)
+        assert status == 0, f"{backend} exited {status}, not 0"
+        assert failure is None, f"{backend} reported {failure!r}"
+        assert elapsed < TRACK_SECONDS - 4, \
+            "the stream should have died well short of the end"
+
+    def test_the_clock_is_what_notices(self):
+        """The whole of the fix, stated against the numbers above: a track
+        that stopped this far short of its stated end did not end."""
+        p = HeadlessTidalPlayer()
+        p._current_track = types.SimpleNamespace(id=1, duration=TRACK_SECONDS)
+        p._play_offset = EXPIRE_FROM * SEGMENT_SECONDS
+        assert p._stream_ended_early() is True
+        p._play_offset = TRACK_SECONDS - 1
+        assert p._stream_ended_early() is False
 
 
 class TestSegmentedFlags:
