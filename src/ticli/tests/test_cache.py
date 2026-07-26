@@ -18,6 +18,7 @@ import pytest
 
 from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
+from ticli.tests.fakes import patch_get
 from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
 from ticli.utils.cache import CachedPlaylist, CachedTrack, MetadataCache
@@ -155,7 +156,7 @@ def _fake_get(monkeypatch, body=BODY, content_type="audio/mp4", on_chunk=None):
         calls.append(url)
         return _FakeResponse(body, content_type, on_chunk)
 
-    monkeypatch.setattr(player_mod.requests, "get", _get)
+    patch_get(monkeypatch, player_mod, _get)
     return calls
 
 
@@ -692,7 +693,7 @@ class TestAudioRetention:
     def test_a_failed_download_leaves_nothing_behind(self, monkeypatch):
         def _boom(*a, **k):
             raise OSError("connection reset")
-        monkeypatch.setattr(player_mod.requests, "get", _boom)
+        patch_get(monkeypatch, player_mod, _boom)
         audio = self._audio()
 
         audio._start_download(URL, 12, audio._download_gen)

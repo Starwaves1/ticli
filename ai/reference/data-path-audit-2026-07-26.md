@@ -352,6 +352,12 @@ hint") are preserved. Only the redundant re-reads go.
 
 ### F7 — No connection reuse in `fetch_to_file`: 46 TLS handshakes per hi-res track
 
+> **FIXED 2026-07-26.** One `requests.Session()` per call, in the same `with`
+> as the output handle. The six test fakes that replaced `requests.get` moved
+> with it — `tests/fakes.py:patch_get` replaces the function *and* the session
+> together, because a fake of something production has stopped calling is
+> INCIDENTS #2's shape. Everything below is the diagnosis as written.
+
 **Measured, and smaller than expected.** The one real cached hi-res track
 (`467461385.m4a`, FLAC 24/48, 175.9 s, 29,575,234 bytes, 1.345 Mbps) parses to
 **45 media segments + 1 initialization segment**, mean 657 KB each. So a hi-res

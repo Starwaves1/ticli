@@ -639,13 +639,34 @@ def fetch_to_file(sources: list, part: str, abandoned=None, progress=None) -> st
     it answers True; `progress(done, total)` is told how far along it is, with
     a total of 0 when the CDN didn't say. Raises on anything else — the caller
     decides what a failed download means.
+
+    One `Session` for the whole track, because a hi-res track is not one
+    request: the real cached 24/48 FLAC (175.9 s, 29,575,234 bytes) parses to
+    **45 media segments plus an initialization segment**, mean 657 KB each. A
+    bare `requests.get` builds its own connection pool and its own TLS
+    connection every time, so that was 46 handshakes to the same host.
+    Measured over loopback HTTPS, 46 x 657 KB, median of 5:
+
+        no added latency                  0.250 s  ->  0.032 s  (7.8x)
+        +40 ms per connection setup       2.430 s  ->  0.086 s  (+2.34 s)
+
+    — the second row models TCP+TLS against a CDN at a 20 ms RTT. Nothing
+    user-visible waits on the *cache* copy, but the deliberate-download
+    progress bar is watched, and 45 avoidable handshakes per track is
+    CDN-side load ticli has no business creating.
+
+    Per call, not module-level: the `with` closes the pool on the way out —
+    including the abandoned path, which raises through it — so an abandoned
+    download cannot leave sockets alive, and the cache thread and a download
+    job never share one. Failure behaviour is unchanged: a segment that 4xxes
+    still raises out of `raise_for_status` at the same place.
     """
     ext = DEFAULT_AUDIO_EXT
     done = 0
     total = 0
-    with open(part, "wb") as handle:
+    with requests.Session() as session, open(part, "wb") as handle:
         for index, source in enumerate(sources):
-            with requests.get(source, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
+            with session.get(source, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
                 response.raise_for_status()
                 if index == 0:
                     # The first segment describes the container the whole file

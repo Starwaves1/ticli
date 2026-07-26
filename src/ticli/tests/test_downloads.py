@@ -25,6 +25,7 @@ import pytest
 
 from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
+from ticli.tests.fakes import patch_get
 from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
 from ticli.utils import downloads, tags
@@ -80,9 +81,20 @@ class _Server:
     def __init__(self, routes):
         self.routes = routes
         self.hits = []
+        # One entry per accepted TCP connection, which is what a keep-alive
+        # session buys and a fresh `requests.get` per segment does not
+        self.connections = []
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            # HTTP/1.0 closes after every response, so without this the
+            # connection count could never tell the two apart
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                outer.connections.append(1)
+                return super().setup()
+
             def do_GET(self):
                 outer.hits.append(self.path)
                 body = outer.routes.get(self.path)
@@ -98,7 +110,8 @@ class _Server:
             def log_message(self, *a):
                 pass
 
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def url(self, path):
@@ -182,7 +195,7 @@ class TestEstimatesCostNothing:
         def _forbidden(*a, **kw):
             raise AssertionError("a size estimate made a network request")
 
-        monkeypatch.setattr(player_mod.requests, "get", _forbidden)
+        patch_get(monkeypatch, player_mod, _forbidden)
         p = _player()
         p._download_track = _track(duration=197)
         estimates = {tier: p._download_estimate(tier)
@@ -201,8 +214,8 @@ class TestEstimatesCostNothing:
         assert downloads.format_bytes(0) == "—"
 
     def test_the_screen_shows_all_four_estimates_and_one_action(self, monkeypatch):
-        monkeypatch.setattr(player_mod.requests, "get",
-                            lambda *a, **k: pytest.fail("no requests here"))
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: pytest.fail("no requests here"))
         p = _player(quality="LOSSLESS")
         p._download_track = _track(duration=197)
         p._download_cursor = 2  # LOSSLESS
@@ -378,6 +391,82 @@ class TestASegmentedDownload:
             server.close()
 
 
+class TestOneConnectionPerTrack:
+    """46 requests to one host should not be 46 TLS handshakes.
+
+    The real cached hi-res track (FLAC 24/48, 175.9 s, 29,575,234 bytes)
+    parses to 45 media segments plus an initialization segment. Measured over
+    loopback HTTPS, 46 x 657 KB, median of 5: 0.250 s with a fresh
+    `requests.get` per segment against 0.032 s with one `Session`, and with a
+    40 ms per-connection setup delay modelling TCP+TLS at a 20 ms RTT CDN,
+    2.430 s against 0.086 s — **+2.3 s and 45 avoidable handshakes per track**.
+    """
+
+    def _segmented(self, count=8):
+        init = _mp4(audio=b"")[:120]
+        parts = [bytes([65 + i]) * 4000 for i in range(count)]
+        routes = {"/init.mp4": init}
+        routes.update({f"/s{i}.mp4": part for i, part in enumerate(parts)})
+        return init, parts, _Server(routes)
+
+    def test_every_segment_of_a_track_shares_one_connection(self):
+        init, parts, server = self._segmented()
+        try:
+            urls = [server.url("/init.mp4")] + \
+                [server.url(f"/s{i}.mp4") for i in range(len(parts))]
+            part = str(cache_mod.CACHE_DIR / "seg.part")
+            cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            player_mod.fetch_to_file(urls, part)
+
+            assert len(server.hits) == 9, "every segment should still be fetched"
+            assert open(part, "rb").read() == init + b"".join(parts)
+            assert len(server.connections) == 1, \
+                f"{len(server.connections)} connections for one track"
+        finally:
+            server.close()
+
+    def test_the_pool_is_closed_when_a_download_is_abandoned(self, monkeypatch):
+        """Per call, not module-level: an abandoned download must not leave a
+        connection pool alive behind it."""
+        class _Response:
+            headers = {"Content-Type": "audio/mp4"}
+
+            def raise_for_status(self):
+                pass
+
+            def iter_content(self, size):
+                yield b"x" * 100
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                return False
+
+        sessions = patch_get(monkeypatch, player_mod, lambda *a, **k: _Response())
+        part = str(cache_mod.CACHE_DIR / "abandoned.part")
+        cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with pytest.raises(player_mod._DownloadSuperseded):
+            player_mod.fetch_to_file(["https://cdn/1.mp4"], part,
+                                     abandoned=lambda: True)
+        assert sessions and all(s.closed for s in sessions)
+
+    def test_a_segment_that_fails_still_raises(self, monkeypatch):
+        """The failure path is unchanged: a 4xx mid-track raises where it
+        always did, out of `raise_for_status`."""
+        init, parts, server = self._segmented(count=3)
+        try:
+            urls = [server.url("/init.mp4"), server.url("/s0.mp4"),
+                    server.url("/gone.mp4"), server.url("/s2.mp4")]
+            part = str(cache_mod.CACHE_DIR / "broken.part")
+            cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            with pytest.raises(Exception):
+                player_mod.fetch_to_file(urls, part)
+            assert "/s2.mp4" not in server.hits, "it kept going after a failure"
+        finally:
+            server.close()
+
+
 class TestPartialFilesAreNeverServed:
     def test_the_destination_does_not_exist_until_the_bytes_are_whole(self, monkeypatch):
         """A `.part` under a dot-prefixed scratch name, renamed only when the
@@ -406,8 +495,7 @@ class TestPartialFilesAreNeverServed:
             def __exit__(self, *e):
                 return False
 
-        monkeypatch.setattr(player_mod.requests, "get",
-                            lambda *a, **k: _Response())
+        patch_get(monkeypatch, player_mod, lambda *a, **k: _Response())
         p = _player()
         track = _track()
         track.get_stream = lambda: types.SimpleNamespace(
@@ -444,7 +532,7 @@ class TestPartialFilesAreNeverServed:
             def __exit__(self, *e):
                 return False
 
-        monkeypatch.setattr(player_mod.requests, "get", lambda *a, **k: _Response())
+        patch_get(monkeypatch, player_mod, lambda *a, **k: _Response())
         p = _player()
         track = _track()
         track.get_stream = lambda: types.SimpleNamespace(
@@ -522,8 +610,8 @@ class TestManualDeletion:
                 pass
 
         monkeypatch.setattr(player_mod.subprocess, "Popen", _Proc)
-        monkeypatch.setattr(player_mod.requests, "get",
-                            lambda *a, **k: pytest.fail("no fetch expected"))
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: pytest.fail("no fetch expected"))
         audio = AudioPlayer("mpv", cache=MetadataCache(songs=False))
         gone = str(downloads.download_dir() / "not" / "there.m4a")
         audio.play_url("http://cdn.example/t.mp4", local=gone)

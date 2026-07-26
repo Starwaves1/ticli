@@ -504,6 +504,34 @@ shared machine is a flaky test waiting to happen. One index read for both
 numbers, no growth with the library, zero re-measures across ten repaints, and
 a re-measure when the page is opened.
 
+### F7 — 46 TLS handshakes per hi-res track
+
+The real cached hi-res track (FLAC 24/48, 175.9 s, 29,575,234 bytes) parses to
+**45 media segments plus an initialization segment**, mean 657 KB each — so a
+hi-res download is 46 sequential `requests.get` calls, each building its own
+Session, its own pool and its own TLS connection. Loopback HTTPS, 46 × 657 KB,
+median of 5:
+
+| | fresh `requests.get` | one `Session` | delta |
+|---|---|---|---|
+| no added latency | 0.250 s | 0.032 s | 7.8× |
+| +40 ms per connection setup (TCP+TLS at a 20 ms RTT CDN) | 2.430 s | 0.086 s | **+2.34 s** |
+
+One `requests.Session()` per call of `fetch_to_file`, in the same `with` as
+the output handle. Per call rather than module-level: the `with` closes the
+pool on every path out including the abandoned one, so an abandoned download
+cannot leave sockets alive, and the cache thread and a download job never
+share one.
+
+**The test fakes had to move with it.** Six sites replaced `requests.get`,
+which `fetch_to_file` no longer calls — a fake of a function production has
+stopped calling is INCIDENTS #2's shape exactly. `tests/fakes.py` now has one
+`patch_get` that replaces `requests.get` *and* `requests.Session().get`
+together, so nothing has to remember. Asserted over a real loopback server
+with `protocol_version = "HTTP/1.1"` and a per-connection counter: nine
+segments, **one** connection, bytes identical; plus the pool closed on an
+abandoned download, and a mid-track 404 still raising where it always did.
+
 ---
 
 ## In flight at time of writing

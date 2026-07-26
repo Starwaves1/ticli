@@ -18,6 +18,7 @@ import tidalapi
 
 from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
+from ticli.tests.fakes import patch_get
 from ticli.utils import config as config_mod
 from ticli.utils import credential_store as store
 
@@ -607,7 +608,7 @@ class TestSegmentedPlayback:
             fetched.append(url)
             return _Response(url)
 
-        monkeypatch.setattr(player_mod.requests, "get", _get)
+        patch_get(monkeypatch, player_mod, _get)
         audio = player_mod.AudioPlayer.__new__(player_mod.AudioPlayer)
         audio.player_cmd = "mpv"
         audio.cache = None
