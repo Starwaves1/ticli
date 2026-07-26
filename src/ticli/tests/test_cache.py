@@ -1658,7 +1658,9 @@ class TestClearCacheAction:
         p._cache.invalidate_audio_count()
         rendered = p._build_settings_display().plain
         # like "[o] log out", with what the cache is actually costing
-        assert "1 song cached · 0.000 GB   [x] clear cache" in rendered
+        # like "[o] log out", with what the cache is actually costing
+        assert "Cache         1 song  · 0.000 GB of 2.000 GB   [x] clear" \
+            in rendered
 
     def test_the_footer_still_fits_eighty_columns(self):
         """The settings footer is already exactly as wide as the panel allows,
@@ -1782,14 +1784,15 @@ class TestDiskUsageOnScreen:
     def test_an_empty_cache_reads_zero(self):
         p = self._settings()
         rendered = p._build_settings_display().plain
-        assert "0 songs cached · 0.000 GB" in rendered
+        assert "Cache         0 songs · 0.000 GB of 2.000 GB" in rendered
 
     def test_the_total_is_what_is_really_on_disk(self):
         p = self._settings()
         self._song("12.m4a", size=3 * 1024 ** 2)
         self._song("13.m4a", size=1024 ** 2)
         p._cache.invalidate_audio_count()
-        assert "2 songs cached · 0.004 GB" in p._build_settings_display().plain
+        assert "Cache         2 songs · 0.004 GB" \
+            in p._build_settings_display().plain
 
     def test_the_row_fits_eighty_columns_even_when_full(self, monkeypatch):
         """A full cache reads longer than an empty one — 12.500 GB across a
@@ -1805,9 +1808,9 @@ class TestDiskUsageOnScreen:
             console.print(p._build_display())
         lines = cap.get().splitlines()
         assert all(len(line) <= 80 for line in lines)
-        matched = [l for l in lines if "clear cache" in l]
+        matched = [l for l in lines if "[x] clear" in l]
         assert matched, "the cache line is missing"
-        assert "9999 songs cached · 12.500 GB" in matched[0], "the row wrapped"
+        assert "9999 songs · 12.500 GB" in matched[0], "the row wrapped"
 
     def test_it_is_measured_once_and_remembered(self, monkeypatch):
         """No stat-per-frame: the settings page repaints on every keystroke."""
@@ -1835,7 +1838,8 @@ class TestDiskUsageOnScreen:
         p._handle_settings_key("x")
         p._handle_key("y")
 
-        assert "0 songs cached · 0.000 GB" in p._build_settings_display().plain
+        assert "Cache         0 songs · 0.000 GB" \
+            in p._build_settings_display().plain
 
     def test_eviction_moves_the_number_back(self):
         cache = MetadataCache(budget_gb=0)

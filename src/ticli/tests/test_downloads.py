@@ -67,6 +67,17 @@ def _track(tid=42, duration=200, cover=None):
     )
 
 
+def _rendered(player) -> str:
+    """The whole pane as plain text, confirmations and all."""
+    from rich.console import Console
+
+    console = Console(width=100, height=40)
+    player.console = console
+    with console.capture() as cap:
+        console.print(player._build_display())
+    return cap.get()
+
+
 def _player(quality="HIGH"):
     p = HeadlessTidalPlayer(quality=quality)
     p.session = types.SimpleNamespace(audio_quality=None, is_pkce=False,
@@ -1070,13 +1081,353 @@ class TestTheSettingsPageIsCheapToPaint:
     def test_opening_the_page_re_measures(self, monkeypatch):
         p = _player()
         p._user_display_name = "Garrett"
-        assert "0 songs downloaded" in p._build_settings_display().plain
+        assert "Downloads     0 songs" in p._build_settings_display().plain
         self._library(3)   # e.g. downloaded from another window, or by hand
         p._handle_key("c")
-        assert "3 songs downloaded" in p._build_settings_display().plain
+        assert "Downloads     3 songs" in p._build_settings_display().plain
+
+
+class TestTheTwoTiersReadAsTwoTiers:
+    """Garrett: "Downloaded songs should not count towards cache limit…
+    both should have a disk usage metric… good cached/downloaded buttons and
+    metrics." Two rows of one little table, so the numbers can be read against
+    each other, and each row carries only what is true of its own tier."""
+
+    def _page(self, songs, song_bytes, kept, kept_bytes, budget=2):
+        p = _player()
+        p._user_display_name = "Garrett"
+        p.config["cache_budget_gb"] = budget
+        p._cache.audio_count = lambda: songs
+        p._cache.disk_bytes = lambda: song_bytes
+        p._download_usage = lambda: (kept, kept_bytes)
+        return p._build_settings_display().plain
+
+    def test_the_cache_is_shown_against_its_budget(self):
+        gb = cache_mod.BYTES_PER_GB
+        text = self._page(12, gb // 2, 0, 0, budget=4)
+        assert "Cache        12 songs · 0.500 GB of 4.000 GB" in text
+
+    def test_the_downloads_carry_no_budget_and_say_so(self):
+        gb = cache_mod.BYTES_PER_GB
+        text = self._page(0, 0, 3, 3 * gb)
+        assert "Downloads     3 songs · 3.000 GB · not counted against" in text
+        # No [x] on the downloads row: nothing in ticli deletes a track
+        # somebody asked for
+        rows = [line for line in text.splitlines() if "Downloads" in line]
+        assert rows and "[x]" not in rows[0]
+
+    def test_the_two_numbers_line_up(self):
+        """The point of the redesign: they are meant to be compared."""
+        gb = cache_mod.BYTES_PER_GB
+        text = self._page(7, gb, 1234, 9 * gb)
+        rows = [line for line in text.splitlines()
+                if line.startswith(("   Cache ", "   Downloads "))]
+        assert len(rows) == 2, rows
+        assert rows[0].index("·") == rows[1].index("·")
+
+    def test_the_page_fits_eighty_by_twentyfour_with_every_action_on_it(self):
+        """The bar `9c96d63` set, and the one Garrett restated: fit at 80x24
+        with [x], [o] and [u] on screen. Below that, degraded is fine."""
+        from rich.console import Console
+
+        gb = cache_mod.BYTES_PER_GB
+        p = _player()
+        p._mode = p.MODE_SETTINGS
+        p._user_display_name = "Garrett"
+        p._cache.audio_count = lambda: 9999
+        p._cache.disk_bytes = lambda: 12 * gb
+        p._download_usage = lambda: (9999, 12 * gb)
+        console = Console(width=80, height=24)
+        p.console = console
+        with console.capture() as cap:
+            console.print(p._build_display())
+        lines = cap.get().splitlines()
+        assert len(lines) <= 24, f"the pane is {len(lines)} rows in a 24-row window"
+        assert all(len(line) <= 80 for line in lines)
+        rendered = "\n".join(lines)
+        for key in ("[x]", "[o]", "[u]", "[R]"):
+            assert key in rendered, f"{key} fell off the page"
+
+
+class TestReFetchingEverything:
+    """The one action in the app that deliberately makes hundreds of requests.
+
+    ai/INCIDENTS #1 is 53 `playbackinfo` calls in 2.8 s getting the owner's IP
+    blocked and his music stopping. So the tests here are about the brakes:
+    that it asks first, that it is serial and paced, that it can be stopped,
+    and that evidence of a block ends it rather than being retried.
+    """
+
+    def _library(self, downloaded=(), cached=()):
+        p = _player(quality="HIRES")
+        root = downloads.download_dir()
+        for tid, granted in downloaded:
+            path = root / "A" / "B" / f"{tid:02d} T.m4a"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"music")
+            downloads.record(tid, path.relative_to(root), "HIGH", 5,
+                             granted=granted)
+        for tid, granted in cached:
+            directory = cache_mod.audio_dir()
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{tid}.m4a").write_bytes(b"music")
+            p._cache.note_cached(tid, ".m4a", 5, quality=granted)
+        return p
+
+    # ── what it says it will do ──
+
+    def test_it_counts_both_tiers(self):
+        p = self._library(downloaded=[(1, "HIGH")], cached=[(2, "LOSSLESS")])
+        plan = p._refetch_candidates()
+        assert plan["downloads"] == ["1"]
+        assert plan["cache"] == ["2"]
+
+    def test_anything_already_at_the_target_tier_is_left_alone(self):
+        p = self._library(downloaded=[(1, "HI_RES_LOSSLESS")],
+                          cached=[(2, "HI_RES_LOSSLESS")])
+        plan = p._refetch_candidates()
+        assert plan["downloads"] == [] and plan["cache"] == []
+        assert plan["skipped"] == 2
+
+    def test_a_download_also_in_the_cache_is_only_counted_once(self):
+        p = self._library(downloaded=[(1, "HIGH")], cached=[(1, "HIGH")])
+        plan = p._refetch_candidates()
+        assert plan["downloads"] == ["1"] and plan["cache"] == []
+
+    def test_a_file_deleted_by_hand_is_not_re_fetched(self):
+        p = self._library(downloaded=[(1, "HIGH")])
+        downloads.path_for(1).unlink()
+        assert p._refetch_candidates()["downloads"] == []
+
+    def test_the_plan_costs_no_network(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HIGH")], cached=[(2, "HIGH")])
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: pytest.fail("counting made a request"))
+        p.session.track = lambda tid: pytest.fail("counting resolved a track")
+        assert p._refetch_candidates()["bytes"] == 10
+
+    # ── it asks first ──
+
+    def test_nothing_happens_until_the_confirmation_is_answered(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HIGH")])
+        started = []
+        monkeypatch.setattr(p, "_start_refetch_job", lambda: started.append(1))
+        p._mode = p.MODE_SETTINGS
+        p._handle_key("R")
+        assert p._refetch_pending is True
+        assert started == [], "it started before it asked"
+
+        rendered = _rendered(p)
+        assert "Re-fetch 1 song at HIRES?" in rendered
+        assert "About" in rendered, "it did not say how much it would fetch"
+
+    def test_any_other_key_is_a_true_no_op(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HIGH")])
+        started = []
+        monkeypatch.setattr(p, "_start_refetch_job", lambda: started.append(1))
+        p._mode = p.MODE_SETTINGS
+        p._handle_key("R")
+        p._handle_key("n")
+        assert started == []
+        assert p._refetch_pending is False and p._refetch_plan is None
+
+    def test_y_starts_it(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HIGH")])
+        started = []
+        monkeypatch.setattr(p, "_start_refetch_job", lambda: started.append(1))
+        p._mode = p.MODE_SETTINGS
+        p._handle_key("R")
+        p._handle_key("y")
+        assert started == [1]
+
+    def test_with_nothing_to_do_it_says_so_rather_than_starting(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HI_RES_LOSSLESS")])
+        p._mode = p.MODE_SETTINGS
+        p._handle_key("R")
+        assert "already at HIRES" in _rendered(p)
+
+    # ── the brakes ──
+
+    def test_it_is_serial_and_paced(self, monkeypatch):
+        """One at a time, and never faster than REFETCH_MIN_INTERVAL between
+        the *starts* — so a run of instant failures cannot become a burst."""
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.3)
+        p = self._library(downloaded=[(1, "HIGH"), (2, "HIGH"), (3, "HIGH")])
+        starts = []
+        overlapping = []
+        running = []
+
+        def _one(kind, key, tier, gen):
+            starts.append(time.monotonic())
+            overlapping.append(len(running))
+            running.append(key)
+            time.sleep(0.02)
+            running.pop()
+
+        monkeypatch.setattr(p, "_refetch_one", _one)
+        p._start_refetch_job()
+        assert _wait_for(lambda: (p._refetch_job or {}).get("state") == "done", 10)
+
+        assert len(starts) == 3
+        assert overlapping == [0, 0, 0], "two tracks were fetched at once"
+        gaps = [b - a for a, b in zip(starts, starts[1:])]
+        assert all(g >= 0.28 for g in gaps), f"paced too fast: {gaps}"
+
+    def test_a_rate_limit_stops_everything_and_retries_nothing(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.01)
+        p = self._library(downloaded=[(1, "HIGH"), (2, "HIGH"), (3, "HIGH")])
+        seen = []
+
+        def _one(kind, key, tier, gen):
+            seen.append(key)
+            raise RuntimeError("429 Too Many Requests")
+
+        monkeypatch.setattr(p, "_refetch_one", _one)
+        p._start_refetch_job()
+        assert _wait_for(lambda: (p._refetch_job or {}).get("state") == "blocked", 10)
+
+        assert seen == ["1"], "it kept going after TIDAL said stop"
+        assert "rate-limiting" in p._toast
+
+    def test_a_streaming_privileges_401_stops_it_too(self):
+        # The escalation the incident actually hit, once 429s were ignored
+        assert player_mod._looks_rate_limited(
+            "401 subStatus 4006 Session does not have streaming privileges")
+        assert not player_mod._looks_rate_limited("404 Not Found")
+
+    def test_one_failure_does_not_stop_the_rest(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.01)
+        p = self._library(downloaded=[(1, "HIGH"), (2, "HIGH")])
+
+        def _one(kind, key, tier, gen):
+            if key == "1":
+                raise RuntimeError("that one is gone")
+
+        monkeypatch.setattr(p, "_refetch_one", _one)
+        p._start_refetch_job()
+        assert _wait_for(lambda: (p._refetch_job or {}).get("state") == "done", 10)
+        assert p._refetch_job["done"] == 1 and p._refetch_job["failed"] == 1
+
+    def test_esc_stops_it_and_it_stays_stopped(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.05)
+        p = self._library(downloaded=[(i, "HIGH") for i in range(1, 8)])
+        seen = []
+
+        def _one(kind, key, tier, gen):
+            seen.append(key)
+            time.sleep(0.05)
+
+        monkeypatch.setattr(p, "_refetch_one", _one)
+        p._mode = p.MODE_SETTINGS
+        p._start_refetch_job()
+        assert _wait_for(lambda: len(seen) >= 2, 5)
+        p._handle_key(player_mod.KEY_ESC)
+
+        assert p._mode == p.MODE_SETTINGS, "Esc left the page instead of stopping"
+        stopped_at = len(seen)
+        time.sleep(0.4)
+        assert len(seen) <= stopped_at + 1, "it kept fetching after being stopped"
+        assert "cancelled" in p._toast
+
+    def test_a_second_press_does_not_start_a_second_run(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.05)
+        p = self._library(downloaded=[(i, "HIGH") for i in range(1, 6)])
+        runs = []
+        monkeypatch.setattr(p, "_refetch_one",
+                            lambda *a: (runs.append(1), time.sleep(0.05)))
+        p._start_refetch_job()
+        p._start_refetch_job()
+        p._start_refetch_job()
+        time.sleep(0.3)
+        p._cancel_refetch()
+        assert len(runs) <= 5, "held [R] fanned out into more than one run"
+
+    # ── it says what it is doing ──
+
+    def test_progress_is_on_the_page_while_it_runs(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.05)
+        p = self._library(downloaded=[(i, "HIGH") for i in range(1, 5)])
+        monkeypatch.setattr(p, "_refetch_one", lambda *a: time.sleep(0.05))
+        p._user_display_name = "Garrett"
+        p._start_refetch_job()
+        assert _wait_for(lambda: (p._refetch_job or {}).get("done", 0) >= 1, 5)
+        rendered = p._build_settings_display().plain
+        assert "Re-fetching at HIRES" in rendered
+        assert "/4" in rendered
+        assert "[Esc]" in rendered
+        p._cancel_refetch()
+
+    # ── and the bytes really change ──
+
+    def test_a_cached_song_is_replaced_with_the_new_tier(self, monkeypatch):
+        """End to end over a loopback server: the file on disk afterwards is
+        the bytes the server sent, and the tracker says the new tier."""
+        fresh = _mp4(audio=b"HI-RES" * 5000)
+        server = _Server({"/hires.mp4": fresh})
+        try:
+            p = self._library(cached=[(42, "HIGH")])
+            p.audio = player_mod.AudioPlayer("mpv", cache=p._cache)
+            real = _track(42)
+            real.get_stream = lambda: types.SimpleNamespace(
+                audio_quality="HI_RES_LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: [server.url("/hires.mp4")]))
+            p.session.track = lambda tid: real
+
+            p._refetch_one("cache", "42", "HIRES", p._refetch_gen)
+
+            landed = cache_mod.cached_audio_path(42)
+            assert landed is not None
+            assert open(landed, "rb").read() == fresh
+            assert p._cache.audio_record(42)["quality"] == "HI_RES_LOSSLESS"
+        finally:
+            server.close()
+
+    def test_a_downloaded_song_is_replaced_in_the_music_folder(self):
+        fresh = _mp4(audio=b"BETTER" * 5000)
+        server = _Server({"/hires.mp4": fresh})
+        try:
+            p = self._library(downloaded=[(42, "HIGH")])
+            real = _track(42)
+            real.get_stream = lambda: types.SimpleNamespace(
+                audio_quality="HI_RES_LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: [server.url("/hires.mp4")]))
+            p.session.track = lambda tid: real
+
+            p._refetch_one("download", "42", "HIRES", p._refetch_gen)
+
+            landed = downloads.path_for(42)
+            assert landed is not None and landed.exists()
+            assert b"BETTER" in landed.read_bytes()
+            assert downloads.load_index()["42"]["granted"] == "HI_RES_LOSSLESS"
+            # The old file was at a different path (the index row is rewritten
+            # too), and nothing in the folder is a leftover of it
+            files = sorted(f.name for f in downloads.download_dir().rglob("*")
+                           if f.is_file())
+            assert files == ["08 Get Lucky.m4a"], files
+        finally:
+            server.close()
+
+    def test_a_blocked_run_says_so_on_the_page(self):
+        p = self._library()
+        p._refetch_job = {"state": "blocked", "done": 3, "error": "429"}
+        p._user_display_name = "Garrett"
+        rendered = p._build_settings_display().plain
+        assert "rate-limiting" in rendered
+        assert "nothing retried" in rendered
 
 
 class TestSettingsShowsTheFolder:
+    def test_the_folder_is_shown_as_a_full_absolute_path(self):
+        """Garrett asked for the absolute path rather than `~/Music/Ticli` —
+        one you can paste into Finder. Not `resolve()`, which on macOS turns
+        /Users/... into /System/Volumes/Data/Users/... through the firmlink."""
+        shown = downloads.display_dir()
+        assert shown.startswith("/")
+        assert "~" not in shown
+        assert "/System/Volumes/Data/" not in shown
+
     def test_the_path_and_the_count_are_on_the_settings_page(self):
         root = downloads.download_dir()
         path = root / "A" / "B" / "01 T.m4a"
@@ -1088,7 +1439,8 @@ class TestSettingsShowsTheFolder:
         p._user_display_name = "Garrett"
         text = p._build_settings_display().plain
         assert str(root) in text
-        assert "1 song downloaded" in text
-        # Why they are exempt is prose, and prose is what a short window drops
-        # first (see _fit_levers) — the count and the path are not
-        assert "never evicted and never counted against the cache budget" in text
+        assert "Downloads     1 song " in text
+        # Exemption from the budget is a fact about the number beside it, not
+        # prose about the feature, so it is on the row and survives a short
+        # window the way the count and the path do
+        assert "not counted against the budget" in text

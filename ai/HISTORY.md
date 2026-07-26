@@ -639,6 +639,75 @@ The download index now records `granted` beside `quality` for the same reason
 — `quality` is what the user asked for and what the screen says, `granted` is
 what TIDAL served and the only one that can be compared with anything.
 
+### Re-fetch everything at the current quality, and two tiers that read as two
+
+Three requests from Garrett, and they turned out to be one screen.
+
+**`[R]` re-fetches every local copy at the tier currently selected** — both
+tiers, because he asked for "specifically downloaded songs as well as cached
+songs". Downloads go back into `~/Music/Ticli` through the same
+`_download_to_music` the download screen uses (tagged, and the old file
+removed if the container changed); cached songs go back into the cache.
+
+This is **the most rate-limit-dangerous thing in the app**, and the incident
+it could repeat is the worst one in this project's history — 53 `playbackinfo`
+calls in 2.8 s got the owner's IP blocked and his music stopped mid-session.
+So the design question was not "how fast can this go" but "how do we make it
+impossible for a user to do that to themselves". Four answers, all structural:
+
+* **Serial.** One track, one thread, no fan-out, nothing to tune.
+* **Paced.** `REFETCH_MIN_INTERVAL` (2 s) between the *starts*, so a run of
+  instant failures cannot become a burst. A track is two requests (resolve,
+  then stream), so the ceiling is about one request a second and the sustained
+  rate is far below that — an order of magnitude under the 19/s that caused
+  the block.
+* **Interruptible.** A generation counter, bumped by `Esc`, checked before
+  every track *and* passed into `fetch_to_file` as its `abandoned` callback,
+  so a cancel lands inside a chunk read rather than at the end of a 30 MB
+  file. On this page `Esc` stops the run rather than leaving, so the key that
+  starts the only long job here is also the key that stops it.
+* **Stop, never retry, on evidence of a block.** A 429, or a 401 with
+  subStatus 4006, ends the whole run and says so in red. Retrying is what
+  turned a rate limit into an edge block.
+
+And opt-in twice: a key, then a confirmation that says how many songs, roughly
+how many bytes and roughly how long *before* anything is fetched. The estimate
+is the size already recorded against each copy, so it costs nothing — asking
+TIDAL for real sizes would be one request per track, which is the pattern that
+caused the incident. Copies already at the target tier are skipped and counted,
+because spending a request to be handed back the file you already have is the
+opposite of the point.
+
+**The two tiers now read as two rows of one small table:**
+
+```
+   Cache      9999 songs · 12.000 GB of 2.000 GB   [x] clear
+   Downloads  9999 songs · 12.000 GB · not counted against the budget
+   /Users/garrett/Music/Ticli   [R] re-fetch all at HIRES
+```
+
+Aligned, so the two numbers can be read against each other — which was the
+point of the request. Each row carries only what is true of its own tier: the
+cache has a budget and an `[x]`, the downloads have a folder and neither,
+because nothing in ticli deletes a track somebody asked for and their bytes are
+not the cache's to reclaim. `of`, not `/`, because the budget can be 0 and a
+fraction with a zero denominator reads as broken. Three decimals, as before.
+
+The folder is now the **full absolute path** — `expanduser()`, deliberately
+not `resolve()`, which on macOS rewrites `/Users/garrett/…` to
+`/System/Volumes/Data/Users/garrett/…` through the firmlink: accurate and
+unreadable. `[R]` shares that line, and which of the two goes first depends on
+what fits, with the tie-break stated: a path that runs off the end is a
+truncated path, an action that runs off the end is a feature nobody can find.
+A run in progress takes the line for the same reason, only more so.
+
+Fits 80x24 with `[x]`, `[o]`, `[u]` and `[R]` all on screen and three settings
+rows, and overflows at no size (checked 40x15 through 120x40). Below 80x24 it
+is degraded and that is explicitly fine.
+
+The settings readouts are cheap by construction now: the cache's from the
+tracker, the downloads' from one memoised index read.
+
 ---
 
 ## In flight at time of writing

@@ -451,6 +451,38 @@ PLAYER_ERROR_SECONDS = 8.0
 # stopped 164 seconds short.
 STREAM_TRUNCATED_MARGIN = 15.0
 
+# The floor between the start of one track and the next in a bulk re-fetch.
+# Two requests per track (resolve, then stream), so the ceiling is about one
+# request a second — an order of magnitude below the 19/s burst that got the
+# owner's IP blocked, and in practice far slower because each track is also
+# fetched. See _start_refetch_job for why every part of this is structural.
+REFETCH_MIN_INTERVAL = 2.0
+
+# What TIDAL saying "stop" looks like in an exception. On any of these the
+# rule (ai/WORKING-RULES.md) is to stop making requests entirely and report —
+# never to retry, which is what turned a rate limit into an edge block.
+RATE_LIMIT_SIGNS = ("429", "too many requests", "4006",
+                    "does not have streaming privileges")
+
+
+def _rough_minutes(tracks: int) -> str:
+    """How long a paced re-fetch of `tracks` songs will take, said the way a
+    person would. The floor is the only part that is knowable without the
+    network, so this is a lower bound and reads as one."""
+    seconds = tracks * REFETCH_MIN_INTERVAL
+    if seconds < 90:
+        return "a minute or so"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"at least {minutes} minutes"
+    hours = minutes / 60
+    return f"at least {hours:.1f} hours"
+
+
+def _looks_rate_limited(message: str) -> bool:
+    lowered = (message or "").lower()
+    return any(sign in lowered for sign in RATE_LIMIT_SIGNS)
+
 # Ascending, so "did TIDAL give us less than we asked for?" is a comparison.
 # Keys are tidalapi's own Quality values, which is what a Stream reports back
 # as the tier it actually granted.
@@ -1714,6 +1746,15 @@ class HeadlessTidalPlayer:
         # listen is one point however many ticks go past (see
         # _maybe_count_play). -1 is "none yet", which no gen ever is.
         self._play_counted = -1
+        # "Re-fetch everything at the current quality": one job, a generation
+        # counter that cancels it, and a whole-dict state the paint thread
+        # reads. See _start_refetch_job.
+        self._refetch_job = None
+        self._refetch_gen = 0
+        # What [R] is about to do, held between the key and the answer —
+        # nothing is touched until the confirmation comes back
+        self._refetch_plan = None
+        self._refetch_pending = False
         # Transient toast message
         self._toast = ""
         self._toast_until = 0.0
@@ -3623,36 +3664,54 @@ class HeadlessTidalPlayer:
                 f"\n   Overridden this run by --quality {self._quality_name}",
                 style="dim yellow",
             )
-        # Shown like logout, for the same reason: an action the page offers,
-        # which the value table above has no way to express
-        # Bare gigabytes, not "x / y GB": the budget is its own row above and
-        # can be 0, which would read as a broken fraction down here
+        # The two tiers, as two rows of the same little table. They are
+        # different in lifetime and ownership, so what each row says is
+        # different too: the cache has a budget and an [x], the downloads have
+        # a folder and neither — nothing in ticli deletes a track somebody
+        # asked for, and their bytes are not the cache's to reclaim. Aligned
+        # labels rather than two prose sentences, because the whole point of
+        # the request was to be able to read the two numbers against each
+        # other. Fits 80 columns; below that it degrades like everything else.
         songs = self._cache.audio_count()
-        content.append(
-            f"\n\n   {songs} song{'' if songs == 1 else 's'} cached"
-            f" · {format_gb(self._cache.disk_bytes())}", style="dim")
-        content.append("   [x]", style="bold")
-        content.append(" clear cache", style="dim")
-        # Downloads are the other tier and read as one: their own folder, their
-        # own count, and deliberately no budget and no [x] — nothing in ticli
-        # deletes a track somebody asked for. Saying where they are is the
-        # whole point of the line; a folder you cannot find is not user-owned.
-        # One index read for both numbers, and remembered until something
-        # moves them: this pair used to be two calls that each re-read and
-        # re-parsed downloads.json once per track, i.e. 229 ms of UI-thread
-        # JSON at 500 downloads, twice a second while the page is open
+        # One index read for both download numbers, and remembered until
+        # something moves them: this pair used to be two calls that each
+        # re-read and re-parsed downloads.json once per track, i.e. 229 ms of
+        # UI-thread JSON at 500 downloads, twice a second while the page open
         kept, kept_bytes = self._download_usage()
+        content.append("\n\n   Cache      ", style="dim")
+        content.append(f"{songs:>4} song{' ' if songs == 1 else 's'}", style="dim")
+        # "of", not "/", because the budget can be 0 and a fraction with a
+        # zero denominator reads as broken rather than as "no room"
         content.append(
-            f"\n   {kept} song{'' if kept == 1 else 's'} downloaded"
-            f" · {format_gb(kept_bytes)}", style="dim")
-        # Where they are is the point of the line and survives a short window;
-        # *why* they are exempt from the budget is prose and goes with the rest
-        # of it, which is what keeps [x], [o] and [u] on screen at 80x24
-        content.append(f"   {downloads.display_dir()}", style="dim")
-        if prose:
-            content.append(
-                "\n   Downloads are never evicted and never counted against"
-                " the cache budget", style="dim")
+            f" · {format_gb(self._cache.disk_bytes())}"
+            f" of {self.config.get('cache_budget_gb', 2)}.000 GB", style="dim")
+        content.append("   [x]", style="bold")
+        content.append(" clear", style="dim")
+        content.append("\n   Downloads  ", style="dim")
+        content.append(f"{kept:>4} song{' ' if kept == 1 else 's'}", style="dim")
+        content.append(f" · {format_gb(kept_bytes)} · not counted against"
+                       " the budget", style="dim")
+        # A path you can paste into Finder or a terminal, with the one action
+        # that spans both tiers beside it — this page has no rows to spare
+        # (80x24 shows three settings rows as it is), so a line of its own for
+        # an action that is only being *offered* would cost one of those.
+        #
+        # Order depends on what fits, and the tie-break is stated: a path that
+        # runs off the end is a truncated path, while an action that runs off
+        # the end is a feature nobody can find. So when both do not fit, the
+        # action goes first and the path is what gets cut.
+        folder = downloads.display_dir()
+        action = self._build_refetch_line()
+        content.append("\n   ", style="")
+        # A run in progress goes first for the same reason, only more so: it
+        # is the only thing on the page that is changing
+        busy = (self._refetch_job or {}).get("state") in ("running", "blocked")
+        if busy or len(folder) + len(action.plain) + 3 > max(self._fit.inner - 3, 20):
+            content.append_text(action)
+            content.append(f"   {folder}", style="dim")
+        else:
+            content.append(folder, style="dim")
+            content.append_text(action)
         # Account lives here rather than on the player screen — it's a thing you
         # look at when you're already in settings, not while listening
         content.append("\n   Logged in as ", style="dim")
@@ -3844,6 +3903,68 @@ class HeadlessTidalPlayer:
         content.append(" keep them, ", style="dim")
         content.append("Esc", style="bold")
         content.append(" cancel", style="dim")
+        return content
+
+    def _build_refetch_line(self) -> Text:
+        """The `[R]` action, or what it is doing right now.
+
+        Three states read differently, the way every other long job here does:
+        an offer, a running count, and how it ended. A run that stopped
+        because TIDAL started rate-limiting says so in red — that is the one
+        outcome the user has to understand, because the rule is that nothing
+        is retried.
+        """
+        content = Text()
+        job = self._refetch_job or {}
+        state = job.get("state")
+        if state == "running":
+            content.append(
+                f"Re-fetching at {job.get('tier', '')} — "
+                f"{job.get('done', 0)}/{job.get('total', 0)}", style="yellow")
+            if job.get("failed"):
+                content.append(f" · {job['failed']} failed", style="dim")
+            content.append("   [Esc]", style="bold")
+            content.append(" stop", style="dim")
+            return content
+        if state == "blocked":
+            content.append(
+                f"Stopped — TIDAL is rate-limiting. {job.get('done', 0)}"
+                " done, nothing retried.", style="red")
+            return content
+        content.append("[R]", style="bold")
+        content.append(f" re-fetch all at {self._quality_name}", style="dim")
+        return content
+
+    def _build_refetch_confirm(self) -> Text:
+        """What `[R]` is about to do, before it does any of it.
+
+        The one operation in the app that deliberately makes a large number of
+        network requests, so it says how many songs and roughly how many bytes
+        *first*. The estimate is the size already recorded for each copy, so
+        it costs nothing — asking TIDAL for real sizes would be one request
+        per track, which is the pattern that caused the incident this is
+        trying not to repeat.
+        """
+        content = Text()
+        plan = self._refetch_plan or {}
+        total = len(plan.get("downloads", [])) + len(plan.get("cache", []))
+        if not total:
+            content.append("\n   Everything is already at "
+                           f"{self._quality_name}. ", style="bold yellow")
+            content.append("Any key to close", style="dim")
+            return content
+        content.append(
+            f"\n   Re-fetch {total} song{'' if total == 1 else 's'}"
+            f" at {self._quality_name}?", style="bold yellow")
+        content.append(
+            f" About {downloads.format_bytes(plan.get('bytes', 0))} over"
+            f" {_rough_minutes(total)}, one at a time.", style="dim")
+        if plan.get("skipped"):
+            content.append(f" {plan['skipped']} already at this quality.",
+                           style="dim")
+        content.append("\n   ", style="")
+        content.append("y", style="bold")
+        content.append(" to start, any other key to cancel", style="dim")
         return content
 
     def _build_clear_cache_confirm(self) -> Text:
@@ -4110,6 +4231,8 @@ class HeadlessTidalPlayer:
             content.append_text(self._build_disable_songs_confirm())
         elif self._clear_cache_pending:
             content.append_text(self._build_clear_cache_confirm())
+        elif self._refetch_pending:
+            content.append_text(self._build_refetch_confirm())
 
         return self._with_footer(content, fit)
 
@@ -5264,67 +5387,287 @@ class HeadlessTidalPlayer:
             self._wake()
 
         def _run():
-            final = None
+            last = [0.0]
+
+            def _progress(done, total):
+                # Cheap enough to call per chunk, but a repaint per chunk is
+                # not — one every quarter second is already faster than the
+                # eye and slower than the monitor's own tick
+                now = time.time()
+                if now - last[0] < 0.25:
+                    return
+                last[0] = now
+                _update(done=done, total=total)
+
             try:
-                real = self._resolve_track(track)
-                if real is None:
-                    raise RuntimeError("track could not be resolved")
-                meta = downloads.track_metadata(real)
-                # The extension is not known until the CDN answers, so the
-                # file is written under a provisional name and moved once the
-                # container has identified itself
-                staging = downloads.download_dir() / f".ticli-{track_id}{downloads.PART_SUFFIX}"
-                staging.parent.mkdir(parents=True, exist_ok=True)
-                last = [0.0]
-
-                def _progress(done, total):
-                    # Cheap enough to call per chunk, but a repaint per chunk
-                    # is not — one every quarter second is already faster than
-                    # the eye and slower than the monitor's own tick
-                    now = time.time()
-                    if now - last[0] < 0.25:
-                        return
-                    last[0] = now
-                    _update(done=done, total=total)
-
-                ext, granted = self._promote_cached_copy(track_id, tier, staging)
-                if ext is None:
-                    url, granted = self._download_stream_url(real, tier)
-                    sources = stream_sources(url)
-                    if not sources:
-                        raise RuntimeError("stream named nothing to fetch")
-                    ext = fetch_to_file(
-                        sources, str(staging),
-                        abandoned=lambda: self._download_job_gen != gen,
-                        progress=_progress)
-                final = downloads.destination(meta, ext)
-                final.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(staging, final)
-                written = tags.write_tags(final, meta, self._cover_bytes(real))
-                size = final.stat().st_size
-                downloads.record(track_id, final.relative_to(downloads.download_dir()),
-                                 tier, size, granted=granted)
-                self._downloads_usage = None  # one more song in the folder
+                final, written, size = self._download_to_music(
+                    track, tier,
+                    abandoned=lambda: self._download_job_gen != gen,
+                    progress=_progress)
                 if self._download_job_gen != gen:
                     return
                 _update(state="done", path=str(final), tags=written,
                         done=size, total=size)
                 self._set_toast(f"Downloaded to {final.parent}")
             except _DownloadSuperseded:
-                self._discard_staging(track_id)
-                if final is not None:
-                    downloads.discard_scratch(final)
+                pass
             except Exception as e:
                 logger.debug("Download failed: %s", e)
-                self._discard_staging(track_id)
-                if final is not None:
-                    downloads.discard_scratch(final)
                 if self._download_job_gen == gen:
                     _update(state="failed", error=str(e)[:PLAYER_ERROR_CHARS])
             finally:
                 self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _download_to_music(self, track, tier: str, abandoned, progress=None):
+        """Put one track in the music folder at `tier`. Returns
+        `(path, tags written, bytes)`; raises on anything that went wrong.
+
+        The single place a download is performed, because there are now three
+        callers — the download screen, and the two halves of "re-fetch
+        everything at the current quality" — and having written it twice is
+        how one of them would quietly stop working. Cleaning up after a
+        failure is in here too, for the same reason.
+        """
+        track_id = getattr(track, "id", None)
+        final = None
+        try:
+            real = self._resolve_track(track)
+            if real is None:
+                raise RuntimeError("track could not be resolved")
+            meta = downloads.track_metadata(real)
+            # The extension is not known until the CDN answers, so the file is
+            # written under a provisional name and moved once the container
+            # has identified itself
+            staging = (downloads.download_dir()
+                       / f".ticli-{track_id}{downloads.PART_SUFFIX}")
+            staging.parent.mkdir(parents=True, exist_ok=True)
+            ext, granted = self._promote_cached_copy(track_id, tier, staging)
+            if ext is None:
+                url, granted = self._download_stream_url(real, tier)
+                sources = stream_sources(url)
+                if not sources:
+                    raise RuntimeError("stream named nothing to fetch")
+                ext = fetch_to_file(sources, str(staging),
+                                    abandoned=abandoned, progress=progress)
+            final = downloads.destination(meta, ext)
+            final.parent.mkdir(parents=True, exist_ok=True)
+            # A re-fetch at another tier can land under another extension, and
+            # the old file is then a second copy of the same song in the same
+            # folder. By exact name, and only ones ticli wrote.
+            previous = downloads.path_for(track_id)
+            os.replace(staging, final)
+            if previous is not None and previous != final:
+                try:
+                    previous.unlink()
+                except OSError:
+                    pass
+            written = tags.write_tags(final, meta, self._cover_bytes(real))
+            size = final.stat().st_size
+            downloads.record(track_id, final.relative_to(downloads.download_dir()),
+                             tier, size, granted=granted)
+            self._downloads_usage = None  # the folder changed
+            return final, written, size
+        except Exception:
+            self._discard_staging(track_id)
+            if final is not None:
+                downloads.discard_scratch(final)
+            raise
+
+    # ── Re-fetch everything at the current quality ──
+    #
+    # This is the single most rate-limit-dangerous thing in the app, and the
+    # incident it could repeat is the worst one in this project's history: 53
+    # `playbackinfo` calls in 2.8 seconds got the owner's IP blocked and his
+    # music stopped mid-session (ai/INCIDENTS #1). So the design question is
+    # not "how fast can this go" — it is "how do we make it impossible for a
+    # user to do that to themselves".
+    #
+    # Four answers, all of them structural rather than advisory:
+    #
+    #   * **Serial.** One track at a time, one thread, no fan-out. There is no
+    #     parallelism to tune and no way to ask for more.
+    #   * **Paced.** At least REFETCH_MIN_INTERVAL between the *start* of one
+    #     track and the next, whatever happened in between — so a run of
+    #     instant failures cannot become a burst. A track costs two requests
+    #     (`session.track` then `get_stream`), so the ceiling is one request a
+    #     second and the sustained rate is well under that: an order of
+    #     magnitude below what caused the block, and slower still in practice
+    #     because each track also has to be fetched.
+    #   * **Interruptible.** A generation counter, bumped by Esc and by
+    #     leaving the settings page, checked before every track and passed
+    #     into `fetch_to_file` as its `abandoned` callback, so a cancel lands
+    #     inside a chunk read rather than at the end of a 30 MB file.
+    #   * **Stop, never retry, on the evidence of a block.** A 429, or a 401
+    #     with subStatus 4006, ends the whole run and says so. Retrying is
+    #     what extends those blocks.
+    #
+    # And it is opt-in twice: an explicit key, and a confirmation that says
+    # how many tracks and roughly how many bytes before it will start.
+
+    def _refetch_candidates(self) -> dict:
+        """What "re-fetch everything at the current quality" would actually do.
+
+        Reads both trackers and no network. Returns `{"downloads": [...],
+        "cache": [...], "skipped": n, "bytes": n}` where each list is
+        `(track_id, tier)` and `skipped` counts the copies already at the
+        target tier — which are left alone, because spending a request to be
+        handed back the file you already have is the opposite of the point.
+        """
+        wanted = self.QUALITY_MAP.get(self._quality_name)
+        plan = {"downloads": [], "cache": [], "skipped": 0, "bytes": 0}
+        for key, entry in downloads.load_index().items():
+            if downloads._entry_path(entry) is None:
+                continue  # deleted by hand: the disk decides
+            if entry.get("granted") == wanted:
+                plan["skipped"] += 1
+                continue
+            plan["downloads"].append(key)
+            plan["bytes"] += int(entry.get("bytes") or 0)
+        if self._cache.keeps_audio:
+            downloaded = set(plan["downloads"])
+            for key, record in self._cache._load_tracker().items():
+                if key in downloaded:
+                    continue  # the download tier covers it
+                if record.get("quality") == wanted:
+                    plan["skipped"] += 1
+                    continue
+                plan["cache"].append(key)
+                plan["bytes"] += int(record.get("bytes") or 0)
+        return plan
+
+    def _start_refetch_job(self) -> None:
+        """Re-fetch every local copy at the tier currently selected.
+
+        Both tiers, because Garrett asked for both: the downloads go back into
+        `~/Music/Ticli` through the same `_download_to_music` the download
+        screen uses (tagged, and the old file removed if the container
+        changed), and the cached songs go back into the cache directory.
+        """
+        job = self._refetch_job
+        if job and job.get("state") == "running":
+            return
+        plan = self._refetch_candidates()
+        total = len(plan["downloads"]) + len(plan["cache"])
+        if not total:
+            self._set_toast("Everything is already at this quality")
+            return
+        tier = self._quality_name
+        self._refetch_gen = gen = self._refetch_gen + 1
+        self._refetch_job = {
+            "state": "running", "tier": tier, "done": 0, "total": total,
+            "failed": 0, "error": "", "current": "",
+        }
+
+        def _update(**changes):
+            current = dict(self._refetch_job or {})
+            current.update(changes)
+            self._refetch_job = current
+            self._wake()
+
+        def _run():
+            done = failed = 0
+            blocked = ""
+            try:
+                for kind, key in ([("download", k) for k in plan["downloads"]]
+                                  + [("cache", k) for k in plan["cache"]]):
+                    if self._refetch_gen != gen:
+                        return
+                    started = time.monotonic()
+                    _update(current=str(key))
+                    try:
+                        self._refetch_one(kind, key, tier, gen)
+                        done += 1
+                    except _DownloadSuperseded:
+                        return
+                    except Exception as e:
+                        message = str(e)
+                        if _looks_rate_limited(message):
+                            # Stop entirely and report. Never retry — that is
+                            # what turned a rate limit into an edge block.
+                            blocked = message[:PLAYER_ERROR_CHARS]
+                            break
+                        logger.debug("Re-fetch of %s failed: %s", key, e)
+                        failed += 1
+                    _update(done=done, failed=failed)
+                    # The floor is on the *start* of each track, so a run of
+                    # instant failures cannot turn into a burst
+                    remaining = REFETCH_MIN_INTERVAL - (time.monotonic() - started)
+                    while remaining > 0 and self._refetch_gen == gen:
+                        time.sleep(min(0.25, remaining))
+                        remaining -= 0.25
+            finally:
+                if self._refetch_gen == gen:
+                    if blocked:
+                        _update(state="blocked", error=blocked,
+                                done=done, failed=failed, current="")
+                        self._set_toast(
+                            "TIDAL is rate-limiting — re-fetch stopped. "
+                            "Nothing will be retried.",
+                            seconds=PLAYER_ERROR_SECONDS)
+                    else:
+                        _update(state="done", done=done, failed=failed,
+                                current="")
+                        self._set_toast(
+                            f"Re-fetched {done} song{'' if done == 1 else 's'}"
+                            f" at {tier}"
+                            + (f" · {failed} failed" if failed else ""))
+                self._wake()
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _refetch_one(self, kind: str, key, tier: str, gen: int) -> None:
+        """One track of the re-fetch, in whichever tier it belongs to."""
+        def _abandoned():
+            if self._refetch_gen != gen:
+                raise _DownloadSuperseded()
+            return False
+
+        real = self.session.track(int(key)) if str(key).isdigit() \
+            else self.session.track(key)
+        if real is None:
+            raise RuntimeError("track could not be resolved")
+        if kind == "download":
+            self._download_to_music(real, tier, abandoned=_abandoned)
+            return
+        self._refetch_into_cache(real, tier, _abandoned)
+
+    def _refetch_into_cache(self, real, tier: str, abandoned) -> None:
+        """Replace a cached copy with the same track at `tier`.
+
+        The cache's own writer (`AudioPlayer._start_download`) is tied to a
+        playback generation and to admission, neither of which applies here —
+        this is a copy the user already has and has explicitly asked to
+        refresh, so it is not up for admission and cannot be refused.
+        """
+        track_id = getattr(real, "id", None)
+        if self.audio is None:
+            raise RuntimeError("no audio player")
+        base = str(self.audio.cache_audio_dir() / str(track_id))
+        part = base + ".part"
+        url, granted = self._download_stream_url(real, tier)
+        sources = stream_sources(url)
+        if not sources:
+            raise RuntimeError("stream named nothing to fetch")
+        ext = fetch_to_file(sources, part, abandoned=abandoned)
+        path = base + ext
+        os.replace(part, path)
+        self.audio._drop_other_copies(base, path)
+        self._cache.note_cached(track_id, ext, os.path.getsize(path),
+                                quality=granted)
+        self._cache.invalidate_audio_count()
+        self.audio._sweep_cache()
+
+    def _cancel_refetch(self) -> None:
+        """Stop the run. The generation counter is what tells the thread, and
+        it is checked inside `fetch_to_file`'s chunk loop, so a cancel lands
+        mid-file rather than at the end of a 30 MB one."""
+        job = self._refetch_job
+        self._refetch_gen += 1
+        if job and job.get("state") == "running":
+            self._refetch_job = dict(job, state="cancelled", current="")
+            self._set_toast("Re-fetch cancelled")
 
     def _discard_staging(self, track_id) -> None:
         """Remove the half-written file this job was writing, by exact name.
@@ -5710,6 +6053,17 @@ class HeadlessTidalPlayer:
             self._clear_cache_pending = False
             if key in ("y", "Y", KEY_ENTER, KEY_ENTER2):
                 self._clear_cached_songs()
+            return
+
+        # Nothing is fetched until this is answered, and cancel is a true
+        # no-op — the same shape as every other confirmation here
+        if self._refetch_pending:
+            self._refetch_pending = False
+            plan = self._refetch_plan
+            self._refetch_plan = None
+            if key in ("y", "Y", KEY_ENTER, KEY_ENTER2) and plan and (
+                    plan["downloads"] or plan["cache"]):
+                self._start_refetch_job()
             return
 
         # The volume overlay is over whatever mode is underneath — including
@@ -6124,6 +6478,12 @@ class HeadlessTidalPlayer:
         # ← is the value-decrease key here (the universal settings idiom), so
         # Esc — or the "c" that opened the page — is what goes back
         if key == KEY_ESC or key == "c":
+            # Esc stops a running re-fetch rather than leaving the page, so
+            # the key that starts the one long job on this screen is also the
+            # key that stops it and you never have to leave to do it
+            if (self._refetch_job or {}).get("state") == "running":
+                self._cancel_refetch()
+                return
             self._mode = self.MODE_PLAYER
             return
         if key == " ":
@@ -6141,6 +6501,16 @@ class HeadlessTidalPlayer:
         # screen, and one letter meaning two things is how muscle memory breaks
         if key in ("u", "U"):
             self._upgrade_to_pkce()
+            return
+        # Re-fetch everything at the current quality. An action, so it lives
+        # outside SETTINGS_SPEC like [x] and [o]; and it asks first, because
+        # it is the one thing here that deliberately makes hundreds of
+        # requests. Reading the plan is two index reads and no network.
+        if key in ("r", "R"):
+            if (self._refetch_job or {}).get("state") == "running":
+                return
+            self._refetch_plan = self._refetch_candidates()
+            self._refetch_pending = True
             return
         if key == KEY_UP:
             self._settings_cursor = max(0, self._settings_cursor - 1)

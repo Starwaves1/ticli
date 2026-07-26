@@ -136,14 +136,18 @@ def download_dir() -> Path:
 
 
 def display_dir() -> str:
-    """The download folder the way a person says it — `~/Music/Ticli`. The
-    settings page and the download screen both show a path, and an absolute
-    one wraps onto two lines for no information."""
-    path = download_dir()
-    try:
-        return "~/" + str(path.relative_to(Path.home()))
-    except ValueError:
-        return str(path)
+    """The download folder as a full absolute path.
+
+    Garrett asked for the absolute path rather than `~/Music/Ticli`: the
+    folder is user-owned, and a path you can paste into Finder or a terminal
+    is worth the columns.
+
+    `expanduser()`, deliberately **not** `resolve()`. On macOS `resolve()`
+    rewrites `/Users/garrett/Music/Ticli` to
+    `/System/Volumes/Data/Users/garrett/Music/Ticli` through the firmlink —
+    accurate, and unreadable. `expanduser()` is already absolute.
+    """
+    return str(download_dir().expanduser())
 
 
 def index_file() -> Path:
