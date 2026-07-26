@@ -790,6 +790,68 @@ class TestWhatTheFileActuallyCarries:
         assert "the folder and filename carry" in text.replace("\n   ", " ")
 
 
+class TestTheSettingsPageIsCheapToPaint:
+    """The settings page repaints twice a second, on the UI thread.
+
+    `downloaded_count()` and `total_bytes()` each called `path_for()` per
+    track, and `path_for()` re-read and re-parsed the whole `downloads.json`
+    every call — 2(N+1) reads and parses of an O(N)-sized file per frame.
+    Measured before: 4.54 ms at 50 downloads, 42.70 ms at 200, **229.48 ms at
+    500** — the same order as the 231 ms keypress latency `auto_refresh=False`
+    existed to remove. Assert the reads, not the milliseconds: a timing
+    threshold on a shared machine is a flaky test waiting to happen.
+    """
+
+    def _library(self, count):
+        root = downloads.download_dir()
+        for tid in range(count):
+            path = root / "A" / "B" / f"{tid:02d} T.m4a"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"music")
+            downloads.record(tid, path.relative_to(root), "HIGH", 5)
+
+    def _counting_reads(self, monkeypatch):
+        reads = []
+        real = downloads.load_index
+
+        def _load():
+            reads.append(1)
+            return real()
+
+        monkeypatch.setattr(downloads, "load_index", _load)
+        return reads
+
+    def test_both_numbers_cost_one_index_read(self, monkeypatch):
+        self._library(20)
+        reads = self._counting_reads(monkeypatch)
+        assert downloads.usage() == (20, 100)
+        assert len(reads) == 1, f"{len(reads)} reads of the index for one frame"
+
+    def test_the_reads_do_not_grow_with_the_library(self, monkeypatch):
+        self._library(60)
+        reads = self._counting_reads(monkeypatch)
+        downloads.usage()
+        assert len(reads) == 1
+
+    def test_a_repaint_does_not_re_measure(self, monkeypatch):
+        self._library(5)
+        p = _player()
+        p._user_display_name = "Garrett"
+        p._build_settings_display()
+        reads = self._counting_reads(monkeypatch)
+        for _ in range(10):  # five seconds of idle repaints
+            p._build_settings_display()
+        assert reads == [], "the page re-measured the download folder per frame"
+
+    def test_opening_the_page_re_measures(self, monkeypatch):
+        p = _player()
+        p._user_display_name = "Garrett"
+        assert "0 songs downloaded" in p._build_settings_display().plain
+        self._library(3)   # e.g. downloaded from another window, or by hand
+        p._handle_key("c")
+        assert "3 songs downloaded" in p._build_settings_display().plain
+
+
 class TestSettingsShowsTheFolder:
     def test_the_path_and_the_count_are_on_the_settings_page(self):
         root = downloads.download_dir()

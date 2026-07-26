@@ -470,6 +470,40 @@ segments requested: 12 of 12 within four seconds with the flag, 6 of 12
 without, and the second of those is a control — without it the first would
 pass on any track short enough to fit ffplay's default queue anyway.
 
+### F6 — the settings page did O(N²) JSON reads on the UI thread
+
+`downloaded_count()` and `total_bytes()` each iterated the index and called
+`path_for()` per track, and **`path_for()` re-read and re-parsed the whole
+`downloads.json` every call** — so one repaint was 2(N+1) reads and 2(N+1)
+parses of an O(N)-sized file:
+
+```
+ 50 downloads    4.54 ms per settings repaint
+200 downloads   42.70 ms
+500 downloads  229.48 ms
+```
+
+paid **twice a second** while the page is open, because `_repaint` builds the
+display before it can decide whether the frame changed. That is the same order
+as the 231 ms keypress latency the `auto_refresh=False` work existed to remove
+(`bd4f95f`), on the UI thread, growing back in a new place.
+
+`downloads.usage()` now returns both numbers from **one** index read and one
+stat per entry, and the player memoises the pair, dropped by the two things
+that move it: opening the page, and a download landing. Both halves, because
+the linear version is still disk work and `_repaint` pays it on every idle
+tick. The memo lives on the player instance rather than in the module — a
+module-level one would outlive a test and leak into the next.
+
+Semantics unchanged and deliberately so: every file is still stat-ed and the
+index is still only a hint about where to look, so a track dragged to the
+trash is still not downloaded.
+
+Tests assert the reads rather than the milliseconds — a timing threshold on a
+shared machine is a flaky test waiting to happen. One index read for both
+numbers, no growth with the library, zero re-measures across ten repaints, and
+a re-measure when the page is opened.
+
 ---
 
 ## In flight at time of writing

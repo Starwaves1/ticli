@@ -1632,6 +1632,12 @@ class HeadlessTidalPlayer:
         # ever replaced wholesale, never appended to in place
         self._settings_cursor = 0
         self._settings_edit: Optional[str] = None
+        # `(count, bytes)` for the downloads tier, measured on demand and kept
+        # until something moves it — the same bargain MetadataCache makes for
+        # audio_count / disk_bytes, and for the same reason: the page repaints
+        # twice a second and the folder changes about once a song. On the
+        # instance rather than in the module, so nothing outlives a test.
+        self._downloads_usage: Optional[tuple] = None
         # Transient toast message
         self._toast = ""
         self._toast_until = 0.0
@@ -3305,6 +3311,20 @@ class HeadlessTidalPlayer:
 
         return content
 
+    def _download_usage(self) -> tuple:
+        """`(downloads on disk, what they cost)`, measured once and kept.
+
+        `downloads.usage()` is one index read and one stat per entry, which is
+        already 229x cheaper than the two calls this replaced — but it is
+        still disk work, and `_repaint` builds the settings display on every
+        idle tick before deciding whether the frame changed. So it is
+        remembered, and dropped by the two things that move it: opening the
+        page, and a download landing.
+        """
+        if self._downloads_usage is None:
+            self._downloads_usage = downloads.usage()
+        return self._downloads_usage
+
     def _build_settings_display(self) -> Text:
         content = Text()
         content.append("   Settings", style="bold magenta")
@@ -3408,10 +3428,14 @@ class HeadlessTidalPlayer:
         # own count, and deliberately no budget and no [x] — nothing in ticli
         # deletes a track somebody asked for. Saying where they are is the
         # whole point of the line; a folder you cannot find is not user-owned.
-        kept = downloads.downloaded_count()
+        # One index read for both numbers, and remembered until something
+        # moves them: this pair used to be two calls that each re-read and
+        # re-parsed downloads.json once per track, i.e. 229 ms of UI-thread
+        # JSON at 500 downloads, twice a second while the page is open
+        kept, kept_bytes = self._download_usage()
         content.append(
             f"\n   {kept} song{'' if kept == 1 else 's'} downloaded"
-            f" · {format_gb(downloads.total_bytes())}", style="dim")
+            f" · {format_gb(kept_bytes)}", style="dim")
         # Where they are is the point of the line and survives a short window;
         # *why* they are exempt from the budget is prose and goes with the rest
         # of it, which is what keeps [x], [o] and [u] on screen at 80x24
@@ -5069,6 +5093,7 @@ class HeadlessTidalPlayer:
                 size = final.stat().st_size
                 downloads.record(track_id, final.relative_to(downloads.download_dir()),
                                  tier, size)
+                self._downloads_usage = None  # one more song in the folder
                 if self._download_job_gen != gen:
                     return
                 _update(state="done", path=str(final), tags=written,
@@ -5610,8 +5635,11 @@ class HeadlessTidalPlayer:
             self._mode = self.MODE_SETTINGS
             self._settings_cursor = 0
             self._settings_edit = None
-            # The song count could have moved since the page was last open
+            # Either tier's numbers could have moved since the page was last
+            # open — including by a deletion made outside ticli, which is the
+            # only way that is ever noticed
             self._cache.invalidate_audio_count()
+            self._downloads_usage = None
             self._nav_history.clear()
         elif key == KEY_ESC:
             self._quit_pending = True

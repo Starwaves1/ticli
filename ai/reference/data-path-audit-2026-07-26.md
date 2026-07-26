@@ -315,6 +315,12 @@ helps F6.
 
 ### F6 — The settings page does O(N²) disk reads on the UI thread, twice a second
 
+> **FIXED 2026-07-26.** `downloads.usage()` returns both numbers from one
+> index read, and the player memoises it — dropped when the page is opened
+> and when a download lands. Both halves of the audit's suggestion, because
+> the linear version is still disk work and `_repaint` pays it on every idle
+> tick. Everything below is the diagnosis as written.
+
 **Measured.** `_build_settings_display` calls `downloads.downloaded_count()` and
 `downloads.total_bytes()`. Each iterates the index and calls `path_for(tid)` —
 and **`path_for` re-reads and re-parses the entire `downloads.json` every
