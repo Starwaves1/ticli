@@ -34,6 +34,7 @@ from pathlib import Path
 
 import pytest
 
+from ticli import player as player_mod
 from ticli.player import (
     HLS_CACHE_SECONDS,
     AudioPlayer,
@@ -329,6 +330,77 @@ class TestSegmentedFlags:
     def test_ffplay_is_not_given_mpv_flags(self):
         flags = AudioPlayer("ffplay")._hls_flags()
         assert not [f for f in flags if f.startswith("--cache")]
+
+    def test_ffplay_is_told_to_buffer_a_segmented_stream(self):
+        assert "-infbuf" in AudioPlayer("ffplay")._hls_flags()
+
+    def test_a_whole_file_needs_no_buffering_flag(self):
+        """Segmented only. On the BTS path both backends already read the
+        whole file at once (ffplay 23.7 MB in the first second), so the flag
+        would be an unbounded buffer bought for nothing."""
+        audio = AudioPlayer("ffplay")
+        assert "-infbuf" not in audio._ffplay_cmd("https://cdn/track.mp4", 0)
+        assert "-infbuf" in audio._ffplay_cmd("/tmp/x" + player_mod.HLS_SUFFIX, 0)
+
+
+def _segments_pulled_in(seconds, extra_flags=(), drop=()):
+    """How many distinct media segments ffplay asks for in the first
+    `seconds`, playing ticli's own playlist with ticli's own flags."""
+    with tempfile.TemporaryDirectory() as tmp:
+        source = _fragmented_flac(Path(tmp) / "frag.mp4")
+        init, segments = _split(source)
+        server = _Server(init, segments)
+        try:
+            playlist = _write_hls_playlist(
+                "test-readahead", _hls_playlist(_Dash(server.port, len(segments))))
+            flags = [f for f in AudioPlayer("ffplay")._hls_flags() if f not in drop]
+            proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
+                 "-volume", "0"] + list(extra_flags) + flags + [playlist],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                time.sleep(seconds)
+                return len({n for n in server.served if n.endswith(".m4s")}), \
+                    len(segments)
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(5)
+                except subprocess.TimeoutExpired:  # pragma: no cover
+                    proc.kill()
+        finally:
+            server.close()
+
+
+@pytest.mark.skipif(not FFMPEG or not shutil.which("ffplay"),
+                    reason="needs ffplay and ffmpeg to measure readahead")
+class TestFfplayReadahead:
+    """ffplay had the weakness mpv had: about two segments of buffer.
+
+    Its read thread stops once every stream has enough packets queued, which
+    on the 45-segment hi-res playlist measured 1.40 MB — the same level the
+    un-fixed mpv sat at, and the level that was reported as hitching.
+    `-infbuf` lifts the limit; there is no `--cache-secs` analogue, so the
+    choice is between ~11 s and the whole (bounded) track.
+    """
+
+    # Real time, real sockets, 12 two-second segments. Measured over this
+    # window: with the flag ffplay has all 12; without it, it plateaus at 6
+    # and takes them one at a time as playback consumes them.
+    WINDOW = 4.0
+
+    def test_the_whole_track_is_pulled_at_once(self):
+        pulled, total = _segments_pulled_in(self.WINDOW)
+        assert pulled == total, \
+            f"only {pulled} of {total} segments in {self.WINDOW}s"
+
+    def test_and_without_the_flag_it_is_not(self):
+        """The control. Without this the test above would pass on a track
+        short enough to fit in ffplay's default queue anyway."""
+        pulled, total = _segments_pulled_in(self.WINDOW, drop=("-infbuf",))
+        assert pulled < total, \
+            "ffplay buffered the whole track without being asked to — the " \
+            "measurement this rests on no longer holds"
 
 
 @pytest.mark.skipif(not MPV or not FFMPEG,

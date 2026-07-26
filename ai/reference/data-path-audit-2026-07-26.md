@@ -275,6 +275,11 @@ HIGH, download asked for HIRES) must fetch; only exact matches promote.
 
 ### F5 — ffplay has the same readahead weakness mpv just had, and one flag fixes it
 
+> **FIXED 2026-07-26.** `-infbuf` added to `_hls_flags()` on the ffplay branch
+> (segmented only). Covered by a real-backend test that counts segments
+> requested in the first four seconds — 12 of 12 with the flag, 6 of 12
+> without. Everything below is the diagnosis as written.
+
 **Measured**, on the 45-segment local HLS playlist (990 kbps, 176 s, 21.8 MB).
 Bytes served, so higher = more buffered:
 

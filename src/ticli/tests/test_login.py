@@ -572,7 +572,8 @@ class TestSegmentedPlayback:
 
     def test_ffplay_is_given_the_protocols_it_needs(self):
         flags = self._audio("ffplay")._hls_flags()
-        assert flags == ["-protocol_whitelist", player_mod.HLS_PROTOCOLS, "-f", "hls"]
+        assert flags == ["-infbuf", "-protocol_whitelist",
+                         player_mod.HLS_PROTOCOLS, "-f", "hls"]
 
     def test_https_is_on_both_backends_whitelists(self):
         # The default for a local file input is "file,crypto,data", which turns

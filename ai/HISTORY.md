@@ -443,6 +443,33 @@ there stalls any player — measured, mpv reports `paused-for-cache` once at
 2.1 s and then runs 21 s ahead for the rest of the track, which is the
 property the test means to assert.
 
+### F5 — ffplay had the readahead weakness mpv had just been fixed for
+
+Bytes served on one 45-segment playlist (990 kbps, 176 s, 21.8 MB):
+
+| backend / flags | @1 s | @3 s | @8 s |
+|---|---|---|---|
+| mpv, `--cache=yes --cache-secs=60` | 9.19 MB | 9.68 | 10.16 |
+| mpv, no cache flags (the bug that was fixed) | 1.88 | 2.37 | 2.86 |
+| **ffplay, before this** | **1.40** | 1.40 | 2.37 |
+| **ffplay, `+ -infbuf`** | **21.71** | 21.71 | 21.71 |
+
+ffplay sat at the *un-fixed* mpv level — about two segments, ~11 s — because
+its read thread stops once every stream has enough packets queued
+(`MIN_FRAMES` / `stream_has_enough_packets` in ffplay.c). Any segment slower
+than that window is the hitch that was reported for mpv.
+
+There is no `--cache-secs` analogue for ffplay, so the choice is between ~11 s
+and unbounded; for a VOD track of known, bounded length (~30 MB hi-res)
+unbounded is the right side of that trade. In `_hls_flags()` next to the mpv
+cache flags it mirrors, so it is **segmented only** — on the BTS path both
+backends already read the whole file at once and need nothing.
+
+Tested by running the real ffplay against the loopback server and counting
+segments requested: 12 of 12 within four seconds with the flag, 6 of 12
+without, and the second of those is a control — without it the first would
+pass on any track short enough to fit ffplay's default queue anyway.
+
 ---
 
 ## In flight at time of writing

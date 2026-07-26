@@ -1013,7 +1013,27 @@ class AudioPlayer:
                 f"%{len(HLS_PROTOCOLS)}%{HLS_PROTOCOLS}",
                 "--cache=yes", f"--cache-secs={HLS_CACHE_SECONDS}",
             ]
-        return ["-protocol_whitelist", HLS_PROTOCOLS, "-f", "hls"]
+        # ffplay had the same weakness mpv did, and here is the measurement on
+        # one 45-segment playlist (990 kbps, 176 s, 21.8 MB), bytes served:
+        #
+        #   mpv, --cache=yes --cache-secs=60   9.19 MB @1s   10.16 MB @8s
+        #   mpv, no cache flags (the old bug)  1.88          2.86
+        #   ffplay, before this line           1.40          2.37
+        #   ffplay, with -infbuf              21.71         21.71
+        #
+        # ffplay sat at the *un-fixed* mpv level — about two segments, ~11 s —
+        # because its read thread stops once every stream has enough packets
+        # queued (MIN_FRAMES / stream_has_enough_packets in ffplay.c). Any
+        # segment slower than that window is an audible hitch, which is the
+        # symptom that was reported for mpv.
+        #
+        # There is no --cache-secs analogue for ffplay, so the choice is
+        # between ~11 s and unbounded, and -infbuf pulls the whole track in
+        # under a second. For a VOD track of known, bounded length (~30 MB
+        # hi-res) unbounded is the right side of that trade. Segmented only:
+        # on the BTS path both backends already read the whole file at once
+        # (ffplay 23.7 MB @1s) and need nothing.
+        return ["-infbuf", "-protocol_whitelist", HLS_PROTOCOLS, "-f", "hls"]
 
     def cache_audio_dir(self):
         """The audio cache directory, created if needed. Private like the rest
