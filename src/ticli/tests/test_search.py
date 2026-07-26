@@ -548,6 +548,55 @@ class TestPlaylistSearch:
         results = _local_search(p, "miles")
         assert [r["name"] for r in results] == ["Miles Ahead", "Naima"]
 
+    def test_the_playlist_name_finds_its_tracks(self, config_file, cache_dir):
+        """Typing a playlist's own name surfaces what is in it — the whole
+        point of the field being indexed as plain text."""
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        p.session = _FakeSession()
+        results = _local_search(p, "late night")
+        assert [r["name"] for r in results] == ["Naima"]
+        assert p.session.calls == []  # still local, still free
+
+    def test_the_playlist_name_matches_case_insensitively_too(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        assert len(_local_search(p, "JAZZ")) == 2  # both tracks in "Jazz"
+
+    def test_every_field_has_its_place_in_the_order(self, config_file, cache_dir):
+        """Title, then artist, then album, then playlist name. The playlist
+        name is one string standing in for every track under it, so it ranks
+        last: a common word must not bury the track actually called that."""
+        _index(cache_dir, [{"id": "p1", "name": "Blue Mood", "num_tracks": 4}], {
+            "p1": [
+                _rec(1, "Naima", "John Coltrane", album="Giant Steps"),
+                _rec(2, "Kind of Blue", "Miles Davis", album="Milestones"),
+                _rec(3, "Solar", "Blue Mitchell", album="Milestones"),
+                _rec(4, "Freddie Freeloader", "Miles Davis", album="Blue Train"),
+            ],
+        })
+        p = HeadlessTidalPlayer()
+        results = _local_search(p, "blue")
+        assert [r["name"] for r in results] == [
+            "Kind of Blue",        # title
+            "Solar",               # artist
+            "Freddie Freeloader",  # album
+            "Naima",               # only the playlist it is in is called that
+        ]
+
+    def test_a_playlist_name_match_still_says_where_it_came_from(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        results = _local_search(p, "late")
+        assert results[0]["playlist"] == "Late Night"
+
+    def test_other_playlists_are_not_dragged_in(self, config_file, cache_dir):
+        """A playlist name matches its own tracks and nobody else's."""
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        results = _local_search(p, "night")
+        assert {r["playlist"] for r in results} == {"Late Night"}
+
     def test_hits_resolve_to_a_real_track_before_playing(self, config_file, cache_dir):
         _stocked(cache_dir)
         p = HeadlessTidalPlayer()

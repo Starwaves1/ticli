@@ -51,6 +51,39 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
   kind of thing. This is not decoration — the regression it exists for played an entire
   library as silence with a normal-looking UI.
 
+### Scrubbing
+
+`←`/`→` already mean prev/next, and in a list they mean back/open, so seeking
+gets a home rather than a key: **`↑` gives the player the arrows** — from the
+top of a list, where `↑` had nowhere left to go, and from the player screen,
+where it did nothing at all. Focused, `←`/`→` move `SEEK_STEP_SECONDS` inside
+the track and `↓` (or Esc) hands them back; anything else — typing, `[t]`,
+Enter — means you are done scrubbing, so focus drops and the key goes on to the
+screen it was meant for. `_handle_focus_key` is the whole interaction, checked
+once before the mode dispatch, so no screen has its own copy. Not the settings
+page (`←`/`→` are the value there) and not the add-to-playlist picker.
+
+`_seek_by` moves `_play_offset` on the keypress, before anything is asked of
+the backend: everything reads position through `_get_position()`, so the bar,
+the saved resume position, the prefetch and the auto-advance all follow from
+that one assignment, and a seek that only appeared on the next poll felt
+broken. Both ends clamp — past the start is 0:00 rather than the previous
+track, and past the end stops `SEEK_END_MARGIN` short rather than advancing,
+because landing on EOF makes the backend exit and reads as "the track ended".
+
+Reaching the backend is separate and coalesced. `AudioPlayer.seek_to()` is an
+IPC seek on mpv (playing or paused), a change to the number `resume()` will
+start from on a paused ffplay, and on a *playing* ffplay a kill and a respawn
+at the offset from the same source — deliberately not `stop()`/`play_url()`,
+which would bump the download generation and make every scrub abandon the copy
+being fetched for this very track. False means "could not be moved", and the
+caller starts the track there instead. `_flush_seek` lets at most one seek
+through per `SEEK_COALESCE_SECONDS`, on a daemon thread; a press that lands too
+soon leaves its position pending and the monitor's existing 0.5s tick delivers
+it, so a held-down arrow is a couple of seeks a second and never a respawn per
+key repeat. The same tick skips its mpv position resync while a scrub is
+pending, or the bar would snap back to where the track was before the arrow.
+
 ### Segmented (MPEG-DASH) streams
 
 A lossless/hi-res stream does not arrive as a file. It arrives as an MPEG-DASH
@@ -108,11 +141,19 @@ away.
 
 "My Playlists" is answered entirely from `cache.iter_tracks()` — TIDAL has
 no server-side search of your own playlists — so it is instant, runs on the
-UI thread, and makes no request at all. Case-insensitive substring over
-name, artists and album, with title matches first; each row says which
-playlist it came from and resolves through `_resolve_track` before playback.
-An empty index or `cache_metadata` turned off says so instead of looking
-like a query with no hits.
+UI thread, and makes no request at all. Case-insensitive substring over four
+plain-text fields, and the *order* is the design: **track title, then artist,
+then album, then the playlist's own name**. Ranking matters more the more
+fields there are — a playlist name is one string standing in for every track
+under it, so a query that matched only it would otherwise bury the track
+actually called that under a whole loosely-named playlist; last place keeps
+"type the playlist's name, get its tracks" working without letting it flood
+anything. Within a rank the index's own order survives. The one indexed field
+left out is the playlist's creator: on your own playlists that is your name on
+every row, which matches everything or nothing. Each row says which playlist it
+came from and resolves through `_resolve_track` before playback. An empty index
+or `cache_metadata` turned off says so instead of looking like a query with no
+hits.
 ### Album artwork
 
 `utils/artwork.py` paints the cover above the track line as half-block pixel

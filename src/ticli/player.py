@@ -127,6 +127,19 @@ MEDIA_KEY_PROP = "user-data/ticli/media-key"
 # the rule every other player uses, for ← and the PREV media key alike
 PREV_RESTART_SECONDS = 30
 
+# Scrubbing. One press of ←/→ with the player focused moves the track this far,
+# and never nearer the end than SEEK_END_MARGIN: landing on EOF makes the
+# backend exit at once, which reads as "the track ended" and skips.
+SEEK_STEP_SECONDS = 10
+SEEK_END_MARGIN = 2
+# The floor between two seeks actually reaching the backend. The screen moves on
+# every press regardless; this is only about how often mpv is spoken to and how
+# often ffplay — which has no runtime control at all — is respawned. A press
+# that arrives too soon leaves its position pending, and the monitor's existing
+# 0.5s tick delivers it, so a held-down arrow costs a couple of seeks a second
+# rather than one respawn per key repeat.
+SEEK_COALESCE_SECONDS = 0.3
+
 # Next-track stream URL prefetch. Fired from the monitor's existing tick this
 # far before the end of a track, and thrown away if it isn't used almost at
 # once — TIDAL's URLs are signed and short-lived, so a stale one is worse than
@@ -725,13 +738,7 @@ class AudioPlayer:
                 # Plays from `source`: a kept file when there is one, the URL
                 # otherwise — a download that has only just started can't
                 # satisfy a seek yet
-                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
-                       "-volume", str(self._ffplay_volume())]
-                if segmented:
-                    cmd += self._hls_flags()
-                if seek > 0:
-                    cmd += ["-ss", str(seek)]
-                cmd.append(source)
+                cmd = self._ffplay_cmd(source, seek)
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -743,13 +750,26 @@ class AudioPlayer:
         if not have_kept:
             self._start_download(url, cache_key, gen)
 
+    def _ffplay_cmd(self, source: str, seek: float) -> list:
+        """How ffplay is asked to play `source` from `seek`.
+
+        The one place that spelling lives, because ffplay is respawned from
+        three of them — a fresh track, a resume, and a scrub — and a flag
+        missing from one of those is a stream that plays everywhere but there.
+        """
+        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
+               "-volume", str(self._ffplay_volume())]
+        if source.endswith(HLS_SUFFIX):
+            cmd += self._hls_flags()
+        if seek > 0:
+            cmd += ["-ss", str(seek)]
+        cmd.append(source)
+        return cmd
+
     def _play_from_cache(self, seek: float):
         """Resume ffplay from local cached file at given position."""
-        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
-               "-volume", str(self._ffplay_volume()), "-ss", str(seek),
-               self._cache_file]
         self._process = subprocess.Popen(
-            cmd,
+            self._ffplay_cmd(self._cache_file, seek),
             stdout=subprocess.DEVNULL,
             stderr=self._open_stderr(),
         )
@@ -887,6 +907,60 @@ class AudioPlayer:
             if not self._mpv_command({"command": ["seek", 0, "absolute"]}):
                 return False
             self._seek_offset = 0
+            self._play_start = time.time()
+            return True
+
+    def seek_to(self, position: float) -> bool:
+        """Move the current track to an absolute position. False when the
+        backend could not be moved and the caller has to start the track again.
+
+        Three cases, and none of them costs a request — the source this is
+        already playing is the source it seeks in:
+
+        - **mpv**, playing or paused: one IPC seek, gapless, and mpv keeps
+          whatever pause state it had.
+        - **ffplay while paused**: there is no process (pause kills it), so
+          the position it will resume from is just a number, and moving that
+          number is the whole seek.
+        - **ffplay while playing**: no runtime control exists at all, so the
+          process is killed and started again at the offset from the same
+          source. Deliberately not stop()/play_url(): those bump the download
+          generation, which would abandon the copy being fetched for this very
+          track and make every scrub start it over.
+        """
+        position = max(0.0, position)
+        with self._lock:
+            alive = self._process is not None and self._process.poll() is None
+            if self.player_cmd == "mpv" and self._ipc_path and alive:
+                if not self._mpv_command({"command": ["seek", position, "absolute"]}):
+                    return False
+                self._seek_offset = position
+                self._play_start = None if self._paused else time.time()
+                return True
+            if self._paused and not alive:
+                # ffplay's pause killed the process, so there is nothing to
+                # seek — only the number resume() will start from
+                self._seek_offset = position
+                return True
+            if not alive or self.player_cmd == "mpv":
+                # Nothing to talk to (or an mpv that stopped answering): the
+                # caller starts the track again at the new position instead
+                return False
+            source = self._cache_file if (
+                self._cache_file and os.path.exists(self._cache_file)) else self._current_url
+            if not source:
+                return False
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            self._process = subprocess.Popen(
+                self._ffplay_cmd(source, position),
+                stdout=subprocess.DEVNULL,
+                stderr=self._open_stderr(),
+            )
+            self._seek_offset = position
             self._play_start = time.time()
             return True
 
@@ -1067,6 +1141,16 @@ class HeadlessTidalPlayer:
         self._play_start_time: Optional[float] = None
         self._play_offset: float = 0
         self._liked_ids: set = set()
+        # Scrubbing. _player_focus is what ↑ hands to the player: while it is
+        # set, ←/→ move within the track instead of between tracks (or in the
+        # list below). _seek_target is the position the user has scrubbed to
+        # and _seek_applied the last one the backend was actually told about —
+        # they differ only while a press is waiting out SEEK_COALESCE_SECONDS.
+        self._player_focus = False
+        self._seek_target: Optional[float] = None
+        self._seek_applied: Optional[float] = None
+        self._seek_applying = False
+        self._last_seek_apply = 0.0
         # Search state
         self._search_query = ""
         self._search_results = []
@@ -1598,6 +1682,9 @@ class HeadlessTidalPlayer:
         """
         self._track_changing = True
         self._play_gen = gen = self._play_gen + 1
+        # This start decides where the track begins; any position still
+        # waiting to be scrubbed to belonged to the track we are leaving
+        self._seek_target = None
         self._prefetch_id = None  # re-arm the prefetch for this track's successor
         self._current_track = track
         self._playing = True
@@ -1772,11 +1859,80 @@ class HeadlessTidalPlayer:
     def _restart_current_track(self):
         """Send the current track back to 0:00 — a gapless mpv seek when the
         process is alive and playing, a fresh spawn from 0 otherwise."""
+        self._seek_target = None  # 0:00 supersedes anything still being scrubbed to
         if self._playing and self.audio and self.audio.seek_to_start():
             self._play_offset = 0
             self._play_start_time = time.time()
             return
         self._play_track(self._current_track, seek=0)
+
+    def _seek_by(self, delta: float):
+        """Scrub the current track by delta seconds.
+
+        The clock moves here, on the keypress, so the bar and the timer answer
+        the arrow before anything has been asked of the backend — a seek that
+        only appeared on the next position poll felt broken. Everything else
+        reads the position through _get_position(), so moving _play_offset is
+        the whole of the bookkeeping: the progress bar, the saved resume
+        position, the prefetch and the auto-advance all follow from it.
+
+        Both ends clamp. Past the start is 0:00, not the previous track, and
+        past the end stops just short of it rather than advancing: ←/→ mean
+        "move inside this song" here, and skipping is what they mean when the
+        player does not have focus.
+        """
+        if self._current_track is None:
+            return
+        duration = getattr(self._current_track, "duration", 0) or 0
+        target = max(0.0, self._get_position() + delta)
+        if duration > 0:
+            target = min(target, max(0.0, duration - SEEK_END_MARGIN))
+        self._play_offset = target
+        self._play_start_time = time.time() if self._playing else None
+        self._seek_target = target
+        self._flush_seek()
+
+    def _seek_pending(self) -> bool:
+        """Whether a scrubbed position is still on its way to the backend."""
+        return self._seek_applying or (
+            self._seek_target is not None and self._seek_target != self._seek_applied)
+
+    def _flush_seek(self):
+        """Hand a scrubbed position to the backend, at most one every
+        SEEK_COALESCE_SECONDS.
+
+        Called by the press that made it and, when that press landed too soon
+        after the last one, by the monitor's existing tick — no new thread of
+        control, and a held-down arrow costs a couple of seeks a second
+        instead of an mpv round trip (or, worse, an ffplay respawn) per key
+        repeat. Nothing is dropped: a position the backend has not been told
+        about stays visible as _seek_target != _seek_applied until it has.
+        """
+        target = self._seek_target
+        if target is None or target == self._seek_applied or self._seek_applying:
+            return
+        if time.monotonic() - self._last_seek_apply < SEEK_COALESCE_SECONDS:
+            return  # too soon — the next press or the monitor tick delivers it
+        self._seek_applying = True
+        self._last_seek_apply = time.monotonic()
+        gen = self._play_gen
+        track = self._current_track
+
+        def _run():
+            # Off the UI thread: an mpv that has stopped answering makes this
+            # wait out the IPC timeout, and killing ffplay is not instant
+            try:
+                if self._play_gen != gen:
+                    return  # the track moved on; this seek belongs to the old one
+                if not (self.audio and self.audio.seek_to(target)):
+                    # No live process to move — the only way to a position is
+                    # to start the track there
+                    self._play_track(track, seek=target)
+                self._seek_applied = target
+            finally:
+                self._seek_applying = False
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _toggle_play_key(self):
         """Play/pause from a keypress, on any screen.
@@ -1876,10 +2032,13 @@ class HeadlessTidalPlayer:
         dead_polls = 0
         while self.running:
             if (self._playing and not self._track_changing and self.audio
+                    and not self._seek_applying
                     and not self.audio.is_paused and not self.audio.is_playing):
                 # Require two consecutive dead polls before advancing: a track
                 # change kills the old process before spawning the new one,
-                # and a single poll can land inside that window
+                # and a single poll can land inside that window. A seek being
+                # applied is the same window on ffplay, which has to be killed
+                # and respawned to land anywhere but where it already is.
                 dead_polls += 1
             else:
                 dead_polls = 0
@@ -1915,12 +2074,18 @@ class HeadlessTidalPlayer:
                     self._play_offset = 0
             elif self._playing and self.audio:
                 # Resync wall-clock position with mpv's real position so
-                # startup latency and drift never accumulate
-                pos = self.audio.get_time_pos()
-                if pos is not None:
-                    self._play_offset = pos
-                    self._play_start_time = time.time()
+                # startup latency and drift never accumulate — but not while a
+                # scrub is still on its way to the backend, or the bar would
+                # snap back to where the track was before the arrow key
+                if not self._seek_pending():
+                    pos = self.audio.get_time_pos()
+                    if pos is not None:
+                        self._play_offset = pos
+                        self._play_start_time = time.time()
                 self._maybe_prefetch_next()
+            # A press that came in too soon after the last one left its
+            # position waiting; this tick is what delivers it
+            self._flush_seek()
             # Save state periodically so a crash doesn't lose the position
             if time.time() - last_save > 10:
                 self._save_state()
@@ -2026,6 +2191,8 @@ class HeadlessTidalPlayer:
             content.append(f"  {pos_str}/{dur_str}", style="cyan")
             if self._queue:
                 content.append(f"  [{self._queue_index + 1}/{len(self._queue)}]", style="dim")
+            if self._player_focus:
+                content.append(f"  \u21c6 {SEEK_STEP_SECONDS}s", style="bold yellow")
             return content
 
         # Full player display
@@ -2057,6 +2224,10 @@ class HeadlessTidalPlayer:
         progress_line.append(f"   {pos_str} ", style="cyan")
         progress_line.append(bar, style="bold cyan" if self._playing else "dim")
         progress_line.append(f" {dur_str}", style="cyan")
+        if self._player_focus:
+            # Focus is a state the arrows are in, so it has to be on screen —
+            # one marker on the line the arrows now move
+            progress_line.append(f"  \u21c6 {SEEK_STEP_SECONDS}s", style="bold yellow")
 
         # Queue info
         status_line = Text()
@@ -2499,7 +2670,12 @@ class HeadlessTidalPlayer:
             controls.append("   [space]", style="bold")
             controls.append(" play/pause  ", style="dim")
             controls.append("[\u2190/\u2192]", style="bold")
-            controls.append(" prev/next  ", style="dim")
+            if self._player_focus:
+                controls.append(f" seek {SEEK_STEP_SECONDS}s  ", style="dim")
+                controls.append("[\u2193]", style="bold")
+                controls.append(" back  ", style="dim")
+            else:
+                controls.append(" prev/next  ", style="dim")
             controls.append("[s]", style="bold")
             controls.append(" search  ", style="dim")
             controls.append("[t]", style="bold")
@@ -2507,7 +2683,9 @@ class HeadlessTidalPlayer:
             controls.append("[m]", style="bold")
             controls.append(" more", style="dim")
             if self._show_more:
-                controls.append("\n   [l]", style="bold")
+                controls.append("\n   [\u2191]", style="bold")
+                controls.append(" scrub  ", style="dim")
+                controls.append("[l]", style="bold")
                 controls.append(" like  ", style="dim")
                 controls.append("[r]", style="bold")
                 controls.append(" radio  ", style="dim")
@@ -2905,8 +3083,22 @@ class HeadlessTidalPlayer:
         """Search the user's own playlists — from the local index, never the
         network. TIDAL has no API for this, and the cache was built for it:
         every playlist it has fetched keeps the plain-text name, artists and
-        album of each track. A scan of a few thousand rows is instant, so this
-        runs on the UI thread and there is nothing to wait for."""
+        album of each track, and the playlist's own name alongside. A scan of a
+        few thousand rows is instant, so this runs on the UI thread and there
+        is nothing to wait for.
+
+        Four fields, case-insensitive substring on each, and the *order* is the
+        design: title, then artist, then album, then playlist name. Ranking
+        matters more the more fields there are — the playlist name is one
+        string standing in for every track under it, so a query that matched
+        only it would otherwise bury the track actually called that under a
+        whole "Late Night" playlist. Last place keeps "type the playlist's name
+        and get its tracks" working without letting it flood anything.
+
+        The one indexed field deliberately left out is the playlist's creator:
+        on your own playlists it is your own name on every row, which matches
+        everything or nothing and tells you neither.
+        """
         self._search_done = True  # local scan: everything it has, in one go
         if not self._cache.enabled:
             self._search_message = (
@@ -2914,19 +3106,26 @@ class HeadlessTidalPlayer:
             return
         names = {p.id: p.name for p in (self._cache.get_playlists() or [])}
         needle = query.lower()
-        exact, loose = [], []
+        # One bucket per field, kept in rank order and concatenated at the end.
+        # Within a bucket the index's own order survives, so two tracks that
+        # matched the same way stay in the order their playlists are in.
+        by_title, by_artist, by_album, by_playlist = [], [], [], []
+        matched_playlists = {pid for pid, pname in names.items()
+                             if needle in (pname or "").lower()}
         scanned = 0
         for playlist_id, record in self._cache.iter_tracks():
             scanned += 1
             name = record.get("name") or ""
             artists = ", ".join(record.get("artists") or [])
             album = record.get("album") or ""
-            # Case-insensitive substring, nothing cleverer: a title match is
-            # what you meant, so those lead; artist and album matches follow
             if needle in name.lower():
-                bucket = exact
-            elif needle in artists.lower() or needle in album.lower():
-                bucket = loose
+                bucket = by_title
+            elif needle in artists.lower():
+                bucket = by_artist
+            elif needle in album.lower():
+                bucket = by_album
+            elif playlist_id in matched_playlists:
+                bucket = by_playlist
             else:
                 continue
             bucket.append({
@@ -2936,7 +3135,7 @@ class HeadlessTidalPlayer:
                 "playlist": names.get(playlist_id, "Playlist"),
                 "obj": CachedTrack(record),
             })
-        self._search_results = exact + loose
+        self._search_results = by_title + by_artist + by_album + by_playlist
         if not self._search_results:
             self._search_message = (
                 "No results in your playlists" if scanned else
@@ -3398,6 +3597,9 @@ class HeadlessTidalPlayer:
                 self._clear_cached_songs()
             return
 
+        if self._handle_focus_key(key):
+            return
+
         if self._mode == self.MODE_SEARCH:
             self._handle_search_key(key)
         elif self._mode == self.MODE_BROWSE:
@@ -3413,6 +3615,42 @@ class HeadlessTidalPlayer:
         else:
             self._handle_player_key(key)
 
+    def _focus_player(self):
+        """Give the player the arrow keys. ↑ is what asks for it: from the top
+        of a list, where ↑ had nowhere left to go, and from the player screen,
+        where it did nothing at all. Pointless with no track to scrub."""
+        if self._current_track is not None:
+            self._player_focus = True
+
+    def _handle_focus_key(self, key: str) -> bool:
+        """Keys that belong to the player while it has focus. True when the key
+        was used up here.
+
+        This is the whole of the seeking interaction, and it is one rule in one
+        place rather than a branch per screen: focused, ←/→ scrub and ↓ (or
+        Esc) hands the arrows back. Anything else — typing a query, [t], Enter —
+        means the user is done scrubbing, so focus drops and the key goes on to
+        the screen it was meant for. Nothing is stolen: unfocused, every key
+        means exactly what it always did, including ←/→ for prev/next.
+        """
+        if not self._player_focus:
+            return False
+        if key == KEY_RIGHT:
+            self._seek_by(SEEK_STEP_SECONDS)
+            return True
+        if key == KEY_LEFT:
+            self._seek_by(-SEEK_STEP_SECONDS)
+            return True
+        if key in (" ", "k"):
+            self._toggle_play_key()
+            return True
+        if key == KEY_UP:
+            return True  # already as far up as focus goes
+        self._player_focus = False
+        # The two keys that mean "give the list back" and nothing more; every
+        # other key falls through to the screen underneath, now unfocused
+        return key in (KEY_DOWN, KEY_ESC)
+
     def _handle_player_key(self, key: str):
         if key in (" ", "k"):
             self._toggle_play_key()
@@ -3420,6 +3658,10 @@ class HeadlessTidalPlayer:
             self._next_track()
         elif key == KEY_LEFT:
             self._prev_track()
+        elif key == KEY_UP:
+            # No list here, so ↑ has always been a no-op: it is where scrubbing
+            # goes, and ←/→ keep meaning prev/next until it is pressed
+            self._focus_player()
         elif key == "s":
             self._mini_player = False
             self._mode = self.MODE_SEARCH
@@ -3477,8 +3719,10 @@ class HeadlessTidalPlayer:
             self._cycle_search_filter(-1)
             return
         if key == KEY_UP:
-            if self._search_results:
-                self._search_cursor = max(0, self._search_cursor - 1)
+            if self._search_results and self._search_cursor > 0:
+                self._search_cursor -= 1
+            else:
+                self._focus_player()
         elif key == KEY_DOWN:
             if self._search_results:
                 if self._search_cursor < len(self._search_results) - 1:
@@ -3508,8 +3752,10 @@ class HeadlessTidalPlayer:
             self._toggle_play_key()
             return
         if key == KEY_UP:
-            if self._browse_tracks:
-                self._browse_cursor = max(-1, self._browse_cursor - 1)
+            if self._browse_tracks and self._browse_cursor > -1:
+                self._browse_cursor -= 1
+            else:
+                self._focus_player()
         elif key == KEY_DOWN:
             if self._browse_tracks:
                 self._browse_cursor = min(len(self._browse_tracks) - 1, self._browse_cursor + 1)
@@ -3533,8 +3779,10 @@ class HeadlessTidalPlayer:
             self._toggle_play_key()
             return
         if key == KEY_UP:
-            if self._queue:
-                self._queue_cursor = max(0, self._queue_cursor - 1)
+            if self._queue and self._queue_cursor > 0:
+                self._queue_cursor -= 1
+            else:
+                self._focus_player()
         elif key == KEY_DOWN:
             if self._queue:
                 self._queue_cursor = min(len(self._queue) - 1, self._queue_cursor + 1)
@@ -3554,8 +3802,10 @@ class HeadlessTidalPlayer:
             self._toggle_play_key()
             return
         if key == KEY_UP:
-            if self._playlists:
-                self._playlists_cursor = max(0, self._playlists_cursor - 1)
+            if self._playlists and self._playlists_cursor > 0:
+                self._playlists_cursor -= 1
+            else:
+                self._focus_player()
         elif key == KEY_DOWN:
             if self._playlists:
                 self._playlists_cursor = min(len(self._playlists) - 1, self._playlists_cursor + 1)
