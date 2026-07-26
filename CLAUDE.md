@@ -123,21 +123,50 @@ which keeps a stream a single string everywhere else in the player.
 Search mode types the query with every printable key, so the only key left
 for a filter is one that isn't printable: `Tab` cycles the scope (All /
 Tracks / Albums / Artists / My Playlists, `Shift-Tab` backwards) and the
-scope row under the query says which is active. Changing scope drops the
-results but never fetches — `Enter` is the one keystroke that costs a
-request, the same as it is after typing.
+scope row under the query says which is active. **`Tab` applies the scope
+as you land on it** — no second keystroke — and it is still true that one
+search is one request, because a fetch buys the *query*, not the scope.
+
+`session.search()` is asked for **all three categories** whatever scope
+asked for it: `limit` is applied per type, so that is the same single
+request a scoped search used to make, with the other scopes paid for. What
+comes back goes into `_search_reservoir`, one per query, kept whole and
+never consumed. Each scope gets a `_search_views` record drawing on it —
+its own rows, cursor and `consumed` depth — so two scopes sit at two depths
+in the same rows, tabbing away and back restores the rows *and* the pages
+already fetched, and `_go_back` from an album needs nothing but the query
+and the scope. Cycling every scope after a search costs **zero** requests,
+measured in `TestScopeCache`; the artist page's tabs work the same way and
+for the same reason.
+
+Presence of a view record — loading or ready — is the whole answer to "has
+this scope been applied", which is what stops a held-down `Tab` fanning
+out. From cold it is `_search_fetching` that does it: the first `Tab`
+starts the one request and every scope behind it is left loading until that
+page lands, when `_fill_waiting_search_views` answers all of them at once.
+So 40 rapid presses are one request, and no new machinery: the same
+single-flight flag, `SEARCH_FETCH_MIN_INTERVAL` and `_search_gen` that
+paging already used.
 
 Under a type filter the whole page is that type; under All it stays the
-50/30/20 split. `session.search()` is asked for `page_size` of each category
-at an offset, and whatever the page had no room for is kept in
-`_search_pool`, so scrolling off the bottom usually costs nothing —
-`_search_more` spends the pool first and only fetches when it runs dry. The
-fetch is a daemon thread, one at a time (`_search_fetching`), no sooner than
-`SEARCH_FETCH_MIN_INTERVAL` after the last, and never past TIDAL's 300-item
-`SEARCH_MAX_OFFSET`; a held-down arrow therefore cannot fan out into
-requests. Rows are appended, so the cursor never moves under the user, and
-`_search_gen` makes a page that lands after the query changed throw itself
-away.
+50/30/20 split. `_search_pool` is now derived — what the reservoir holds
+that this scope has not shown, in this scope's categories only — and
+`_search_more` spends that before asking, never past TIDAL's 300-item
+`SEARCH_MAX_OFFSET`, one fetch at a time and no sooner than
+`SEARCH_FETCH_MIN_INTERVAL` after the last. Rows are appended, so the
+cursor never moves under the user. `exhausted` is per category because they
+run out at different depths: Albums being done says nothing about Tracks.
+
+The cache is **per session and in memory only** — deliberately not the
+on-disk index in `utils/cache.py`. It holds **one query at a time**: typing
+or backspacing drops the reservoir and every view (`_reset_search_results`,
+which also bumps `_search_gen` so a page in flight throws itself away), and
+`Enter` clears them too, which is what makes it the explicit refresh. Memory
+was never the reason — staleness is, and a query is retyped deliberately.
+Three states read differently: `Searching…` in yellow for a scope with no
+rows yet, `No results found` in green for one the query had nothing for, and
+`Already loaded this session` under rows that cost nothing. The scope row
+marks every scope already answered, so "Tab is free from here" is visible.
 
 "My Playlists" is answered entirely from `cache.iter_tracks()` — TIDAL has
 no server-side search of your own playlists — so it is instant, runs on the

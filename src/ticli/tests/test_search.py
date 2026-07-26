@@ -269,37 +269,60 @@ class TestTypeFilters:
 
     def test_tab_is_not_typed_into_the_query(self, config_file):
         p = HeadlessTidalPlayer()
+        p.session = _FakeSession()
         p._search_query = "monk"
         p._handle_search_key(player_mod.KEY_TAB)
         assert p._search_query == "monk"
 
+    def test_tab_applies_the_scope_without_a_second_keystroke(self, config_file):
+        """Tab is the whole gesture: no Enter, and the rows are there when the
+        key comes back up."""
+        p, session = _search(page_size=10)
+        p._handle_search_key(player_mod.KEY_TAB)
+        assert p._search_filter == "tracks"
+        assert {i["type"] for i in p._search_results} == {"track"}
+        assert len(p._search_results) == 10
+
     def test_tab_does_not_fetch_by_itself(self, config_file):
-        """Changing scope is a key you press repeatedly — Enter is what costs
-        a request, exactly as it does after typing."""
+        """Applying a scope instantly and never fanning out are the same
+        requirement: one request buys the query, and every scope is served out
+        of it."""
         p, session = _search(page_size=10)
         for _ in range(4):
             p._handle_search_key(player_mod.KEY_TAB)
         assert len(session.calls) == 1
-        assert p._search_results == []
 
-    def test_tracks_filter_asks_only_for_tracks(self, config_file):
+    def test_one_request_covers_every_scope(self, config_file):
+        """The measured cost of walking the whole scope row and back."""
+        p, session = _search(page_size=10)
+        assert len(session.calls) == 1
+        for _ in range(len(HeadlessTidalPlayer.SEARCH_FILTERS) * 2):
+            p._handle_search_key(player_mod.KEY_TAB)
+        assert p._search_filter == "all"  # two whole laps
+        assert len(session.calls) == 1
+
+    def test_a_fetch_asks_for_every_category(self, config_file):
+        """Why the laps are free: `limit` is per type, so one request at the
+        page size brings back a page of each — the same single request a
+        scoped search used to make, with the other scopes paid for."""
         import tidalapi
         p = _filtered("tracks", page_size=12)
-        assert p.session.calls[0]["models"] == [tidalapi.Track]
+        assert len(p.session.calls) == 1
+        assert p.session.calls[0]["models"] == [tidalapi.Track, tidalapi.Album,
+                                                tidalapi.Artist]
+
+    def test_tracks_filter_shows_only_tracks(self, config_file):
+        p = _filtered("tracks", page_size=12)
         assert {i["type"] for i in p._search_results} == {"track"}
         assert len(p._search_results) == 12  # a whole page of one type
 
-    def test_albums_filter_asks_only_for_albums(self, config_file):
-        import tidalapi
+    def test_albums_filter_shows_only_albums(self, config_file):
         p = _filtered("albums", page_size=12)
-        assert p.session.calls[0]["models"] == [tidalapi.Album]
         assert {i["type"] for i in p._search_results} == {"album"}
         assert len(p._search_results) == 12
 
-    def test_artists_filter_asks_only_for_artists(self, config_file):
-        import tidalapi
+    def test_artists_filter_shows_only_artists(self, config_file):
         p = _filtered("artists", page_size=12)
-        assert p.session.calls[0]["models"] == [tidalapi.Artist]
         assert {i["type"] for i in p._search_results} == {"artist"}
         assert len(p._search_results) == 12
 
@@ -321,6 +344,227 @@ class TestTypeFilters:
         p._search_filter = "playlists"
         p._handle_player_key("s")
         assert p._search_filter == "all"
+
+
+# ── the session's scope cache ──
+
+
+class TestScopeCache:
+    """Tab applies a scope at once, and every scope of one query is answered
+    out of one reservoir of rows kept for the session."""
+
+    def test_revisiting_a_scope_costs_nothing_and_keeps_its_rows(self, config_file):
+        p, session = _search(page_size=10)
+        p._handle_search_key(player_mod.KEY_TAB)  # tracks
+        first = [i["name"] for i in p._search_results]
+        for _ in range(len(HeadlessTidalPlayer.SEARCH_FILTERS)):
+            p._handle_search_key(player_mod.KEY_TAB)  # all the way round
+        assert p._search_filter == "tracks"
+        assert [i["name"] for i in p._search_results] == first
+        assert len(session.calls) == 1
+
+    def test_the_cursor_is_remembered_per_scope(self, config_file):
+        """Coming back to a scope comes back to where you were in it; a scope
+        you have never opened starts at the top."""
+        p, _ = _search(page_size=10)
+        p._search_cursor = 4
+        p._handle_search_key(player_mod.KEY_TAB)  # tracks
+        assert p._search_cursor == 0
+        p._search_cursor = 7
+        p._handle_search_key(player_mod.KEY_SHIFT_TAB)  # back to all
+        assert p._search_cursor == 4
+        p._handle_search_key(player_mod.KEY_TAB)
+        assert p._search_cursor == 7
+
+    def test_a_scope_round_trip_keeps_the_pages_already_fetched(self, config_file):
+        """Depth survives the trip: five pages deep in Tracks is still five
+        pages deep after a lap of the scope row, and costs nothing to get back."""
+        p = _paged(filter_name="tracks", page_size=10)
+        for expected in (20, 30, 40):
+            p._search_last_fetch = 0
+            _scroll_to_bottom(p)
+            assert _wait_for(lambda e=expected: len(p._search_results) == e)
+        deep, cursor = len(p._search_results), p._search_cursor
+        calls = len(p.session.calls)
+        for _ in range(len(HeadlessTidalPlayer.SEARCH_FILTERS)):
+            p._handle_search_key(player_mod.KEY_TAB)
+        assert p._search_filter == "tracks"
+        assert len(p._search_results) == deep == 40
+        assert p._search_cursor == cursor  # and where you were in them
+        assert len(p.session.calls) == calls
+
+    def test_paging_still_works_after_a_round_trip(self, config_file):
+        p = _paged(filter_name="tracks", page_size=10)
+        for _ in range(len(HeadlessTidalPlayer.SEARCH_FILTERS)):
+            p._handle_search_key(player_mod.KEY_TAB)
+        p._search_last_fetch = 0
+        _scroll_to_bottom(p)
+        assert _wait_for(lambda: len(p._search_results) == 20)
+        assert p.session.calls[-1]["offset"] == 10
+
+    def test_a_scope_deepened_by_one_pays_for_the_others_too(self, config_file):
+        """A page fetched under Tracks lands in the reservoir, so Albums gets
+        two pages out of it without a request of its own."""
+        p = _paged(filter_name="tracks", page_size=10)
+        p._search_last_fetch = 0
+        _scroll_to_bottom(p)
+        assert _wait_for(lambda: len(p._search_results) == 20)
+        calls = len(p.session.calls)
+        p._handle_search_key(player_mod.KEY_TAB)  # albums
+        p._handle_search_key(player_mod.KEY_DOWN)
+        _scroll_to_bottom(p)
+        assert len(p._search_results) == 20
+        assert len(p.session.calls) == calls
+
+    def test_held_tab_from_cold_is_one_request(self, config_file):
+        """Nothing fetched yet and the key held down: the first Tab starts the
+        one request, and every scope behind it waits on the same one."""
+        p = HeadlessTidalPlayer()
+        p._page_size = 10
+        p.session = _FakeSession()
+        p._search_query = "miles davis"
+        release = threading.Event()
+        started = []
+        real_search = p.session.search
+
+        def slow_search(*a, **kw):
+            started.append(1)  # counted on entry: the request is out by now
+            release.wait(2.0)
+            return real_search(*a, **kw)
+
+        p.session.search = slow_search
+        for _ in range(40):
+            p._handle_search_key(player_mod.KEY_TAB)
+        assert _wait_for(lambda: started)
+        assert len(started) == 1
+        assert p._search_loading or p._search_filter == "playlists"
+        release.set()
+        assert _wait_for(lambda: not p._search_fetching)
+        assert len(started) == 1
+        assert len(p.session.calls) == 1
+        # every scope the key passed through is answered by that one page
+        for scope in ("all", "tracks", "albums", "artists"):
+            assert p._search_views[scope]["results"], scope
+
+    def test_typing_drops_everything_filed_under_the_old_query(self, config_file):
+        p, session = _search(page_size=10)
+        p._handle_search_key(player_mod.KEY_TAB)
+        assert p._search_views
+        p._handle_search_key("x")
+        assert p._search_views == {}
+        assert p._search_results == []
+        assert p._search_offset == 0
+        assert len(session.calls) == 1  # typing never searches
+
+    def test_a_new_query_is_not_answered_by_the_old_one(self, config_file):
+        p, session = _search(page_size=10)
+        p._handle_search_key(player_mod.KEY_BACKSPACE)
+        p._handle_search_key(player_mod.KEY_TAB)  # tracks, on the new query
+        assert _wait_for(lambda: not p._search_loading)
+        assert len(session.calls) == 2
+        assert session.calls[-1]["query"] == p._search_query.strip()
+
+    def test_enter_is_the_refresh(self, config_file):
+        """The cache is per session, so Enter has to be the way past it — and
+        it clears every scope, not just the one on screen."""
+        p, session = _search(page_size=10)
+        p._handle_search_key(player_mod.KEY_TAB)
+        assert len(session.calls) == 1
+        p._do_search()
+        assert _wait_for(lambda: not p._search_loading)
+        assert len(session.calls) == 2
+        assert set(p._search_views) == {"tracks"}  # the others start over too
+
+    def test_going_back_from_a_result_asks_for_nothing(self, config_file):
+        p, session = _search(page_size=10)
+        p._mode = p.MODE_SEARCH
+        p._handle_search_key(player_mod.KEY_TAB)  # tracks
+        p._search_cursor = 3
+        p._push_nav()
+        p._mode = p.MODE_BROWSE
+        p._go_back()
+        assert p._mode == p.MODE_SEARCH
+        assert p._search_filter == "tracks"
+        assert p._search_cursor == 3
+        assert len(p._search_results) == 10
+        assert len(session.calls) == 1
+
+    def test_an_empty_category_is_not_asked_for_twice(self, config_file):
+        """A scope TIDAL had nothing for says so, and stays said."""
+        p, session = _search(page_size=10, caps={"albums": 0})
+        p._handle_search_key(player_mod.KEY_TAB)
+        p._handle_search_key(player_mod.KEY_TAB)  # albums
+        assert p._search_filter == "albums"
+        assert p._search_results == []
+        assert p._search_message == "No results found"
+        assert len(session.calls) == 1
+
+    def test_a_failed_query_is_reported_on_every_scope(self, config_file):
+        p = HeadlessTidalPlayer()
+        p._page_size = 10
+
+        def boom(*a, **kw):
+            raise RuntimeError("network down")
+
+        p.session = types.SimpleNamespace(search=boom, audio_quality=None)
+        p._search_query = "x"
+        p._do_search()
+        assert _wait_for(lambda: not p._search_loading)
+        assert "Search failed" in p._search_message
+        p._handle_search_key(player_mod.KEY_TAB)
+        assert "Search failed" in p._search_message  # and no second attempt
+
+    def test_loading_empty_and_cached_read_differently(self, config_file):
+        p, _ = _search(page_size=10)
+        p._put_search_view("all", loading=True, results=[])
+        assert "Searching..." in p._build_search_display().plain
+        p._put_search_view("all", loading=False, results=[], message="No results found")
+        assert "No results found" in p._build_search_display().plain
+        assert "Searching..." not in p._build_search_display().plain
+        p._handle_search_key(player_mod.KEY_TAB)  # tracks, straight from the pool
+        text = p._build_search_display().plain
+        assert "Already loaded this session" in text
+        assert "Searching..." not in text
+
+    def test_a_scope_paying_for_its_own_page_does_not_claim_to_be_free(self, config_file):
+        p = _paged(filter_name="tracks", page_size=10)
+        assert "Already loaded this session" not in p._build_search_display().plain
+
+    def test_my_playlists_costs_nothing_and_keeps_its_messages(self, config_file, cache_dir):
+        """The local scan is reached by Tab like any other scope, and the two
+        things it has to say about an index it cannot use still get said."""
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        p.session = _FakeSession()
+        p._search_query = "so what"
+        for _ in range(4):
+            p._handle_search_key(player_mod.KEY_TAB)
+        assert p._search_filter == "playlists"
+        assert [r["name"] for r in p._search_results] == ["So What"]
+        # One request for the four network scopes, and none for this one
+        before = len(p.session.calls)
+        p._handle_search_key(player_mod.KEY_TAB)
+        p._handle_search_key(player_mod.KEY_SHIFT_TAB)
+        assert len(p.session.calls) == before
+
+    def test_tabbing_onto_an_empty_index_still_says_so(self, config_file, cache_dir):
+        p = HeadlessTidalPlayer()
+        p.session = _FakeSession()
+        p._search_query = "anything"
+        p._search_filter = "artists"
+        p._handle_search_key(player_mod.KEY_TAB)
+        assert p._search_filter == "playlists"
+        assert "Nothing cached" in p._search_message
+
+    def test_tabbing_onto_a_disabled_cache_still_says_so(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        save_config({**config_mod.DEFAULTS, "cache_metadata": False})
+        p = HeadlessTidalPlayer()
+        p.session = _FakeSession()
+        p._search_query = "so what"
+        p._search_filter = "artists"
+        p._handle_search_key(player_mod.KEY_TAB)
+        assert "metadata cache" in p._search_message
 
 
 # ── paging on scroll ──
@@ -464,7 +708,7 @@ class TestFetchMoreOnScroll:
 
     def test_a_fetch_in_flight_is_visible(self, config_file):
         p = _paged(page_size=10)
-        p._search_fetching = True
+        p._put_search_view(p._search_filter, loading=True)
         assert "Loading more" in p._build_search_display().plain
 
     def test_the_offset_ceiling_is_respected(self, config_file):

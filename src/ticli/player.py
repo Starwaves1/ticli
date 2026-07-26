@@ -351,6 +351,38 @@ def _empty_search_pool() -> dict:
     return {"tracks": [], "albums": [], "artists": []}
 
 
+def _empty_search_reservoir() -> dict:
+    """Everything one query has brought back, kept whole and never consumed.
+
+    A fetch asks for all three categories at once, so this is what every scope
+    draws on: `offset` is how deep into the query it has gone, `exhausted` is
+    per category because they run out at different depths, and `stopped` is a
+    failure the scopes should stop asking about. In memory only, for the length
+    of the run — deliberately not the on-disk index in utils/cache.py.
+    """
+    return {
+        "tracks": [], "albums": [], "artists": [],
+        "offset": 0,
+        "exhausted": {"tracks": False, "albums": False, "artists": False},
+        "stopped": False,
+        "message": "",
+    }
+
+
+def _empty_search_view() -> dict:
+    """One scope's answer to one query.
+
+    `consumed` is how far into each of the reservoir's categories this scope
+    has already drawn — the scope's paging depth, which is what makes tabbing
+    away and back come back to the same rows. `cached` records that the view
+    was shown without a request of its own, because the display says so.
+    """
+    return {
+        "loading": False, "results": [], "cursor": 0, "message": "",
+        "consumed": {"tracks": 0, "albums": 0, "artists": 0}, "cached": False,
+    }
+
+
 def _split_keys(data: str) -> list:
     """Split one raw stdin read into individual keys.
 
@@ -1178,24 +1210,23 @@ class HeadlessTidalPlayer:
         self._seek_applied: Optional[float] = None
         self._seek_applying = False
         self._last_seek_apply = 0.0
-        # Search state
+        # Search state. Results, cursor and message are not attributes: they
+        # are properties over the *view* for the scope on screen, so Tab is a
+        # change of which view is being read and nothing has to be copied.
         self._search_query = ""
-        self._search_results = []
-        self._search_cursor = 0
-        self._search_loading = False
-        self._search_message = ""
         self._search_history: list = []  # recent searches, newest first
-        # Which scope the query runs in, and the paging state behind it.
-        # The pool is what a fetch brought back but the page had no room for;
-        # scrolling past the bottom spends that before asking TIDAL again.
+        # Which scope the query runs in, and what the session has in hand for
+        # it: one reservoir of rows per query, and one view per scope drawing
+        # on it. Both are dropped the moment the query changes.
         self._search_filter = "all"
-        self._search_pool: dict = _empty_search_pool()
-        self._search_offset = 0
-        self._search_done = False  # TIDAL has nothing more behind this query
-        self._search_fetching = False  # a "load more" is in flight
+        self._search_key = ""  # the query the reservoir and views belong to
+        self._search_reservoir: dict = _empty_search_reservoir()
+        self._search_views: dict = {}
+        self._search_fetching = False  # a page is in flight (any scope)
         self._search_last_fetch = 0.0
-        # Bumped whenever the query, the scope or the results are reset, so a
-        # fetch that lands after the fact knows to throw its page away
+        # Bumped whenever the query is reset, so a fetch that lands after the
+        # fact knows to throw its page away. Not on a scope change: that page
+        # is still for this query, and every scope is served out of it.
         self._search_gen = 0
         # Browse state
         self._browse_title = ""
@@ -2307,7 +2338,9 @@ class HeadlessTidalPlayer:
         content.append("\u2588", style="bold white")
 
         # The scope row. It is always on screen, so Tab has something to point
-        # at and the active scope is never hidden state.
+        # at and the active scope is never hidden state. A scope already shown
+        # for this query is marked, so "Tab is free from here on" is visible
+        # rather than something you have to have read the source to know.
         content.append("\n   [Tab]", style="bold")
         for i, name in enumerate(self.SEARCH_FILTERS):
             content.append("  " if i == 0 else " \u00b7 ", style="dim")
@@ -2315,8 +2348,13 @@ class HeadlessTidalPlayer:
             content.append(
                 self.SEARCH_FILTER_LABELS[name],
                 style="bold cyan" if active else "dim")
+            if name in self._search_views and not self._search_views[name]["loading"]:
+                content.append("\u00b7", style="dim cyan")
 
-        if self._search_loading:
+        if self._search_loading and not self._search_results:
+            # A scope waiting for its first page. Not the same as one that came
+            # back empty (green, below) and not the same as one served out of
+            # what the session already had (marked under the rows).
             content.append("\n\n   Searching...", style="dim yellow")
         elif self._search_message:
             content.append(f"\n\n   {self._search_message}", style="dim green")
@@ -2341,10 +2379,15 @@ class HeadlessTidalPlayer:
                     content.append(f"  {item['artist']}", style="dim")
                 if item.get("playlist"):
                     content.append(f"  in {item['playlist']}", style="dim cyan")
-            if self._search_fetching:
+            if self._search_loading:
                 # The next page is on its way — say so under the last row, so
                 # scrolling off the bottom never looks like a frozen player
                 content.append("\n\n   Loading more...", style="dim yellow")
+            elif self._search_view()["cached"]:
+                # These rows cost nothing: they were already in hand when Tab
+                # landed here. Said plainly, because "instant" and "stale" are
+                # the same thing seen from two sides.
+                content.append("\n\n   Already loaded this session", style="dim")
             if total > page:
                 page_num = (self._search_cursor // page) + 1
                 total_pages = (total + page - 1) // page
@@ -2961,15 +3004,13 @@ class HeadlessTidalPlayer:
         if self._mode == self.MODE_SEARCH:
             self._nav_history.append({
                 "mode": self.MODE_SEARCH,
+                # The rows, the pool and the paging depth are all still in
+                # _search_views and the reservoir behind it, so coming back
+                # from an album needs nothing but the query and the scope it
+                # was in — and asks TIDAL for nothing at all
                 "query": self._search_query,
-                "results": list(self._search_results),
-                "cursor": self._search_cursor,
-                # Paging comes back too, so coming back from an album lands you
-                # where you were and scrolling on still fetches the next page
                 "filter": self._search_filter,
-                "pool": dict(self._search_pool),
-                "offset": self._search_offset,
-                "done": self._search_done,
+                "cursor": self._search_cursor,
             })
         elif self._mode == self.MODE_BROWSE:
             self._nav_history.append({
@@ -3007,16 +3048,12 @@ class HeadlessTidalPlayer:
         if mode == self.MODE_SEARCH:
             self._mode = self.MODE_SEARCH
             self._search_query = state.get("query", "")
-            self._search_results = state.get("results", [])
-            self._search_cursor = state.get("cursor", 0)
             self._search_filter = state.get("filter", "all")
-            self._search_pool = state.get("pool") or _empty_search_pool()
-            self._search_offset = state.get("offset", 0)
-            self._search_done = state.get("done", False)
-            self._search_gen += 1  # anything still in flight belongs to the old view
-            self._search_loading = False
-            self._search_fetching = False
-            self._search_message = ""
+            if self._search_filter in self._search_views:
+                self._search_cursor = state.get("cursor", 0)
+            # The generation is deliberately left alone: a page still in flight
+            # is for this same query, and the scope that asked for it is still
+            # waiting for it here.
         elif mode == self.MODE_BROWSE:
             self._mode = self.MODE_BROWSE
             self._browse_title = state.get("title", "")
@@ -3063,14 +3100,21 @@ class HeadlessTidalPlayer:
         artists = max(1, page * 2 // 10)
         return max(1, page - albums - artists), albums, artists
 
-    def _search_kinds(self) -> tuple:
-        """Which categories the active scope asks TIDAL for."""
-        return self.SEARCH_FILTER_KINDS.get(self._search_filter, ())
+    def _search_kinds(self, scope: Optional[str] = None) -> tuple:
+        """Which of the reservoir's categories a scope shows."""
+        return self.SEARCH_FILTER_KINDS.get(scope or self._search_filter, ())
 
-    def _search_models(self) -> list:
-        """The tidalapi models behind those categories."""
-        models = {"tracks": tidalapi.Track, "albums": tidalapi.Album, "artists": tidalapi.Artist}
-        return [models[kind] for kind in self._search_kinds()]
+    @staticmethod
+    def _search_models() -> list:
+        """What a fetch asks TIDAL for — always all three categories, whatever
+        scope asked for it.
+
+        `limit` is applied per type, so this is the same single request either
+        way; the payload is bigger and every other scope is then answered out
+        of it for free. That is the whole trade: one request buys the query,
+        not the scope, so Tab can apply immediately without costing anything.
+        """
+        return [tidalapi.Track, tidalapi.Album, tidalapi.Artist]
 
     def _search_row(self, kind: str, obj) -> dict:
         """One result row. Everything downstream reads these, not the objects."""
@@ -3082,79 +3126,251 @@ class HeadlessTidalPlayer:
             return {"type": "album", "name": obj.name, "artist": artist, "obj": obj}
         return {"type": "artist", "name": obj.name, "artist": "", "obj": obj}
 
-    def _take_search_page(self, pool: dict, page: int) -> tuple:
-        """One page of rows out of the pool, and what the pool has left.
+    # ── The per-scope views over one query's reservoir ──
+
+    def _search_view(self, scope: Optional[str] = None) -> dict:
+        """The view for a scope, or an empty one if it has never been shown.
+        Presence in `_search_views` — not any flag inside the record — is the
+        answer to "has this scope been applied to this query", exactly as
+        `_artist_sections` answers it for the artist page's tabs."""
+        return self._search_views.get(scope or self._search_filter) or _empty_search_view()
+
+    def _put_search_view(self, scope: str, **changes):
+        """Replace a view whole. Both dicts are assigned, never mutated, so a
+        paint racing a fetch reads one complete record or the other."""
+        self._search_views = {
+            **self._search_views, scope: {**self._search_view(scope), **changes}}
+
+    @property
+    def _search_results(self) -> list:
+        return self._search_view()["results"]
+
+    @_search_results.setter
+    def _search_results(self, value: list):
+        self._put_search_view(self._search_filter, results=list(value))
+
+    @property
+    def _search_message(self) -> str:
+        return self._search_view()["message"]
+
+    @property
+    def _search_loading(self) -> bool:
+        """The scope on screen is waiting for rows — its first page or its
+        next one; the display tells those apart by whether it has any yet."""
+        return self._search_view()["loading"]
+
+    @property
+    def _search_cursor(self) -> int:
+        return self._search_view()["cursor"]
+
+    @_search_cursor.setter
+    def _search_cursor(self, value: int):
+        self._put_search_view(self._search_filter, cursor=value)
+
+    @property
+    def _search_offset(self) -> int:
+        """How deep into the query the reservoir has gone — one number for
+        every scope, because one fetch deepens all of them."""
+        return self._search_reservoir["offset"]
+
+    @_search_offset.setter
+    def _search_offset(self, value: int):
+        self._search_reservoir = {**self._search_reservoir, "offset": value}
+
+    @property
+    def _search_pool(self) -> dict:
+        """What the reservoir still holds that the scope on screen has not
+        shown. Only that scope's categories: a page of albums nobody asked for
+        is not "more results" under Tracks."""
+        consumed = self._search_view()["consumed"]
+        pool = _empty_search_pool()
+        for kind in self._search_kinds():
+            pool[kind] = self._search_reservoir[kind][consumed.get(kind, 0):]
+        return pool
+
+    @property
+    def _search_done(self) -> bool:
+        return self._search_scope_done(self._search_filter)
+
+    @_search_done.setter
+    def _search_done(self, value: bool):
+        self._search_reservoir = {**self._search_reservoir, "stopped": bool(value)}
+
+    def _search_scope_done(self, scope: str) -> bool:
+        """Nothing more will ever come for this scope: the query failed, TIDAL
+        has nothing past 300, or every category it shows has run short. An
+        empty tuple of categories (My Playlists) is done by construction."""
+        reservoir = self._search_reservoir
+        if reservoir["stopped"] or reservoir["offset"] >= SEARCH_MAX_OFFSET:
+            return True
+        return all(reservoir["exhausted"][kind] for kind in self._search_kinds(scope))
+
+    def _take_search_page(self, scope: str, consumed: dict, page: int) -> tuple:
+        """One page of rows for a scope, out of the reservoir at `consumed`,
+        and the depth that leaves behind.
 
         Under a type filter the page is all of that type; under "All" it is the
-        50/30/20 split, still exactly `page` rows. Never mutates the pool it is
-        given — the caller swaps in the returned one whole.
+        50/30/20 split, still exactly `page` rows. Reads the reservoir, never
+        touches it — two scopes can be at two depths in the same rows.
         """
-        if self._search_filter == "all":
+        reservoir = self._search_reservoir
+        kinds = ("tracks", "albums", "artists")
+        avail = {kind: len(reservoir[kind]) - consumed.get(kind, 0) for kind in kinds}
+        if scope == "all":
             n_tracks, n_albums, n_artists = self._search_split(page)
             # A query with one album shouldn't waste the other album rows —
             # hand the shortfall to tracks, which is what you searched for
-            n_albums = min(n_albums, len(pool["albums"]))
-            n_artists = min(n_artists, len(pool["artists"]))
-            n_tracks = min(page - n_albums - n_artists, len(pool["tracks"]))
+            n_albums = min(n_albums, avail["albums"])
+            n_artists = min(n_artists, avail["artists"])
+            n_tracks = min(page - n_albums - n_artists, avail["tracks"])
             counts = {"tracks": n_tracks, "albums": n_albums, "artists": n_artists}
         else:
-            counts = {kind: page for kind in self._search_kinds()}
+            counts = {kind: page for kind in self._search_kinds(scope)}
 
         items = []
-        rest = _empty_search_pool()
-        for kind in ("tracks", "albums", "artists"):
-            take = min(counts.get(kind, 0), len(pool[kind]))
-            items.extend(self._search_row(kind, obj) for obj in pool[kind][:take])
-            rest[kind] = pool[kind][take:]
+        rest = dict(consumed)
+        for kind in kinds:
+            start = consumed.get(kind, 0)
+            take = min(counts.get(kind, 0), avail[kind])
+            items.extend(self._search_row(kind, obj)
+                         for obj in reservoir[kind][start:start + take])
+            rest[kind] = start + take
         return items, rest
 
     @staticmethod
     def _pool_size(pool: dict) -> int:
         return sum(len(v) for v in pool.values())
 
+    def _search_servable(self, scope: str) -> bool:
+        """Can the rows already in hand answer this scope's next page?
+
+        A short page — or none at all — only counts once the query has nothing
+        left to give: otherwise the first Tab onto a thin category would settle
+        for four rows. But once it *is* done, an empty category is the answer,
+        and asking again would only fetch a page TIDAL has already said it does
+        not have.
+        """
+        consumed = self._search_view(scope)["consumed"]
+        held = sum(len(self._search_reservoir[kind]) - consumed.get(kind, 0)
+                   for kind in self._search_kinds(scope))
+        if held >= self._page_size:
+            return True
+        return self._search_scope_done(scope) and self._search_reservoir["offset"] > 0
+
+    def _fill_search_view(self, scope: str):
+        """Append one page to a scope out of the reservoir, and say so when
+        there was nothing there to append."""
+        view = self._search_view(scope)
+        items, consumed = self._take_search_page(scope, view["consumed"], self._page_size)
+        self._put_search_view(
+            scope, results=view["results"] + items, consumed=consumed, loading=False,
+            message="" if (view["results"] or items) else "No results found")
+
+    def _fill_waiting_search_views(self):
+        """A page landed: hand it to every scope that was waiting for one.
+        Not just the scope on screen — a Tab while the request was out left
+        others loading, and they are answered by the same rows."""
+        for scope in self.SEARCH_FILTERS:
+            if scope in self._search_views and self._search_views[scope]["loading"]:
+                self._fill_search_view(scope)
+
+    def _fail_waiting_search_views(self, message: str):
+        """The request the waiting scopes were waiting for did not come back.
+        One that already has rows keeps them and simply stops paging."""
+        for scope in self.SEARCH_FILTERS:
+            view = self._search_views.get(scope)
+            if view is None or not view["loading"]:
+                continue
+            self._put_search_view(
+                scope, loading=False, message="" if view["results"] else message)
+
     def _reset_search_results(self):
-        """Forget the current results and everything paging knows about them.
-        Bumping the generation is what makes a fetch already in flight drop
-        its page instead of appending it to a list it no longer belongs to."""
+        """Forget the query and everything filed under it — every scope's view
+        and the reservoir they all draw on. Bumping the generation is what
+        makes a fetch already in flight drop its page instead of pouring it
+        into a reservoir that no longer belongs to that query."""
         self._search_gen += 1
-        self._search_results = []
-        self._search_cursor = 0
-        self._search_message = ""
-        self._search_pool = _empty_search_pool()
-        self._search_offset = 0
-        self._search_done = False
+        self._search_key = ""
+        self._search_views = {}
+        self._search_reservoir = _empty_search_reservoir()
+        self._search_fetching = False
 
     def _cycle_search_filter(self, step: int = 1):
-        """Tab through the scopes. Changing scope drops the results but does
-        not refetch: every scope but "My Playlists" costs a request, and Tab is
-        a key you press repeatedly. Enter runs the search, exactly as it does
-        after typing — one deliberate keystroke, one request."""
+        """Tab through the scopes, applying each one as you land on it — no
+        second keystroke. It is not the fan-out it looks like: a fetch asks for
+        all three categories at once, so the scopes share one reservoir and
+        cycling every one of them after a search costs nothing at all. The
+        cursor lives in the view, so coming back comes back to where you were.
+        """
         order = self.SEARCH_FILTERS
         self._search_filter = order[(order.index(self._search_filter) + step) % len(order)]
-        self._reset_search_results()
-        self._search_loading = False
+        self._apply_search_scope()
 
     def _do_search(self):
+        """Enter: the explicit search, and the explicit refresh. Everything
+        filed under this query goes — every scope's rows, not just the one on
+        screen — so Enter is how you get past the session's cache."""
         query = self._search_query.strip()
         if not query:
             return
         self._add_to_history(query)
         self._reset_search_results()
-        if self._search_filter == "playlists":
+        self._search_key = query
+        self._apply_search_scope()
+
+    def _apply_search_scope(self):
+        """Show the scope on screen, and ask TIDAL for it only if nothing
+        already in hand can answer it.
+
+        The three ways out without a request are the point: a scope visited
+        before, a scope the reservoir can fill, and a scope whose page is
+        already on its way — that last one is what makes a held-down Tab one
+        request rather than five.
+        """
+        query = self._search_query.strip()
+        if not query:
+            return
+        scope = self._search_filter
+        if query != self._search_key:
+            # Tabbed onto a query nothing is filed under (typing never
+            # searches): start the query here, in this scope
+            self._reset_search_results()
+            self._search_key = query
+        elif scope in self._search_views:
+            # Visited already, loading or ready — either way there is nothing
+            # to do. Only a finished one counts as free: a scope still waiting
+            # on the request it started must not claim it cost nothing.
+            if not self._search_views[scope]["loading"]:
+                self._put_search_view(scope, cached=True)
+            return
+        if scope == "playlists":
             self._search_own_playlists(query)
             return
-        self._search_loading = True
+        if self._search_reservoir["message"]:
+            self._put_search_view(scope, loading=False,
+                                  message=self._search_reservoir["message"])
+            return
+        if self._search_servable(scope):
+            self._put_search_view(scope, cached=True)
+            self._fill_search_view(scope)
+            return
+        self._put_search_view(scope, loading=True, message="", cached=False)
+        if self._search_fetching:
+            return  # the page already in flight will fill this view too
+        self._search_fetching = True
         self._fetch_search_page(query, self._search_gen)
 
     def _fetch_search_page(self, query: str, gen: int):
         """One page of results from TIDAL, on a daemon thread.
 
+        It fills the reservoir, not a scope: whatever comes back belongs to the
+        query, and every scope waiting on it is served out of the same rows.
+
         Snapshot the page size now: changing the setting mid-flight retunes the
         next search, it never refetches this one.
         """
         page = self._page_size
-        offset = self._search_offset
-        kinds = self._search_kinds()
+        offset = self._search_reservoir["offset"]
         models = self._search_models()
         self._search_last_fetch = time.monotonic()
 
@@ -3165,32 +3381,32 @@ class HeadlessTidalPlayer:
                 # one category comes up short.
                 results = self.session.search(query, models=models, limit=page, offset=offset)
                 if gen != self._search_gen:
-                    return  # the query or the scope moved on while we were out
-                pool = _empty_search_pool()
-                short = True
-                for kind in kinds:
-                    found = list(results.get(kind) or [])
-                    pool[kind] = self._search_pool[kind] + found
-                    if len(found) >= page:
-                        short = False
-                # A page TIDAL couldn't fill for any category is the last one,
-                # and it never has more than 300 items behind a query anyway
-                self._search_offset = offset + page
-                self._search_done = short or self._search_offset >= SEARCH_MAX_OFFSET
-                items, rest = self._take_search_page(pool, page)
-                if gen != self._search_gen:
-                    return
-                self._search_pool = rest
-                self._search_results = self._search_results + items
-                if not self._search_results:
-                    self._search_message = "No results found"
+                    return  # the query moved on while we were out
+                reservoir = self._search_reservoir
+                found = {kind: list(results.get(kind) or [])
+                         for kind in ("tracks", "albums", "artists")}
+                # A category TIDAL couldn't fill has nothing more behind it, and
+                # there is never more than 300 items behind a query anyway
+                self._search_reservoir = {
+                    **reservoir,
+                    **{kind: reservoir[kind] + rows for kind, rows in found.items()},
+                    "offset": offset + page,
+                    "exhausted": {kind: reservoir["exhausted"][kind] or len(rows) < page
+                                  for kind, rows in found.items()},
+                }
+                self._fill_waiting_search_views()
             except Exception as e:
                 if gen == self._search_gen:
-                    self._search_message = f"Search failed: {e}"
-                    self._search_done = True
+                    message = f"Search failed: {e}"
+                    self._search_reservoir = {
+                        **self._search_reservoir, "stopped": True, "message": message}
+                    self._fail_waiting_search_views(message)
             finally:
-                self._search_loading = False
-                self._search_fetching = False
+                # Only while this is still the query being searched: a fetch
+                # that has been superseded must not open the gate on the one
+                # that replaced it
+                if gen == self._search_gen:
+                    self._search_fetching = False
                 self._wake()  # results landed off the UI thread; repaint now
 
         threading.Thread(target=_run, daemon=True).start()
@@ -3198,29 +3414,27 @@ class HeadlessTidalPlayer:
     def _search_more(self):
         """The next page, asked for by scrolling off the bottom of this one.
 
-        Free whenever the last fetch overshot the page — that surplus is
-        already in the pool. Only an empty pool costs a request, and only one
-        is ever in flight, so holding the down arrow can't fan out.
+        Free whenever the reservoir still holds rows this scope has not shown —
+        which is most of the time, since every fetch brings back a page of each
+        category. Only an empty one costs a request, and only one is ever in
+        flight, so holding the down arrow can't fan out.
         """
         if self._search_loading or self._search_fetching:
             return
-        if self._search_filter == "playlists":
+        scope = self._search_filter
+        if scope == "playlists":
             return  # a local scan already returned everything it has
-        page = self._page_size
-        pool = self._search_pool
-        if self._pool_size(pool) >= page or (self._search_done and self._pool_size(pool)):
-            items, rest = self._take_search_page(pool, page)
-            self._search_pool = rest
-            self._search_results = self._search_results + items
+        if self._search_servable(scope):
+            self._fill_search_view(scope)
             return
-        if self._search_done or self._search_offset >= SEARCH_MAX_OFFSET:
-            self._search_done = True
+        if self._search_scope_done(scope):
             return
         if time.monotonic() - self._search_last_fetch < SEARCH_FETCH_MIN_INTERVAL:
             return
         query = self._search_query.strip()
         if not query:
             return
+        self._put_search_view(scope, loading=True, cached=False)
         self._search_fetching = True
         self._fetch_search_page(query, self._search_gen)
 
@@ -3244,10 +3458,14 @@ class HeadlessTidalPlayer:
         on your own playlists it is your own name on every row, which matches
         everything or nothing and tells you neither.
         """
-        self._search_done = True  # local scan: everything it has, in one go
+        # A local scan returns everything it has in one go, so this view is
+        # complete the moment it is written — nothing pages it and nothing
+        # refetches it for the rest of the query's life
         if not self._cache.enabled:
-            self._search_message = (
-                "Playlist search needs the metadata cache — turn 'Cache playlists' on in settings")
+            self._put_search_view(
+                "playlists", loading=False, results=[], cursor=0,
+                message="Playlist search needs the metadata cache — "
+                        "turn 'Cache playlists' on in settings")
             return
         names = {p.id: p.name for p in (self._cache.get_playlists() or [])}
         needle = query.lower()
@@ -3280,11 +3498,12 @@ class HeadlessTidalPlayer:
                 "playlist": names.get(playlist_id, "Playlist"),
                 "obj": CachedTrack(record),
             })
-        self._search_results = by_title + by_artist + by_album + by_playlist
-        if not self._search_results:
-            self._search_message = (
+        results = by_title + by_artist + by_album + by_playlist
+        self._put_search_view(
+            "playlists", loading=False, results=results, cursor=0, cached=False,
+            message="" if results else (
                 "No results in your playlists" if scanned else
-                "Nothing cached to search yet — open Playlists once to index them")
+                "Nothing cached to search yet — open Playlists once to index them"))
 
     def _select_search_result(self):
         if not self._search_results:
