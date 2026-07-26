@@ -372,6 +372,18 @@ HLS_VERSION = 7
 # "file,crypto,data", which silently turns every segment into an error.
 HLS_PROTOCOLS = "file,http,https,tcp,tls,crypto"
 HLS_SUFFIX = ".m3u8"
+# How far ahead mpv is told to buffer a segmented stream. mpv's --cache
+# defaults to "auto", which means "on for a network stream" — and the playlist
+# it is handed is a *local file*, so it decides the stream is local and leaves
+# the cache off. The readahead is then --demuxer-readahead-secs, whose default
+# is 1: measured with `demuxer-cache-duration` over IPC, mpv sat at exactly
+# 1.02s of buffer for the whole track while fetching 4-second FLAC segments off
+# the network. Any fetch that takes longer than that second is an audible
+# hitch, which is precisely what was reported. --cache=yes restores the
+# buffering mpv would have applied to a plain https:// URL; --cache-secs bounds
+# it in time, because its own default is 3600000 (i.e. "the whole track"), and
+# the ceiling should be seconds of audio rather than megabytes of hi-res.
+HLS_CACHE_SECONDS = 60
 # How much of the backend's own complaint fits on the toast line, and how long
 # it stays up — longer than an ordinary toast, because it is the only notice
 # that the thing the user asked for did not happen.
@@ -934,6 +946,10 @@ class AudioPlayer:
         mpv would otherwise treat an .m3u8 as a list of files to play one
         after another, and each fMP4 fragment on its own is not a file any
         demuxer can open.
+
+        The cache flags are here for the same reason as the rest: handing mpv
+        a local playlist for a remote stream is what made it stop buffering
+        like a network player (see HLS_CACHE_SECONDS).
         """
         if self.player_cmd == "mpv":
             return [
@@ -942,6 +958,7 @@ class AudioPlayer:
                 # to be passed length-prefixed to survive intact
                 f"--demuxer-lavf-o=protocol_whitelist="
                 f"%{len(HLS_PROTOCOLS)}%{HLS_PROTOCOLS}",
+                "--cache=yes", f"--cache-secs={HLS_CACHE_SECONDS}",
             ]
         return ["-protocol_whitelist", HLS_PROTOCOLS, "-f", "hls"]
 
