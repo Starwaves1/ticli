@@ -112,6 +112,41 @@ def audio_dir() -> Path:
     return CACHE_DIR / "audio"
 
 
+def artwork_dir() -> Path:
+    """Rendered cover art (see utils/artwork.py).
+
+    Its own directory, deliberately outside audio_dir: the budget, the song
+    count and the eviction order are all about audio, and a few hundred files
+    of a few hundred bytes each must not move any of those numbers. Artwork
+    keeps its own small ceiling instead.
+    """
+    return CACHE_DIR / "artwork"
+
+
+def clear_artwork() -> int:
+    """Delete every rendered cover. Returns how many went.
+
+    By name, like every other deletion here: only files ticli wrote (the
+    `.art` renderings and any `.tmp` left by an interrupted write) are
+    touched, never the directory.
+    """
+    removed = 0
+    try:
+        entries = list(artwork_dir().iterdir())
+    except OSError:
+        return removed
+    for path in entries:
+        if path.suffix not in (".art", ".tmp"):
+            continue
+        try:
+            if path.is_file():
+                path.unlink()
+                removed += 1
+        except OSError as e:
+            logger.debug("Could not delete cached artwork %s: %s", path, e)
+    return removed
+
+
 # ── Record shims ──
 #
 # What comes back out of the cache is not a tidalapi object and never
@@ -302,9 +337,10 @@ class MetadataCache:
         self._save(entries)
 
     def clear(self) -> None:
-        """Drop everything — the metadata index and any cached audio."""
+        """Drop everything — the index, any cached audio, any cover art."""
         self.clear_metadata()
         self.clear_audio()
+        clear_artwork()
 
     def clear_metadata(self) -> None:
         """Forget the index. Turning metadata caching off has to mean the disk
