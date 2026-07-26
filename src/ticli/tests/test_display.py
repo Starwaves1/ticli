@@ -46,8 +46,14 @@ MODES = (
 )
 
 # The widths a real window gets dragged to. 60 is where the old fixed-width
-# progress bar started wrapping and 120 is past every ceiling in the layout.
+# progress bar started wrapping, 80 is the last one that still stacks the
+# cover above the track, 100 is the first that puts it beside, and 120 is
+# past every ceiling in the layout.
 WIDTHS = (60, 80, 100, 120)
+# Both sides of MIN_BESIDE_WIDTH (83) at every height the matrix uses, so the
+# frame is measured with the cover above the text and beside it.
+OVERFLOW_WIDTHS = (40, 50, 60, 80, 100, 120)
+OVERFLOW_HEIGHTS = (20, 24, 30, 40)
 
 # A `[key] label` pair, or a bare `[key]` — the two shapes a hint may take.
 HINT = re.compile(r"\[[^\[\]]+\](?: [^\[\]]+?)?(?:  |$)")
@@ -59,11 +65,25 @@ CURSOR_UP = "\x1b[1A"
 
 @pytest.fixture(autouse=True)
 def isolated_dirs(tmp_path, monkeypatch):
-    """No test may read or write the owner's real cache or config."""
+    """No test may read or write the owner's real cache or config — or reach
+    resources.tidal.com, which a paint asking for a size the harness has not
+    stored would otherwise do on a thread nobody is waiting for."""
     monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path / "config")
     monkeypatch.setattr(config_mod, "CONFIG_FILE", tmp_path / "config" / "config.json")
     monkeypatch.setattr(cache_mod, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(art_mod, "load",
+                        lambda cover, cols, rows, **kw: _grid(cols, rows))
     return tmp_path
+
+
+_UNSET = object()
+
+
+def _art(width, height):
+    """The size a cover is actually rendered at in a window this big — which
+    is a question about the placement as well as the room, so it is asked the
+    way the player asks it rather than by calling art_size bare."""
+    return art_mod.art_size(width, height, art_mod.art_beside(width, height))
 
 
 def _track(name="Satisfied (Ambient Reprise)"):
@@ -83,9 +103,15 @@ def _grid(cols, rows):
 class Harness:
     """A player painting into a `Screen` through a real `Live`."""
 
-    def __init__(self, width=100, height=30, artwork=(20, 10)):
+    def __init__(self, width=100, height=30, artwork=_UNSET):
         import io
 
+        if artwork is _UNSET:
+            # The size this window actually asks for. Storing any other one
+            # is a miss, and a miss starts a fetch on a thread — which the
+            # fixture keeps off the network but which would still land
+            # halfway through a test and change the frame under it.
+            artwork = _art(width, height)
         self.buf = io.StringIO()
         self.player = HeadlessTidalPlayer()
         self.player.console = Console(
@@ -200,7 +226,7 @@ class TestNothingIsStranded:
     def test_artwork_appearing_and_vanishing(self, h):
         # The size the window in the fixture actually gets, not a constant:
         # art_size answers to the width as well as the height now
-        size = art_mod.art_size(100, 30)
+        size = _art(100, 30)
         h.set_artwork(size)
         h.repaint()
         h.set_artwork(None)          # a cover with no picture: pane gets shorter
@@ -217,7 +243,7 @@ class TestNothingIsStranded:
         crossing a threshold changes the height of the frame."""
         for height in (30, 25, 23, 21, 30):
             h.resize(100, height)
-            size = art_mod.art_size(100, height)
+            size = _art(100, height)
             h.set_artwork(size)
             h.repaint()
             assert len(h.art_rows()) == (size[1] if size else 0), height
@@ -310,7 +336,7 @@ class TestThePaneFits:
         """Overflowing is not harmless: Rich answers it by replacing the
         bottom line — the controls — with a red ellipsis."""
         for height in range(18, 45):
-            size = art_mod.art_size(100, height)
+            size = _art(100, height)
             if size is None:
                 continue
             harness = Harness(width=100, height=height, artwork=size)
@@ -332,7 +358,7 @@ class TestThePaneFits:
                 for mode in MODES:
                     for more in (False, True):
                         harness = Harness(width=width, height=height,
-                                          artwork=art_mod.art_size(width, height))
+                                          artwork=_art(width, height))
                         p = harness.player
                         p._mode = mode
                         p._show_more = more
@@ -408,7 +434,7 @@ class TestTheFooterNeverBreaksAPair:
 
     def _harness(self, width, mode, more=False, height=24):
         h = Harness(width=width, height=height,
-                    artwork=art_mod.art_size(width, height))
+                    artwork=_art(width, height))
         h.player._mode = mode
         h.player._show_more = more
         _fill_lists(h.player)
@@ -467,7 +493,7 @@ class TestTheProgressLine:
     @pytest.mark.parametrize("width", WIDTHS + (40, 30))
     def test_the_times_stay_on_one_line_with_the_bar(self, width):
         h = Harness(width=width, height=24,
-                    artwork=art_mod.art_size(width, 24))
+                    artwork=_art(width, 24))
         h.start()
         h.repaint()
         try:
@@ -496,7 +522,7 @@ class TestTheVolumeOverlayOnScreen:
 
     def _harness(self, width=100, mode=None):
         h = Harness(width=width, height=24,
-                    artwork=art_mod.art_size(width, 24))
+                    artwork=_art(width, 24))
         if mode is not None:
             h.player._mode = mode
         _fill_lists(h.player)
@@ -588,7 +614,7 @@ class TestTheRowsThatSayWhereYouAre:
 
     def _harness(self, width, mode, height=24):
         h = Harness(width=width, height=height,
-                    artwork=art_mod.art_size(width, height))
+                    artwork=_art(width, height))
         h.player._mode = mode
         _fill_lists(h.player)
         h.start()
@@ -634,7 +660,7 @@ class TestTheRowsThatSayWhereYouAre:
 class TestScrubbingAndTheOverlayOnScreen:
     def _harness(self, width=80):
         h = Harness(width=width, height=24,
-                    artwork=art_mod.art_size(width, 24))
+                    artwork=_art(width, 24))
         h.start()
         h.repaint()
         return h
@@ -765,16 +791,29 @@ class TestAFrameNeverOutgrowsTheWindow:
 
     @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
     @pytest.mark.parametrize("mode", MODES)
-    @pytest.mark.parametrize("width", WIDTHS + (40,))
+    @pytest.mark.parametrize("width", OVERFLOW_WIDTHS)
     def test_every_mode_at_every_width(self, title, mode, width):
-        for height in (20, 24, 30):
+        for height in OVERFLOW_HEIGHTS:
             h = Harness(width=width, height=height,
-                        artwork=art_mod.art_size(width, height))
-            p = _loaded(h.player, title, art_mod.art_size(width, height))
+                        artwork=_art(width, height))
+            p = _loaded(h.player, title, _art(width, height))
             p._mode = mode
             lines, widths = _frame(p)
             assert len(lines) <= height, (title[:12], mode, width, height, len(lines))
             assert max(widths) <= width, (title[:12], mode, width, height, max(widths))
+
+    @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
+    def test_every_size_a_window_can_be_dragged_through(self, title):
+        """The matrix above at its named sizes, and then every size between
+        them: a layout that answers to a threshold has an off-by-one at the
+        threshold, and 83 columns is a column nobody would have listed."""
+        for width in range(30, 140, 3):
+            for height in range(6, 44, 2):
+                h = Harness(width=width, height=height)
+                p = _loaded(h.player, title, _art(width, height))
+                lines, widths = _frame(p)
+                assert len(lines) <= height, (width, height, len(lines))
+                assert max(widths, default=0) <= width, (width, height)
 
     def test_the_mini_player_too(self):
         for width in WIDTHS + (40,):
@@ -825,6 +864,156 @@ class TestAFrameNeverOutgrowsTheWindow:
             h.live.stop()
 
 
+def _rows(width, height, title=WIDE_TITLE, mode=None, **attrs):
+    """One frame as plain rows, with the invariant checked on the way out:
+    nothing here is worth reading if the pane did not fit the window."""
+    h = Harness(width=width, height=height)
+    p = _loaded(h.player, title, _art(width, height))
+    if mode is not None:
+        p._mode = mode
+    for name, value in attrs.items():
+        setattr(p, name, value)
+    lines, widths = _frame(p)
+    assert len(lines) <= height, (width, height, len(lines))
+    assert max(widths, default=0) <= width, (width, height)
+    return ["".join(seg.text for seg in line) for line in lines]
+
+
+def _hint_rows(rows):
+    """Rows of the pane that are a footer: hints start at the left margin and
+    nothing else on the player screen begins with a bracket."""
+    return [r for r in rows if r.strip().strip("│").strip().startswith("[")]
+
+
+class TestTheTitleIsTheLastThingToGo:
+    """The relax order, at its far end. The window runs out of rows and
+    something has to stop being drawn; what survives longest is the song, not
+    the six keys that say how to work the app. You can find `[s]` again by
+    making the window bigger — you cannot find out what is playing that way.
+    """
+
+    @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
+    def test_the_track_is_on_screen_at_every_height_the_pane_has(self, title):
+        for height in range(5, 25):
+            rows = _rows(60, height, title)
+            assert any("Super Idol" in r for r in rows), (height, rows)
+
+    @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
+    def test_the_hints_go_first(self, title):
+        """Five rows of terminal is one row of pane. It used to be the footer;
+        it is the track now, and the footer comes back one row later."""
+        assert _hint_rows(_rows(60, 5, title)) == []
+        assert any("Super Idol" in r for r in _rows(60, 5, title))
+        assert _hint_rows(_rows(60, 9, title)), "the footer never came back"
+
+    def test_the_progress_line_outlives_the_footer_too(self):
+        """Both halves of "what is playing": the title, and where in it. The
+        old order kept two rows of bare keys and dropped the bar."""
+        rows = _rows(60, 8)
+        assert any("0:00" in r for r in rows), rows
+        assert len(_hint_rows(rows)) <= 1, rows
+
+    def test_but_a_long_body_still_gives_way_before_the_footer(self):
+        """The other side of the rule, and the one it would be easy to break
+        by applying "identity first" everywhere. The download screen's body is
+        twenty-two rows in a twenty-row pane — but what it loses to a crop is
+        the tail of its prose, not the track, so the footer keeps both of its
+        rows and `[←/Esc] back` stays on screen."""
+        rows = _rows(60, 24, mode=HeadlessTidalPlayer.MODE_DOWNLOAD)
+        assert len(_hint_rows(rows)) == 2, rows
+        assert any("[←/Esc]" in r for r in rows), rows
+
+
+class TestTheCoverBesideTheTrack:
+    """Above the track line in a narrow window, beside it in a wide one —
+    because in a wide window the scarce axis is the vertical one."""
+
+    def _art_and_title(self, rows):
+        return [r for r in rows if "▀" in r and "Super Idol" in r]
+
+    @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
+    def test_a_wide_window_puts_them_on_the_same_row(self, title):
+        rows = _rows(100, 30, title)
+        assert self._art_and_title(rows), rows
+        # and the whole text block is beside the cover, not only its first row
+        beside = [r for r in rows if "▀" in r]
+        assert any("0:00" in r for r in beside), rows
+        assert any("Queue:" in r for r in beside), rows
+        assert any("Next:" in r for r in beside), rows
+
+    @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
+    def test_a_narrow_window_puts_the_cover_back_above(self, title):
+        rows = _rows(60, 30, title)
+        assert [r for r in rows if "▀" in r], "no cover at all"
+        assert self._art_and_title(rows) == [], rows
+
+    def test_the_threshold_is_the_width_and_only_the_width(self):
+        assert self._art_and_title(_rows(82, 30)) == []
+        assert self._art_and_title(_rows(83, 30))
+
+    def test_beside_costs_fewer_rows_than_above(self, monkeypatch):
+        """Measured against the same pane laid out the old way, rather than
+        against a number written down here: a threshold nothing can reach is
+        a stacked layout."""
+        beside = len(_rows(100, 30))
+        monkeypatch.setattr(art_mod, "MIN_BESIDE_WIDTH", 10_000)
+        stacked = len(_rows(100, 30))
+        assert beside < stacked, (beside, stacked)
+
+    def test_the_text_is_centred_against_the_cover(self):
+        """A five-row block pinned to the top of a sixteen-row cover reads as
+        a layout that ran out rather than one that was chosen."""
+        rows = _rows(100, 30)
+        art = [i for i, r in enumerate(rows) if "▀" in r]
+        text = [i for i, r in enumerate(rows) if "▶" in r]
+        last = max(i for i, r in enumerate(rows) if "Next:" in r)
+        assert art and text
+        above, below = text[0] - art[0], art[-1] - last
+        assert above > 0 and below > 0, (above, below)
+        assert abs(above - below) <= 2, (above, below)
+
+    @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
+    def test_the_progress_line_shortens_instead_of_running_under_the_cover(self, title):
+        """The bar is laid out in the columns the cover left. Laid out for the
+        pane instead, it would wrap — and a wrapped progress line is the bug
+        the whole width-responsive layout exists for."""
+        wide = _rows(140, 30, title)
+        narrow = _rows(90, 30, title)
+        for rows in (wide, narrow):
+            assert len([r for r in rows if "0:00" in r]) == 1, rows
+            assert all("2:52" in r for r in rows if "0:00" in r), rows
+        bar = lambda rows: [r for r in rows if "0:00" in r][0].count("─")
+        assert bar(narrow) < bar(wide), (bar(narrow), bar(wide))
+
+    @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
+    def test_the_title_beside_the_cover_is_clipped_in_cells(self, title):
+        """的 is two cells and one character. A title clipped by characters
+        measures 74 and renders 82, which beside a cover is a row that pushes
+        the frame a line taller every repaint."""
+        for width in (83, 100, 120, 140):
+            rows = _rows(width, 30, title)
+            for row in rows:
+                assert cell_len(row) <= width, (width, row)
+
+    def test_it_survives_a_resize_across_the_threshold(self):
+        """Through a real Live and a real terminal model, both ways: the
+        layout changes the size the cover is rendered at, so a stale render
+        laid out for the other one is exactly what would be stranded."""
+        h = Harness(width=100, height=30)
+        _loaded(h.player, WIDE_TITLE, _art(100, 30))
+        h.start()
+        try:
+            for width in (100, 60, 100, 82, 83, 100):
+                h.resize(width, 30)
+                h.set_artwork(_art(width, 30))
+                h.repaint()
+                h.assert_one_frame(f"resized to {width}")
+                h.repaint()
+                h.assert_one_frame(f"settled at {width}")
+        finally:
+            h.live.stop()
+
+
 class TestTheDownloadTiersFit:
     """Three things want one line: the tier, `download now` on the hovered
     row, and the size. A clipped size is the one outcome that must not
@@ -832,7 +1021,7 @@ class TestTheDownloadTiersFit:
 
     def _rows(self, width):
         h = Harness(width=width, height=24,
-                    artwork=art_mod.art_size(width, 24))
+                    artwork=_art(width, 24))
         p = _loaded(h.player, "Satisfied (Ambient Reprise)")
         p._mode = p.MODE_DOWNLOAD
         p._download_cursor = 2

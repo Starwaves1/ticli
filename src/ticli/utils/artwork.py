@@ -53,13 +53,20 @@ SOURCE_SIZE = 320
 # entry here is (n, n/2) and the renderer packs two pixels into a cell.
 ART_SIZES = ((32, 16), (28, 14), (24, 12), (20, 10), (16, 8), (12, 6))
 
-# The most of the terminal's width a cover may take. Height alone used to
-# choose the size, so a tall, narrow window put a 20-column cover above a
-# track line with eight columns of room left — the picture looked fine and
-# everything around it looked cramped. Two fifths keeps the cover the second
-# thing you look at at any width, and steps the size down as the window
-# narrows without any thresholds of its own.
-ART_WIDTH_SHARE = 0.4
+# The most of the terminal's width a *stacked* cover may take. Height alone
+# used to choose the size, so a tall, narrow window put a 20-column cover
+# above a track line with eight columns of room left — the picture looked
+# fine and everything around it looked cramped.
+#
+# Three fifths, raised from two: stacked, nothing shares the cover's rows, so
+# the share is a question of balance rather than of competition, and two
+# fifths was answering it as though something did. A narrow window is exactly
+# where a big cover is worth having, and it is now the only place a stacked
+# cover is drawn at all — past MIN_BESIDE_WIDTH the picture moves beside the
+# text and the budget below takes over. The absolute ceiling is unchanged:
+# ART_SIZES still stops at 32 columns, so nothing gets bigger in a wide
+# window, only in a narrow one.
+ART_WIDTH_SHARE = 0.6
 
 # Rows the rest of the player pane needs, below which artwork is not worth
 # its vertical cost, and the narrowest terminal art is offered in at all.
@@ -70,11 +77,44 @@ ART_WIDTH_SHARE = 0.4
 # answers by replacing the bottom line with a red ellipsis, i.e. eating the
 # controls. Two rows of headroom means every state of the pane fits.
 MIN_ROWS_AROUND_ART = 16
+# The same count for a cover drawn *beside* the text rather than above it,
+# where the track rows cost nothing extra because they are inside the
+# picture's own rows. What is left is the borders and padding (4), the blank
+# row above the footer (1), the footer (up to 4 with `[m]` open) and a toast
+# (1) — ten, plus a row of headroom. The smallest cover offered is six rows
+# and the text block is at most six, so the text always has somewhere to go.
+MIN_ROWS_BESIDE_ART = 11
 # Columns a picture costs beyond its own width: the panel's border and
 # padding (6) plus the indent that lines it up with the track title (3). A
 # picture that doesn't clear this would wrap, which looks like corruption.
 ART_MARGIN = 9
 MIN_ART_WIDTH = min(cols for cols, _ in ART_SIZES) + ART_MARGIN
+
+# Columns between a cover and the text beside it, and the least the text may
+# be left with. Forty holds the three-space indent, both times, a full-width
+# progress bar and the scrub marker with room over for a title — under that
+# the text column is a column of ellipses and the picture has won an argument
+# it should not have been in.
+ART_GUTTER = 2
+MIN_TEXT_WIDTH = 40
+# Where the cover stops sitting above the text and starts sitting beside it:
+# the width at which the *largest* cover there is can sit beside a full text
+# column. Derived, not chosen — the margin (9), the biggest entry in
+# ART_SIZES (32), the gutter (2) and MIN_TEXT_WIDTH (40) — and the derivation
+# is what makes widening the window safe. Below it the cover is capped by a
+# share of the width and above it by this budget, and because the budget can
+# hold 32 from the very first column past the threshold while beside also
+# answers to the *smaller* MIN_ROWS_BESIDE_ART, the cover crossing the
+# threshold can only grow. Picking a threshold that merely felt wide enough
+# (71 was tried) shrank a 28-column cover to 20 the moment the window got one
+# column wider, which is the one thing a responsive layout must not do.
+#
+# Vertical is the scarce axis in a wide window, and that is the point of the
+# move: stacked spends art_rows + 2 + 5 rows, side by side spends
+# max(art_rows, 5) — eleven rows back at 100x30, where the cover also goes
+# from 28x14 to 32x16.
+MIN_BESIDE_WIDTH = (ART_MARGIN + max(cols for cols, _ in ART_SIZES)
+                    + ART_GUTTER + MIN_TEXT_WIDTH)  # 83
 
 ART_VERSION = 1
 ART_SUFFIX = ".art"
@@ -549,22 +589,49 @@ def render(pixels: list, indent: int = 0):
     return text
 
 
-def art_size(width: int, height: int):
+def art_beside(width: int, height: int) -> bool:
+    """Whether this window is wide enough to put the cover next to the text.
+
+    One threshold and no hysteresis: above MIN_BESIDE_WIDTH the cover and the
+    text both have a share worth having, below it they do not and the cover
+    goes back above. A rule that also consulted the height would put the
+    layout somewhere nobody could predict from the width they can see.
+    """
+    return width >= MIN_BESIDE_WIDTH and art_size(width, height, True) is not None
+
+
+def art_size(width: int, height: int, beside: bool = False):
     """Cell size for a terminal this big, or None if artwork doesn't fit.
 
-    Artwork sits above the track line rather than beside it: the progress bar
-    can be 50 columns wide, and an 80-column terminal has no room to put
-    anything next to it. Stacked, the size answers to both axes — the rows it
-    costs must be spared by the rest of the pane, and its width has to stay a
-    fraction of the window's or a narrow terminal ends up as a big cover and
-    a cramped everything-else.
+    Both axes decide it, and which budget each one gets depends on where the
+    picture is going to sit.
+
+    **Stacked** — the cover above the track line, which is what a window
+    narrower than MIN_BESIDE_WIDTH gets. Its rows are rows the rest of the
+    pane does not get (MIN_ROWS_AROUND_ART), and its width is capped as a
+    *share* of the window's: nothing shares those rows, so the cap is about
+    balance, and a narrow window is allowed a cover that dominates.
+
+    **Beside** — the cover on the left with the track line, the progress bar
+    and the next-track line to its right. The text is inside the picture's
+    rows, so it costs the pane nothing (MIN_ROWS_BESIDE_ART is five rows
+    cheaper) — but it is now competing for the *same* columns, so the share
+    gives way to a budget: everything left after the margin, the gutter and
+    MIN_TEXT_WIDTH. That is a bigger cover than stacked at the heights a real
+    window has (24 rows: 24x12 beside against 16x8 above) and a smaller one
+    only where vertical room is free anyway.
     """
     if width < MIN_ART_WIDTH:
         return None
-    share = int(width * ART_WIDTH_SHARE)
+    if beside:
+        room = width - ART_MARGIN - ART_GUTTER - MIN_TEXT_WIDTH
+        spare = MIN_ROWS_BESIDE_ART
+    else:
+        room = int(width * ART_WIDTH_SHARE)
+        spare = MIN_ROWS_AROUND_ART
     for cols, rows in ART_SIZES:
-        if (cols + ART_MARGIN <= width and cols <= share
-                and rows + MIN_ROWS_AROUND_ART <= height):
+        if (cols + ART_MARGIN <= width and cols <= room
+                and rows + spare <= height):
             return cols, rows
     return None
 

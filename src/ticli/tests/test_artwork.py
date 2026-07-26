@@ -204,6 +204,13 @@ class TestRender:
         assert not art_mod.supports_art(object())
 
 
+def _size(width, height):
+    """The size and placement this window gets, asked the way the player asks
+    it: the two are one decision (see art_size)."""
+    beside = art_mod.art_beside(width, height)
+    return art_mod.art_size(width, height, beside), beside
+
+
 class TestArtSize:
     def test_a_normal_terminal_gets_the_big_size(self):
         assert art_mod.art_size(80, 26) == (20, 10)
@@ -218,31 +225,101 @@ class TestArtSize:
 
     def test_a_wide_terminal_gets_a_bigger_one(self):
         assert art_mod.art_size(100, 60) == (32, 16)
-        assert art_mod.art_size(60, 60) == (24, 12)
+        assert art_mod.art_size(60, 60) == (32, 16)
 
     def test_the_size_steps_down_with_the_width(self):
         """Width, not only height: a tall narrow window used to keep the
-        20-column cover and cramp everything beside it."""
-        assert art_mod.art_size(50, 60) == (20, 10)
-        assert art_mod.art_size(40, 60) == (16, 8)
-        assert art_mod.art_size(30, 60) == (12, 6)
-        assert art_mod.art_size(29, 60) is None
+        20-column cover and cramp everything beside it. Three fifths of it
+        now rather than two, which is why 50 columns keeps a 28-column cover
+        where it used to step down to 20."""
+        assert art_mod.art_size(50, 60) == (28, 14)
+        assert art_mod.art_size(40, 60) == (24, 12)
+        assert art_mod.art_size(30, 60) == (16, 8)
+        assert art_mod.art_size(29, 60) == (16, 8)
+        assert art_mod.art_size(20, 60) is None
 
     def test_the_picture_never_takes_most_of_the_width(self):
+        """Stacked, the cap is a share of the window. Beside the text it is a
+        budget instead — everything the margin, the gutter and the text
+        column have not already claimed — because there the two are competing
+        for the same columns rather than merely sharing a pane."""
         for height in (20, 24, 40, 60):
             for width in range(10, 200):
-                size = art_mod.art_size(width, height)
-                if size is not None:
+                size, beside = _size(width, height)
+                if size is None:
+                    continue
+                if beside:
+                    assert (size[0] + art_mod.ART_MARGIN + art_mod.ART_GUTTER
+                            + art_mod.MIN_TEXT_WIDTH) <= width, (width, height)
+                else:
                     assert size[0] <= width * art_mod.ART_WIDTH_SHARE
+
+    def test_the_absolute_ceiling_did_not_move(self):
+        """The share was raised, not the largest cover there is: a wide window
+        looks exactly as it did."""
+        for height in range(12, 80):
+            for width in range(10, 400):
+                size, _ = _size(width, height)
+                if size is not None:
+                    assert size[0] <= 32 and size[1] <= 16, (width, height, size)
 
     def test_the_picture_always_fits_the_pane(self):
         """Panel border and padding take six columns and the indent three;
         art that overran them would wrap, which reads as corruption."""
         for height in (16, 20, 22, 24, 40, 60):
             for width in range(10, 120):
-                size = art_mod.art_size(width, height)
+                size, _ = _size(width, height)
                 if size is not None:
                     assert size[0] + 3 <= width - 6, (width, height, size)
+
+
+class TestWhereTheCoverSits:
+    """Above the track line in a narrow window, beside it in a wide one."""
+
+    def test_the_threshold_is_where_the_biggest_cover_fits_beside_the_text(self):
+        assert art_mod.MIN_BESIDE_WIDTH == 83
+        assert not art_mod.art_beside(82, 40)
+        assert art_mod.art_beside(83, 40)
+
+    def test_beside_costs_fewer_rows_and_gives_a_bigger_cover(self):
+        """The point of the move. At 100x30 the cover goes up a size *and*
+        the pane it sits in gets shorter, because the track line, the bar and
+        the next-track line are inside the picture's rows instead of under
+        them."""
+        assert art_mod.art_size(100, 30, False) == (28, 14)
+        assert art_mod.art_size(100, 30, True) == (32, 16)
+        stacked = 14 + 2 + 5      # cover, gap, the five text rows
+        beside = max(16, 5)
+        assert beside < stacked
+
+    def test_a_short_wide_window_gets_a_cover_where_it_used_to_get_none(self):
+        assert art_mod.art_size(100, 20, False) is None
+        assert art_mod.art_beside(100, 20)
+        assert art_mod.art_size(100, 20, True) == (16, 8)
+
+    def test_widening_the_window_never_shrinks_the_cover(self):
+        """The property MIN_BESIDE_WIDTH is derived from, and the reason it is
+        derived rather than chosen: at 71 — wide enough to *look* like enough —
+        crossing the threshold took a 28-column cover down to 20, so dragging
+        the window one column wider made the picture smaller. Checked at every
+        width and height rather than at a few, because the failure was a single
+        column."""
+        for height in range(10, 80):
+            widest = 0
+            for width in range(10, 240):
+                size, _ = _size(width, height)
+                cols = size[0] if size else 0
+                assert cols >= widest, (width, height, widest, cols)
+                widest = cols
+
+    def test_a_taller_window_never_shrinks_it_either(self):
+        for width in range(10, 240):
+            tallest = 0
+            for height in range(6, 80):
+                size, _ = _size(width, height)
+                cols = size[0] if size else 0
+                assert cols >= tallest, (width, height, tallest, cols)
+                tallest = cols
 
 
 # ── the disk cache ──
@@ -454,6 +531,29 @@ class TestPlayerArtwork:
         player._artwork_text()
         assert _wait_for(lambda: len(sizes) == 2)
         assert sizes == [(20, 10), (12, 6)]
+
+    def test_crossing_the_side_by_side_threshold_re_renders(self, monkeypatch):
+        """The placement decides the size, so moving the cover beside the text
+        is a resize as far as the fetch and the disk cache are concerned. One
+        column of width does it, and the render made for the other layout must
+        not be shown in the meantime: the pixels *are* the render."""
+        sizes = []
+
+        def _load(cover, cols, rows, **kw):
+            sizes.append((cols, rows))
+            return _grid(cols, rows)
+
+        monkeypatch.setattr(art_mod, "load", _load)
+        player = _player(Console(width=82, height=30, color_system="truecolor"))
+        player._artwork_text()
+        assert _wait_for(lambda: player._artwork is not None)
+        assert sizes == [(28, 14)], "stacked, capped by three fifths of 82"
+
+        player.console = Console(width=83, height=30, color_system="truecolor")
+        assert player._artwork_text() is None, "a render for the old layout"
+        assert _wait_for(lambda: len(sizes) == 2)
+        assert sizes[1] == (32, 16), "beside, and bigger for it"
+        assert _wait_for(lambda: player._artwork_text() is not None)
 
     def test_a_failed_fetch_shows_nothing_and_is_not_retried(self, monkeypatch):
         calls = []
