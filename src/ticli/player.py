@@ -76,6 +76,15 @@ MIN_INNER_WIDTH = 12
 INDENT = 3
 HINT_GAP = 2
 
+# The rows at the top of the pane that say what is playing: the track line,
+# the album under it and the progress line. They outrank the footer when the
+# window is too short for both, which is the one place the ordering is
+# reversed — everywhere above it the footer wins, because what a long body
+# loses to a crop is its tail and not its identity. Three, because the
+# progress line is the third of them; two would keep the album and lose the
+# time, which is the wrong half of "what is playing, and where in it".
+IDENTITY_ROWS = 3
+
 # Under this a progress bar is not a bar, it is a smear — three cells that
 # round to the same place for half the track. The times alone say more.
 MIN_BAR_WIDTH = 8
@@ -100,6 +109,38 @@ def _clip_lines(text: "Text", width: int) -> list:
     for line in lines:
         line.truncate(width, overflow="ellipsis")
     return list(lines)
+
+
+def _side_by_side(left: list, right: list) -> "Text":
+    """Two blocks of lines as one, `left` padded to its widest row.
+
+    The cover on the left and the track beside it. Rich has no column
+    primitive that survives being counted — everything else in this pane is a
+    list of lines whose length _build_display can measure — so the two blocks
+    are zipped by hand into lines of exactly that kind.
+
+    The text is centred against the picture rather than sitting at its top,
+    because a five-row block pinned to the top of a sixteen-row cover reads as
+    a layout that ran out rather than one that was chosen. Padding is measured
+    in *cells*: a title with 的 in it is wider than it is long, and a left
+    column padded by character count leaves the right column ragged.
+    """
+    width = max((cell_len(line.plain) for line in left), default=0)
+    top = max((len(left) - len(right)) // 2, 0)
+    out = []
+    for i in range(max(len(left), len(right))):
+        line = Text()
+        if i < len(left):
+            line.append_text(left[i])
+        j = i - top
+        if 0 <= j < len(right):
+            # Only where there is something to align to: a row of trailing
+            # spaces is a row the pane pays for and nobody can see
+            line.append(" " * (width - cell_len(line.plain)
+                               + artwork.ART_GUTTER))
+            line.append_text(right[j])
+        out.append(line)
+    return Text("\n").join(out)
 
 
 def _hint_piece(hint: Hint, level: int) -> str:
@@ -186,9 +227,9 @@ class _Fit:
     of them goes first is per screen, because the cheapest thing to lose is
     not the same on all of them. Each screen names its own order (`levers`),
     and _build_display pulls them in turn until the pane fits. What is never
-    given up on any screen is the track, the progress line and at least one
-    row of hints; see _build_display for the crop that enforces that when
-    even this runs out.
+    given up on any screen is the track and the progress line — IDENTITY_ROWS
+    — and when even this runs out it is the footer that gives way to them
+    rather than the other way round; see the crop in _build_display.
     """
 
     __slots__ = ("inner", "rows", "page_rows", "artwork", "hint_rows",
@@ -2574,15 +2615,14 @@ class HeadlessTidalPlayer:
             return self._play_offset + (time.time() - self._play_start_time)
         return self._play_offset
 
-    def _artwork_text(self):
-        """The current cover as half-block pixel art, or None.
+    def _art_layout(self):
+        """`(cols, rows, beside)` for this window, or None for no artwork.
 
-        None is the normal answer for most of a track's first second: nothing
-        is fetched on this thread. The first paint that wants artwork starts a
-        daemon thread and returns None; when that thread lands it assigns the
-        pixels and wakes the loop, and the next paint has a picture. Every
-        reason there might never be one — no cover, no colour, no room, a
-        failed fetch, an undecodable image — comes out here as None too.
+        The one place the size and the placement are decided, because they are
+        one decision: `beside` changes what size fits, the size is what the
+        fetch thread is asked for and what the disk cache is keyed on, and two
+        callers computing it separately is how a picture ends up rendered at
+        one size and laid out at another.
         """
         # `self._mini_player`, not `self._fit.mini`: this is asked outside a
         # build too, where the fit is whatever the last one left behind
@@ -2596,14 +2636,31 @@ class HeadlessTidalPlayer:
             width, height = self.console.size
         except Exception:
             return None
-        size = artwork.art_size(width, height)
+        beside = artwork.art_beside(width, height)
+        size = artwork.art_size(width, height, beside)
         if size is None:  # terminal too small to give artwork the room
             return None
-        cols, rows = size
+        return size[0], size[1], beside
+
+    def _artwork_text(self):
+        """The current cover as half-block pixel art, or None.
+
+        None is the normal answer for most of a track's first second: nothing
+        is fetched on this thread. The first paint that wants artwork starts a
+        daemon thread and returns None; when that thread lands it assigns the
+        pixels and wakes the loop, and the next paint has a picture. Every
+        reason there might never be one — no cover, no colour, no room, a
+        failed fetch, an undecodable image — comes out here as None too.
+        """
+        layout = self._art_layout()
+        if layout is None:
+            return None
+        cols, rows, _ = layout
+        cover = artwork.cover_id_of(self._current_track)
         ready = self._artwork
         if ready is not None and ready[:3] == (cover, cols, rows):
             # A stored None is an answered question: this cover has no art
-            return artwork.render(ready[3], indent=3) if ready[3] else None
+            return artwork.render(ready[3], indent=INDENT) if ready[3] else None
         self._request_artwork(cover, cols, rows)
         return None
 
@@ -2661,7 +2718,21 @@ class HeadlessTidalPlayer:
                 content.append(f"  \u21c6 {SEEK_STEP_SECONDS}s", style="bold yellow")
             return content
 
-        # Full player display
+        # Full player display. Beside the cover the text has the columns the
+        # cover left; above it, or while the picture is still being fetched,
+        # it has the pane. The floor is what makes that safe to ask outside a
+        # build (ROOMY_FIT is 74 columns whatever the terminal is): a text
+        # column narrower than the layout was designed for goes back to
+        # stacked rather than clipping the title to nothing.
+        layout = self._art_layout()
+        art = self._artwork_text()
+        text_width = self._fit.inner
+        beside = art is not None and layout is not None and layout[2]
+        if beside:
+            text_width = self._fit.inner - INDENT - layout[0] - artwork.ART_GUTTER
+            if text_width < artwork.MIN_TEXT_WIDTH:
+                beside, text_width = False, self._fit.inner
+
         track_line = Text()
         track_line.append(f" {state_icon} ", style="bold cyan")
         if liked is True:
@@ -2676,7 +2747,7 @@ class HeadlessTidalPlayer:
         if album:
             album_line.append(f"   {album}", style="dim")
 
-        progress_line = self._build_progress_line(position, duration)
+        progress_line = self._build_progress_line(position, duration, text_width)
 
         # Queue info
         status_line = Text()
@@ -2692,27 +2763,28 @@ class HeadlessTidalPlayer:
             t = self._queue[self._queue_index + 1]
             t_name = t.name if hasattr(t, "name") else "?"
             t_artist = t.artists[0].name if hasattr(t, "artists") and t.artists else ""
-            up_next.append("\n   Next: ", style="dim")
+            up_next.append("   Next: ", style="dim")
             up_next.append(t_name, style="dim white")
             if t_artist:
                 up_next.append(f" \u2022 {t_artist}", style="dim")
 
+        lines = [track_line, album_line, progress_line, status_line]
+        if up_next.plain:
+            lines.append(up_next)
+
+        if beside:
+            return _side_by_side(_clip_lines(art, INDENT + layout[0]),
+                                 [line for row in lines
+                                  for line in _clip_lines(row, text_width)])
+
         content = Text()
-        art = self._artwork_text()
         if art is not None:
             content.append_text(art)
             content.append("\n\n")
-        content.append_text(track_line)
-        content.append("\n")
-        content.append_text(album_line)
-        content.append("\n")
-        content.append_text(progress_line)
-        content.append("\n")
-        content.append_text(status_line)
-        content.append_text(up_next)
+        content.append_text(Text("\n").join(lines))
         return content
 
-    def _build_progress_line(self, position, duration) -> Text:
+    def _build_progress_line(self, position, duration, width=None) -> Text:
         """Elapsed, the bar, and the duration — on one line, always.
 
         The bar used to be laid out at `progress_bar_width` columns whatever
@@ -2728,24 +2800,30 @@ class HeadlessTidalPlayer:
         to it: focus is a state the arrows are in, so it has to be on screen,
         and the columns it costs have to come out of the bar rather than off
         the end of the pane.
+
+        `width` is what the line has to lay itself out in, which is the pane
+        unless a cover is sitting beside it — then it is the columns the cover
+        left, and the bar shortens rather than the line wrapping under it.
         """
+        if width is None:
+            width = self._fit.inner
         pos_str = format_time(position)
         dur_str = format_time(duration) if duration > 0 else "--:--"
         marker = f"  ⇆ {SEEK_STEP_SECONDS}s" if self._player_focus else ""
-        room = (self._fit.inner - INDENT - len(pos_str) - len(dur_str)
+        room = (width - INDENT - len(pos_str) - len(dur_str)
                 - len(marker) - 2)
-        width = min(self._bar_max, room)
+        bar_width = min(self._bar_max, room)
         line = Text()
-        if width < MIN_BAR_WIDTH:
+        if bar_width < MIN_BAR_WIDTH:
             line.append(f"{' ' * INDENT}{pos_str} / {dur_str}", style="cyan")
             if marker:
                 line.append(marker, style="bold yellow")
             return line
         if duration > 0:
-            filled = int(width * min(position / duration, 1.0))
-            bar = "━" * filled + "╸" + "─" * max(0, width - filled - 1)
+            filled = int(bar_width * min(position / duration, 1.0))
+            bar = "━" * filled + "╸" + "─" * max(0, bar_width - filled - 1)
         else:
-            bar = "─" * width
+            bar = "─" * bar_width
         line.append(f"{' ' * INDENT}{pos_str} ", style="cyan")
         line.append(bar, style="bold cyan" if self._playing else "dim")
         line.append(f" {dur_str}", style="cyan")
@@ -3760,8 +3838,24 @@ class HeadlessTidalPlayer:
 
         lines = body + footer
         if len(lines) > fit.rows:
-            footer = footer[:max(fit.rows - 1, 0)] or footer[:fit.rows]
-            lines = body[:fit.rows - len(footer)] + footer
+            # The blank row between the pane and its footer says nothing, so
+            # it goes before anything that does
+            if body and not body[-1].plain.strip():
+                body = body[:-1]
+        if len(body) + len(footer) > fit.rows:
+            # Identity before instructions, but only where they are actually
+            # in competition. The body is cut from the bottom, so down to
+            # IDENTITY_ROWS what it loses is its tail and the footer is worth
+            # more than another line of it — that is the old order and it
+            # stands. Past that the footer would be eating the song: which
+            # key searches is worth less, at any size, than knowing what is
+            # playing, and it is worth nothing at all on a pane with room for
+            # one line. So the last thing on screen is the track, not the
+            # controls.
+            keep = min(len(body), max(IDENTITY_ROWS, fit.rows - len(footer)))
+            footer = footer[:max(fit.rows - keep, 0)]
+            body = body[:max(fit.rows - len(footer), 1)]
+        lines = body + footer
 
         content = Text("\n").join(lines)
         content.no_wrap = True
