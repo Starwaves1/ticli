@@ -165,6 +165,34 @@ outside eviction and the budget.
 **Both halves matter to him** — "Both eviction and admission are important."
 Do not build either until the value function is settled.
 
+## Single-fetch playback + the scratch tier (Garrett, 2026-07-26 — proposed)
+
+Today a played track with `cache_songs` on is fetched **twice concurrently**:
+the backend streams it while `_start_download` fetches the same bytes. His
+proposal: play the first ~30s from a partial download, and at ~20s — if the
+user is still listening and the song is worth caching — fetch the rest and
+resume from the local copy, so one download serves both streaming and caching.
+Fallback he named himself: keep streaming in chunks if switching proves hitchy
+or expensive.
+
+Plus a **scratch tier**: when the cache is full, do the same thing anyway and
+delete the file when the song ends or ticli closes. It does not count against
+the budget.
+
+**Reframing that must survive:** the hitching that motivated this is already
+fixed (`c71de29` — mpv's `--cache` had defaulted off because it is handed a
+local playlist file, leaving 1.02s of readahead against 4s segments). So this
+is about **bandwidth, not smoothness**, and a mid-track file switch now has to
+justify a gap it might *introduce* rather than curing one. `_start_download`
+also already fetches the whole track in seconds, so the "first 30s, then the
+rest" staging may not be load-bearing.
+
+Feasibility measured under `ai/reference/single-fetch-feasibility-2026-07-26.md`.
+Depends on the `is_owned_audio` `.part` fix (data-path audit finding 1) landing
+first, or it fills the cache with unrecognisable leaked files twice as fast.
+The "worth caching" hook must default to today's behaviour — the value function
+is still open (see cache admission above).
+
 ## Backlog (requested, not yet scheduled)
 
 - **`r` (start radio) must not restart the current song** (Garrett,
