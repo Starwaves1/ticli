@@ -58,6 +58,11 @@ KEY_ENTER = "\r"
 KEY_ENTER2 = "\n"
 KEY_BACKSPACE = "\x7f"
 KEY_BACKSPACE2 = "\x08"
+# Tab and Shift-Tab. Search types the query with every printable key it gets,
+# so a filter can only ever be bound to a key that isn't one — Tab is the only
+# such key left unbound, and cycling is what it means everywhere else.
+KEY_TAB = "\t"
+KEY_SHIFT_TAB = "\x1b[Z"
 
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
@@ -69,7 +74,7 @@ from ticli.utils.config import (
     load_config,
     save_config,
 )
-from ticli.utils.cache import MetadataCache, format_gb
+from ticli.utils.cache import CachedTrack, MetadataCache, format_gb
 
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
@@ -135,6 +140,13 @@ IDLE_POLL_SECONDS = 0.5
 # not two presses. Comfortably above every platform's repeat interval
 # (macOS 15ms floor, Linux 33ms default) and below a deliberate double tap.
 KEY_REPEAT_WINDOW = 0.15
+# Search paging. tidalapi documents no more than 300 items behind any one
+# query, so the offset stops climbing there instead of asking for pages TIDAL
+# will never fill. The interval is a floor between network pages: one fetch in
+# flight already blocks the next, and a fetch brings back several screens'
+# worth of rows, so a held-down arrow can never fan out into requests.
+SEARCH_MAX_OFFSET = 300
+SEARCH_FETCH_MIN_INTERVAL = 1.0
 # How long to wait for the tail of an escape sequence that straddled a read.
 # Only a bare Esc ever pays it in full; kept generous so an arrow key over a
 # slow SSH link can't decode as Esc and quit the player.
@@ -191,6 +203,11 @@ def _audio_extension(content_type: Optional[str], url: str) -> str:
 
 class _DownloadSuperseded(Exception):
     """The track a download was for is no longer the one playing."""
+
+
+def _empty_search_pool() -> dict:
+    """Fetched-but-not-yet-shown search rows, per category."""
+    return {"tracks": [], "albums": [], "artists": []}
 
 
 def _split_keys(data: str) -> list:
@@ -745,6 +762,26 @@ class HeadlessTidalPlayer:
         "LOSSLESS": tidalapi.Quality.high_lossless,
         "HIRES": tidalapi.Quality.hi_res_lossless,
     }
+    # Search scopes, in the order Tab cycles them. "playlists" is the odd one
+    # out on purpose: TIDAL has no server-side search of your own playlists, so
+    # that scope is answered from the local index and never asks the network.
+    SEARCH_FILTERS = ("all", "tracks", "albums", "artists", "playlists")
+    SEARCH_FILTER_LABELS = {
+        "all": "All",
+        "tracks": "Tracks",
+        "albums": "Albums",
+        "artists": "Artists",
+        "playlists": "My Playlists",
+    }
+    # Which categories a scope asks TIDAL for. Keyed by the plural names
+    # session.search() answers with, so the fetch never has to translate.
+    SEARCH_FILTER_KINDS = {
+        "all": ("tracks", "albums", "artists"),
+        "tracks": ("tracks",),
+        "albums": ("albums",),
+        "artists": ("artists",),
+    }
+
     QUALITY_LABELS = {
         "LOW": "96k AAC",
         "HIGH": "320k AAC",
@@ -785,6 +822,18 @@ class HeadlessTidalPlayer:
         self._search_loading = False
         self._search_message = ""
         self._search_history: list = []  # recent searches, newest first
+        # Which scope the query runs in, and the paging state behind it.
+        # The pool is what a fetch brought back but the page had no room for;
+        # scrolling past the bottom spends that before asking TIDAL again.
+        self._search_filter = "all"
+        self._search_pool: dict = _empty_search_pool()
+        self._search_offset = 0
+        self._search_done = False  # TIDAL has nothing more behind this query
+        self._search_fetching = False  # a "load more" is in flight
+        self._search_last_fetch = 0.0
+        # Bumped whenever the query, the scope or the results are reset, so a
+        # fetch that lands after the fact knows to throw its page away
+        self._search_gen = 0
         # Browse state
         self._browse_title = ""
         self._browse_tracks = []
@@ -1462,6 +1511,16 @@ class HeadlessTidalPlayer:
         content.append(self._search_query, style="white")
         content.append("\u2588", style="bold white")
 
+        # The scope row. It is always on screen, so Tab has something to point
+        # at and the active scope is never hidden state.
+        content.append("\n   [Tab]", style="bold")
+        for i, name in enumerate(self.SEARCH_FILTERS):
+            content.append("  " if i == 0 else " \u00b7 ", style="dim")
+            active = name == self._search_filter
+            content.append(
+                self.SEARCH_FILTER_LABELS[name],
+                style="bold cyan" if active else "dim")
+
         if self._search_loading:
             content.append("\n\n   Searching...", style="dim yellow")
         elif self._search_message:
@@ -1485,11 +1544,22 @@ class HeadlessTidalPlayer:
                 content.append(f" {item['name']}", style="bold white" if i == self._search_cursor else "white")
                 if item.get("artist"):
                     content.append(f"  {item['artist']}", style="dim")
+                if item.get("playlist"):
+                    content.append(f"  in {item['playlist']}", style="dim cyan")
+            if self._search_fetching:
+                # The next page is on its way — say so under the last row, so
+                # scrolling off the bottom never looks like a frozen player
+                content.append("\n\n   Loading more...", style="dim yellow")
             if total > page:
                 page_num = (self._search_cursor // page) + 1
                 total_pages = (total + page - 1) // page
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
                 content.append(f"  ({total} results)", style="dim")
+                # Only on the last page, where "down" has stopped doing
+                # anything and the reason needs saying
+                if (page_num == total_pages and self._search_done
+                        and not self._pool_size(self._search_pool)):
+                    content.append("  end of results", style="dim")
         elif self._search_query:
             content.append("\n\n   Press Enter to search", style="dim")
 
@@ -1823,6 +1893,8 @@ class HeadlessTidalPlayer:
             controls.append(" search/open  ", style="dim")
             controls.append("[\u2191/\u2193]", style="bold")
             controls.append(" navigate  ", style="dim")
+            controls.append("[Tab]", style="bold")
+            controls.append(" filter  ", style="dim")
             if self._search_results:
                 controls.append("[Space]", style="bold")
                 controls.append(" pause/play  ", style="dim")
@@ -1951,6 +2023,12 @@ class HeadlessTidalPlayer:
                 "query": self._search_query,
                 "results": list(self._search_results),
                 "cursor": self._search_cursor,
+                # Paging comes back too, so coming back from an album lands you
+                # where you were and scrolling on still fetches the next page
+                "filter": self._search_filter,
+                "pool": dict(self._search_pool),
+                "offset": self._search_offset,
+                "done": self._search_done,
             })
         elif self._mode == self.MODE_BROWSE:
             self._nav_history.append({
@@ -1983,7 +2061,13 @@ class HeadlessTidalPlayer:
             self._search_query = state.get("query", "")
             self._search_results = state.get("results", [])
             self._search_cursor = state.get("cursor", 0)
+            self._search_filter = state.get("filter", "all")
+            self._search_pool = state.get("pool") or _empty_search_pool()
+            self._search_offset = state.get("offset", 0)
+            self._search_done = state.get("done", False)
+            self._search_gen += 1  # anything still in flight belongs to the old view
             self._search_loading = False
+            self._search_fetching = False
             self._search_message = ""
         elif mode == self.MODE_BROWSE:
             self._mode = self.MODE_BROWSE
@@ -2023,56 +2107,207 @@ class HeadlessTidalPlayer:
         artists = max(1, page * 2 // 10)
         return max(1, page - albums - artists), albums, artists
 
+    def _search_kinds(self) -> tuple:
+        """Which categories the active scope asks TIDAL for."""
+        return self.SEARCH_FILTER_KINDS.get(self._search_filter, ())
+
+    def _search_models(self) -> list:
+        """The tidalapi models behind those categories."""
+        models = {"tracks": tidalapi.Track, "albums": tidalapi.Album, "artists": tidalapi.Artist}
+        return [models[kind] for kind in self._search_kinds()]
+
+    def _search_row(self, kind: str, obj) -> dict:
+        """One result row. Everything downstream reads these, not the objects."""
+        if kind == "tracks":
+            artist = obj.artists[0].name if obj.artists else ""
+            return {"type": "track", "name": obj.name, "artist": artist, "obj": obj}
+        if kind == "albums":
+            artist = obj.artist.name if obj.artist else ""
+            return {"type": "album", "name": obj.name, "artist": artist, "obj": obj}
+        return {"type": "artist", "name": obj.name, "artist": "", "obj": obj}
+
+    def _take_search_page(self, pool: dict, page: int) -> tuple:
+        """One page of rows out of the pool, and what the pool has left.
+
+        Under a type filter the page is all of that type; under "All" it is the
+        50/30/20 split, still exactly `page` rows. Never mutates the pool it is
+        given — the caller swaps in the returned one whole.
+        """
+        if self._search_filter == "all":
+            n_tracks, n_albums, n_artists = self._search_split(page)
+            # A query with one album shouldn't waste the other album rows —
+            # hand the shortfall to tracks, which is what you searched for
+            n_albums = min(n_albums, len(pool["albums"]))
+            n_artists = min(n_artists, len(pool["artists"]))
+            n_tracks = min(page - n_albums - n_artists, len(pool["tracks"]))
+            counts = {"tracks": n_tracks, "albums": n_albums, "artists": n_artists}
+        else:
+            counts = {kind: page for kind in self._search_kinds()}
+
+        items = []
+        rest = _empty_search_pool()
+        for kind in ("tracks", "albums", "artists"):
+            take = min(counts.get(kind, 0), len(pool[kind]))
+            items.extend(self._search_row(kind, obj) for obj in pool[kind][:take])
+            rest[kind] = pool[kind][take:]
+        return items, rest
+
+    @staticmethod
+    def _pool_size(pool: dict) -> int:
+        return sum(len(v) for v in pool.values())
+
+    def _reset_search_results(self):
+        """Forget the current results and everything paging knows about them.
+        Bumping the generation is what makes a fetch already in flight drop
+        its page instead of appending it to a list it no longer belongs to."""
+        self._search_gen += 1
+        self._search_results = []
+        self._search_cursor = 0
+        self._search_message = ""
+        self._search_pool = _empty_search_pool()
+        self._search_offset = 0
+        self._search_done = False
+
+    def _cycle_search_filter(self, step: int = 1):
+        """Tab through the scopes. Changing scope drops the results but does
+        not refetch: every scope but "My Playlists" costs a request, and Tab is
+        a key you press repeatedly. Enter runs the search, exactly as it does
+        after typing — one deliberate keystroke, one request."""
+        order = self.SEARCH_FILTERS
+        self._search_filter = order[(order.index(self._search_filter) + step) % len(order)]
+        self._reset_search_results()
+        self._search_loading = False
+
     def _do_search(self):
         query = self._search_query.strip()
         if not query:
             return
         self._add_to_history(query)
+        self._reset_search_results()
+        if self._search_filter == "playlists":
+            self._search_own_playlists(query)
+            return
         self._search_loading = True
-        self._search_results = []
-        self._search_cursor = 0
-        self._search_message = ""
-        # Snapshot the size now: changing the setting mid-flight retunes the
-        # next search, it never refetches this one
+        self._fetch_search_page(query, self._search_gen)
+
+    def _fetch_search_page(self, query: str, gen: int):
+        """One page of results from TIDAL, on a daemon thread.
+
+        Snapshot the page size now: changing the setting mid-flight retunes the
+        next search, it never refetches this one.
+        """
         page = self._page_size
+        offset = self._search_offset
+        kinds = self._search_kinds()
+        models = self._search_models()
+        self._search_last_fetch = time.monotonic()
 
         def _run():
             try:
                 # TIDAL applies `limit` per type, so a single request at the page
                 # size covers every category — including the slack we need when
-                # one category comes up short. Well under tidalapi's 300 ceiling.
-                results = self.session.search(
-                    query, models=[tidalapi.Track, tidalapi.Album, tidalapi.Artist], limit=page
-                )
-                found_tracks = list(results.get("tracks") or [])
-                found_albums = list(results.get("albums") or [])
-                found_artists = list(results.get("artists") or [])
-
-                n_tracks, n_albums, n_artists = self._search_split(page)
-                # A query with one album shouldn't waste the other album rows —
-                # hand the shortfall to tracks, which is what you searched for
-                n_albums = min(n_albums, len(found_albums))
-                n_artists = min(n_artists, len(found_artists))
-                n_tracks = page - n_albums - n_artists
-
-                items = []
-                for track in found_tracks[:n_tracks]:
-                    artist = track.artists[0].name if track.artists else ""
-                    items.append({"type": "track", "name": track.name, "artist": artist, "obj": track})
-                for album in found_albums[:n_albums]:
-                    artist = album.artist.name if album.artist else ""
-                    items.append({"type": "album", "name": album.name, "artist": artist, "obj": album})
-                for artist in found_artists[:n_artists]:
-                    items.append({"type": "artist", "name": artist.name, "artist": "", "obj": artist})
-                self._search_results = items
-                if not items:
+                # one category comes up short.
+                results = self.session.search(query, models=models, limit=page, offset=offset)
+                if gen != self._search_gen:
+                    return  # the query or the scope moved on while we were out
+                pool = _empty_search_pool()
+                short = True
+                for kind in kinds:
+                    found = list(results.get(kind) or [])
+                    pool[kind] = self._search_pool[kind] + found
+                    if len(found) >= page:
+                        short = False
+                # A page TIDAL couldn't fill for any category is the last one,
+                # and it never has more than 300 items behind a query anyway
+                self._search_offset = offset + page
+                self._search_done = short or self._search_offset >= SEARCH_MAX_OFFSET
+                items, rest = self._take_search_page(pool, page)
+                if gen != self._search_gen:
+                    return
+                self._search_pool = rest
+                self._search_results = self._search_results + items
+                if not self._search_results:
                     self._search_message = "No results found"
             except Exception as e:
-                self._search_message = f"Search failed: {e}"
+                if gen == self._search_gen:
+                    self._search_message = f"Search failed: {e}"
+                    self._search_done = True
             finally:
                 self._search_loading = False
+                self._search_fetching = False
+                self._wake()  # results landed off the UI thread; repaint now
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _search_more(self):
+        """The next page, asked for by scrolling off the bottom of this one.
+
+        Free whenever the last fetch overshot the page — that surplus is
+        already in the pool. Only an empty pool costs a request, and only one
+        is ever in flight, so holding the down arrow can't fan out.
+        """
+        if self._search_loading or self._search_fetching:
+            return
+        if self._search_filter == "playlists":
+            return  # a local scan already returned everything it has
+        page = self._page_size
+        pool = self._search_pool
+        if self._pool_size(pool) >= page or (self._search_done and self._pool_size(pool)):
+            items, rest = self._take_search_page(pool, page)
+            self._search_pool = rest
+            self._search_results = self._search_results + items
+            return
+        if self._search_done or self._search_offset >= SEARCH_MAX_OFFSET:
+            self._search_done = True
+            return
+        if time.monotonic() - self._search_last_fetch < SEARCH_FETCH_MIN_INTERVAL:
+            return
+        query = self._search_query.strip()
+        if not query:
+            return
+        self._search_fetching = True
+        self._fetch_search_page(query, self._search_gen)
+
+    def _search_own_playlists(self, query: str):
+        """Search the user's own playlists — from the local index, never the
+        network. TIDAL has no API for this, and the cache was built for it:
+        every playlist it has fetched keeps the plain-text name, artists and
+        album of each track. A scan of a few thousand rows is instant, so this
+        runs on the UI thread and there is nothing to wait for."""
+        self._search_done = True  # local scan: everything it has, in one go
+        if not self._cache.enabled:
+            self._search_message = (
+                "Playlist search needs the metadata cache — turn 'Cache playlists' on in settings")
+            return
+        names = {p.id: p.name for p in (self._cache.get_playlists() or [])}
+        needle = query.lower()
+        exact, loose = [], []
+        scanned = 0
+        for playlist_id, record in self._cache.iter_tracks():
+            scanned += 1
+            name = record.get("name") or ""
+            artists = ", ".join(record.get("artists") or [])
+            album = record.get("album") or ""
+            # Case-insensitive substring, nothing cleverer: a title match is
+            # what you meant, so those lead; artist and album matches follow
+            if needle in name.lower():
+                bucket = exact
+            elif needle in artists.lower() or needle in album.lower():
+                bucket = loose
+            else:
+                continue
+            bucket.append({
+                "type": "track",
+                "name": name,
+                "artist": artists,
+                "playlist": names.get(playlist_id, "Playlist"),
+                "obj": CachedTrack(record),
+            })
+        self._search_results = exact + loose
+        if not self._search_results:
+            self._search_message = (
+                "No results in your playlists" if scanned else
+                "Nothing cached to search yet — open Playlists once to index them")
 
     def _select_search_result(self):
         if not self._search_results:
@@ -2549,9 +2784,10 @@ class HeadlessTidalPlayer:
             self._mini_player = False
             self._mode = self.MODE_SEARCH
             self._search_query = ""
-            self._search_results = []
-            self._search_cursor = 0
-            self._search_message = ""
+            # A fresh search starts in the scope you'd expect, not in whatever
+            # one you last tabbed to half an hour ago
+            self._search_filter = "all"
+            self._reset_search_results()
             self._nav_history.clear()
         elif key == "t":
             self._mini_player = not self._mini_player
@@ -2594,12 +2830,24 @@ class HeadlessTidalPlayer:
             # Space toggles play/pause when browsing search results
             self._toggle_play_key()
             return
+        if key == KEY_TAB:
+            self._cycle_search_filter(1)
+            return
+        if key == KEY_SHIFT_TAB:
+            self._cycle_search_filter(-1)
+            return
         if key == KEY_UP:
             if self._search_results:
                 self._search_cursor = max(0, self._search_cursor - 1)
         elif key == KEY_DOWN:
             if self._search_results:
-                self._search_cursor = min(len(self._search_results) - 1, self._search_cursor + 1)
+                if self._search_cursor < len(self._search_results) - 1:
+                    self._search_cursor += 1
+                else:
+                    # The bottom of the list is where the next page comes from.
+                    # The cursor stays put: rows are appended below it, so it
+                    # never jumps, and the next press walks into them.
+                    self._search_more()
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
             if self._search_results:
                 self._select_search_result()
@@ -2607,14 +2855,10 @@ class HeadlessTidalPlayer:
                 self._do_search()
         elif key in (KEY_BACKSPACE, KEY_BACKSPACE2):
             self._search_query = self._search_query[:-1]
-            self._search_results = []
-            self._search_cursor = 0
-            self._search_message = ""
+            self._reset_search_results()
         elif len(key) == 1 and key.isprintable():
             self._search_query += key
-            self._search_results = []
-            self._search_cursor = 0
-            self._search_message = ""
+            self._reset_search_results()
 
     def _handle_browse_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:

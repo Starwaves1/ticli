@@ -45,6 +45,35 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
   IPC (`keybind`) to write `user-data/ticli/media-key`, which `_monitor_playback` polls
   on its existing 0.5s tick. Gated on `IS_MACOS`; a silent no-op elsewhere and on ffplay.
 
+### Search
+
+Search mode types the query with every printable key, so the only key left
+for a filter is one that isn't printable: `Tab` cycles the scope (All /
+Tracks / Albums / Artists / My Playlists, `Shift-Tab` backwards) and the
+scope row under the query says which is active. Changing scope drops the
+results but never fetches — `Enter` is the one keystroke that costs a
+request, the same as it is after typing.
+
+Under a type filter the whole page is that type; under All it stays the
+50/30/20 split. `session.search()` is asked for `page_size` of each category
+at an offset, and whatever the page had no room for is kept in
+`_search_pool`, so scrolling off the bottom usually costs nothing —
+`_search_more` spends the pool first and only fetches when it runs dry. The
+fetch is a daemon thread, one at a time (`_search_fetching`), no sooner than
+`SEARCH_FETCH_MIN_INTERVAL` after the last, and never past TIDAL's 300-item
+`SEARCH_MAX_OFFSET`; a held-down arrow therefore cannot fan out into
+requests. Rows are appended, so the cursor never moves under the user, and
+`_search_gen` makes a page that lands after the query changed throw itself
+away.
+
+"My Playlists" is answered entirely from `cache.iter_tracks()` — TIDAL has
+no server-side search of your own playlists — so it is instant, runs on the
+UI thread, and makes no request at all. Case-insensitive substring over
+name, artists and album, with title matches first; each row says which
+playlist it came from and resolves through `_resolve_track` before playback.
+An empty index or `cache_metadata` turned off says so instead of looking
+like a query with no hits.
+
 ### Caching
 
 `utils/cache.py` holds a metadata index (your playlists, and the tracks in

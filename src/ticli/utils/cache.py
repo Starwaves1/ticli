@@ -403,10 +403,14 @@ class MetadataCache:
     def iter_tracks(self):
         """Every cached track record, with the playlist it came from.
 
-        Nothing calls this yet; it is the shape "search my own playlists"
-        needs — TIDAL has no server-side API for that, so it can only ever
-        be answered from an index like this one.
+        What "search my own playlists" is served from — TIDAL has no
+        server-side API for that, so it can only ever be answered from an
+        index like this one. Disabled means disabled: with metadata caching
+        off this yields nothing rather than reading a file that shouldn't be
+        consulted, the same as every other read.
         """
+        if not self.enabled:
+            return
         for key, entry in self._load().items():
             if not key.startswith("playlist:"):
                 continue

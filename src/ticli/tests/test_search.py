@@ -1,17 +1,20 @@
-"""Tests for search sizing — the "Songs per page" setting has to reach search
-and the browse lists it opens, not just the queue and playlist pages.
+"""Tests for search: page sizing, the type filters, paging on scroll, and
+searching the user's own playlists out of the local index.
 
-No TIDAL session or network: the session is a fake that records the single
-request it is given.
+No TIDAL session or network anywhere: the session is a fake that records
+every request it is given, and the cache directory is redirected to tmp_path.
 """
 
 import json
+import threading
 import time
 import types
 
 import pytest
 
+import ticli.player as player_mod
 from ticli.player import HeadlessTidalPlayer
+from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
 from ticli.utils.config import save_config
 
@@ -231,3 +234,365 @@ class TestBrowseListsHonourPageSize:
         p._open_artist(types.SimpleNamespace(name="X", get_top_tracks=get_top_tracks))
         assert _wait_for(lambda: not p._browse_loading)
         assert seen["limit"] == 20
+
+
+# ── type filters ──
+
+
+def _filtered(filter_name, page_size=10, caps=None, query="miles davis"):
+    p = HeadlessTidalPlayer()
+    p._page_size = page_size
+    p.session = _FakeSession(caps)
+    p._search_filter = filter_name
+    p._search_query = query
+    p._do_search()
+    assert _wait_for(lambda: not p._search_loading), "search never finished"
+    return p
+
+
+class TestTypeFilters:
+    def test_tab_cycles_through_every_scope(self, config_file):
+        p = HeadlessTidalPlayer()
+        seen = [p._search_filter]
+        for _ in range(len(HeadlessTidalPlayer.SEARCH_FILTERS) - 1):
+            p._handle_search_key(player_mod.KEY_TAB)
+            seen.append(p._search_filter)
+        assert seen == list(HeadlessTidalPlayer.SEARCH_FILTERS)
+        p._handle_search_key(player_mod.KEY_TAB)
+        assert p._search_filter == "all"  # wraps
+
+    def test_shift_tab_cycles_backwards(self, config_file):
+        p = HeadlessTidalPlayer()
+        p._handle_search_key(player_mod.KEY_SHIFT_TAB)
+        assert p._search_filter == HeadlessTidalPlayer.SEARCH_FILTERS[-1]
+
+    def test_tab_is_not_typed_into_the_query(self, config_file):
+        p = HeadlessTidalPlayer()
+        p._search_query = "monk"
+        p._handle_search_key(player_mod.KEY_TAB)
+        assert p._search_query == "monk"
+
+    def test_tab_does_not_fetch_by_itself(self, config_file):
+        """Changing scope is a key you press repeatedly — Enter is what costs
+        a request, exactly as it does after typing."""
+        p, session = _search(page_size=10)
+        for _ in range(4):
+            p._handle_search_key(player_mod.KEY_TAB)
+        assert len(session.calls) == 1
+        assert p._search_results == []
+
+    def test_tracks_filter_asks_only_for_tracks(self, config_file):
+        import tidalapi
+        p = _filtered("tracks", page_size=12)
+        assert p.session.calls[0]["models"] == [tidalapi.Track]
+        assert {i["type"] for i in p._search_results} == {"track"}
+        assert len(p._search_results) == 12  # a whole page of one type
+
+    def test_albums_filter_asks_only_for_albums(self, config_file):
+        import tidalapi
+        p = _filtered("albums", page_size=12)
+        assert p.session.calls[0]["models"] == [tidalapi.Album]
+        assert {i["type"] for i in p._search_results} == {"album"}
+        assert len(p._search_results) == 12
+
+    def test_artists_filter_asks_only_for_artists(self, config_file):
+        import tidalapi
+        p = _filtered("artists", page_size=12)
+        assert p.session.calls[0]["models"] == [tidalapi.Artist]
+        assert {i["type"] for i in p._search_results} == {"artist"}
+        assert len(p._search_results) == 12
+
+    def test_all_filter_still_splits(self, config_file):
+        p = _filtered("all", page_size=12)
+        assert {i["type"] for i in p._search_results} == {"track", "album", "artist"}
+        assert len(p._search_results) == 12
+
+    def test_filter_row_is_on_screen(self, config_file):
+        p = HeadlessTidalPlayer()
+        p._search_filter = "albums"
+        text = p._build_search_display().plain
+        for label in HeadlessTidalPlayer.SEARCH_FILTER_LABELS.values():
+            assert label in text
+        assert "[Tab]" in text
+
+    def test_entering_search_starts_in_all(self, config_file):
+        p = HeadlessTidalPlayer()
+        p._search_filter = "playlists"
+        p._handle_player_key("s")
+        assert p._search_filter == "all"
+
+
+# ── paging on scroll ──
+
+
+class _PagedSession:
+    """A session with a finite catalogue behind the query, so offsets matter."""
+
+    def __init__(self, totals=None):
+        self.calls = []
+        self.totals = totals or {"tracks": 200, "albums": 200, "artists": 200}
+        self.audio_quality = None
+
+    def search(self, query, models=None, limit=50, offset=0):
+        self.calls.append({"query": query, "models": models, "limit": limit, "offset": offset})
+        def rows(kind, make):
+            end = min(offset + limit, self.totals.get(kind, 0))
+            return [make(i) for i in range(min(offset, end), end)]
+        return {
+            "tracks": rows("tracks", _fake_track),
+            "albums": rows("albums", _fake_album),
+            "artists": rows("artists", _fake_artist),
+        }
+
+
+def _paged(filter_name="tracks", page_size=10, totals=None):
+    p = HeadlessTidalPlayer()
+    p._page_size = page_size
+    p.session = _PagedSession(totals)
+    p._search_filter = filter_name
+    p._search_query = "miles davis"
+    p._do_search()
+    assert _wait_for(lambda: not p._search_loading), "search never finished"
+    return p
+
+
+def _scroll_to_bottom(p):
+    for _ in range(len(p._search_results) + 1):
+        p._handle_search_key(player_mod.KEY_DOWN)
+
+
+class TestFetchMoreOnScroll:
+    def test_down_at_the_bottom_asks_for_the_next_page(self, config_file):
+        p = _paged(page_size=10)
+        assert len(p._search_results) == 10
+        p._search_last_fetch = 0  # the gate is time, not this test's subject
+        _scroll_to_bottom(p)
+        assert _wait_for(lambda: len(p._search_results) > 10)
+        assert p.session.calls[-1]["offset"] == 10
+        assert len(p._search_results) == 20
+
+    def test_results_are_appended_not_replaced(self, config_file):
+        p = _paged(page_size=10)
+        first = [i["name"] for i in p._search_results]
+        p._search_last_fetch = 0
+        _scroll_to_bottom(p)
+        assert _wait_for(lambda: len(p._search_results) > 10)
+        assert [i["name"] for i in p._search_results][:10] == first
+
+    def test_cursor_stays_put_across_the_append(self, config_file):
+        p = _paged(page_size=10)
+        for _ in range(9):
+            p._handle_search_key(player_mod.KEY_DOWN)
+        assert p._search_cursor == 9  # the last row
+        p._search_last_fetch = 0
+        p._handle_search_key(player_mod.KEY_DOWN)  # one press: fetch, no move
+        assert p._search_cursor == 9
+        assert _wait_for(lambda: len(p._search_results) > 10)
+        assert p._search_cursor == 9
+        p._handle_search_key(player_mod.KEY_DOWN)
+        assert p._search_cursor == 10  # and the next press walks into the new rows
+
+    def test_surplus_rows_are_served_without_a_request(self, config_file):
+        """"All" fetches a page of each category and shows a page in total, so
+        the next screen or two is already in hand — scrolling must spend that
+        before it asks TIDAL for anything."""
+        p = _paged(filter_name="all", page_size=10)
+        assert len(p.session.calls) == 1
+        _scroll_to_bottom(p)
+        assert len(p._search_results) == 20
+        assert len(p.session.calls) == 1  # no network for page two
+
+    def test_end_of_results_stops_fetching(self, config_file):
+        p = _paged(page_size=10, totals={"tracks": 14, "albums": 0, "artists": 0})
+        assert len(p._search_results) == 10
+        p._search_last_fetch = 0
+        _scroll_to_bottom(p)
+        assert _wait_for(lambda: len(p._search_results) == 14)
+        assert p._search_done
+        calls = len(p.session.calls)
+        for _ in range(30):
+            p._handle_search_key(player_mod.KEY_DOWN)
+        assert len(p.session.calls) == calls  # never again, however hard you scroll
+        assert p._search_cursor == 13
+
+    def test_short_first_page_never_asks_for_a_second(self, config_file):
+        p = _paged(page_size=10, totals={"tracks": 4, "albums": 0, "artists": 0})
+        p._search_last_fetch = 0
+        for _ in range(20):
+            p._handle_search_key(player_mod.KEY_DOWN)
+        assert len(p.session.calls) == 1
+        assert p._search_done
+
+    def test_held_down_arrow_does_not_fan_out(self, config_file):
+        """A burst of repeats while a fetch is in flight is one fetch, not a
+        request per key event — the owner's IP depends on it."""
+        p = _paged(page_size=10)
+        release = threading.Event()
+        real_search = p.session.search
+
+        def slow_search(*a, **kw):
+            release.wait(2.0)
+            return real_search(*a, **kw)
+
+        p.session.search = slow_search
+        p._search_last_fetch = 0
+        for _ in range(60):  # ~a second of key repeat held at the bottom
+            p._handle_search_key(player_mod.KEY_DOWN)
+        assert p._search_fetching
+        assert len(p.session.calls) == 1  # the first page only; the second is blocked
+        release.set()
+        assert _wait_for(lambda: not p._search_fetching)
+        assert len(p.session.calls) == 2
+
+    def test_back_to_back_fetches_are_rate_gated(self, config_file):
+        """Even with nothing in flight, two network pages can't land inside the
+        minimum interval."""
+        p = _paged(page_size=10)
+        _scroll_to_bottom(p)  # _do_search stamped the clock a moment ago
+        time.sleep(0.05)
+        assert len(p.session.calls) == 1
+
+    def test_the_last_page_says_it_is_the_last(self, config_file):
+        p = _paged(page_size=10, totals={"tracks": 14, "albums": 0, "artists": 0})
+        p._search_last_fetch = 0
+        _scroll_to_bottom(p)
+        assert _wait_for(lambda: len(p._search_results) == 14)
+        assert "end of results" in p._build_search_display().plain
+        p._search_cursor = 0  # page one, where the list is still going
+        assert "end of results" not in p._build_search_display().plain
+
+    def test_a_fetch_in_flight_is_visible(self, config_file):
+        p = _paged(page_size=10)
+        p._search_fetching = True
+        assert "Loading more" in p._build_search_display().plain
+
+    def test_the_offset_ceiling_is_respected(self, config_file):
+        p = _paged(page_size=10)
+        p._search_offset = player_mod.SEARCH_MAX_OFFSET
+        p._search_last_fetch = 0
+        _scroll_to_bottom(p)
+        assert len(p.session.calls) == 1  # TIDAL has nothing past 300
+        assert p._search_done
+
+
+# ── searching your own playlists ──
+
+
+@pytest.fixture
+def cache_dir(tmp_path, monkeypatch):
+    """Redirect the metadata cache away from the real one."""
+    monkeypatch.setattr(cache_mod, "CACHE_DIR", tmp_path / "cache")
+    return tmp_path / "cache"
+
+
+def _index(cache_dir, playlists, tracks_by_playlist):
+    """Write an index the way the cache itself would have."""
+    now = time.time()
+    entries = {"playlists": {"fetched": now, "used": now, "data": playlists}}
+    for pid, records in tracks_by_playlist.items():
+        entries[f"playlist:{pid}"] = {"fetched": now, "used": now, "data": records}
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_mod.index_file().write_text(json.dumps({"version": cache_mod.CACHE_VERSION,
+                                                  "entries": entries}))
+
+
+def _rec(tid, name, artist, album="Kind of Blue"):
+    return {"id": tid, "name": name, "duration": 200, "artists": [artist], "album": album}
+
+
+def _stocked(cache_dir):
+    _index(cache_dir, [
+        {"id": "p1", "name": "Jazz", "num_tracks": 2, "creator": "Garrett", "editable": True},
+        {"id": "p2", "name": "Late Night", "num_tracks": 1, "creator": "Garrett", "editable": True},
+    ], {
+        "p1": [_rec(1, "So What", "Miles Davis"), _rec(2, "Blue in Green", "Miles Davis")],
+        "p2": [_rec(3, "Naima", "John Coltrane", album="Giant Steps")],
+    })
+
+
+def _local_search(p, query):
+    p._search_filter = "playlists"
+    p._search_query = query
+    p._do_search()
+    return p._search_results
+
+
+class TestPlaylistSearch:
+    def test_matches_are_found_without_any_request(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        p.session = _FakeSession()
+        results = _local_search(p, "so what")
+        assert [r["name"] for r in results] == ["So What"]
+        assert p.session.calls == []  # local index only, never the network
+
+    def test_results_say_which_playlist_they_came_from(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        results = _local_search(p, "naima")
+        assert results[0]["playlist"] == "Late Night"
+        p._search_cursor = 0
+        assert "in Late Night" in p._build_search_display().plain
+
+    def test_matching_is_case_insensitive_and_substring(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        assert len(_local_search(p, "BLUE IN")) == 1
+
+    def test_artist_and_album_match_too_but_titles_lead(self, config_file, cache_dir):
+        _index(cache_dir, [{"id": "p1", "name": "Jazz", "num_tracks": 2}], {
+            "p1": [_rec(1, "Naima", "Miles Davis"), _rec(2, "Miles Ahead", "Bill Evans")],
+        })
+        p = HeadlessTidalPlayer()
+        results = _local_search(p, "miles")
+        assert [r["name"] for r in results] == ["Miles Ahead", "Naima"]
+
+    def test_hits_resolve_to_a_real_track_before_playing(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        real = _fake_track(1)
+        asked = []
+
+        def track(tid):
+            asked.append(tid)
+            return real
+
+        p.session = types.SimpleNamespace(search=None, track=track, audio_quality=None)
+        played = []
+        p._play_track = lambda t, seek=0: played.append(t)
+        _local_search(p, "so what")
+        p._search_cursor = 0
+        p._select_search_result()
+        # The row itself is a cached record; playback resolves it through the
+        # session (_play_track does that on its own thread, so check the seam)
+        assert played and getattr(played[0], "cached", False)
+        assert p._resolve_track(played[0]) is real
+        assert asked == [1]
+
+    def test_no_match_says_so(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        assert _local_search(p, "stockhausen") == []
+        assert p._search_message == "No results in your playlists"
+
+    def test_empty_cache_says_so(self, config_file, cache_dir):
+        p = HeadlessTidalPlayer()
+        assert _local_search(p, "anything") == []
+        assert "Nothing cached" in p._search_message
+
+    def test_caching_disabled_says_so(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        save_config({**config_mod.DEFAULTS, "cache_metadata": False})
+        p = HeadlessTidalPlayer()
+        assert _local_search(p, "so what") == []
+        assert "metadata cache" in p._search_message
+        assert "settings" in p._search_message
+
+    def test_scrolling_a_local_result_list_never_fetches(self, config_file, cache_dir):
+        _stocked(cache_dir)
+        p = HeadlessTidalPlayer()
+        p.session = _FakeSession()
+        _local_search(p, "miles")
+        for _ in range(20):
+            p._handle_search_key(player_mod.KEY_DOWN)
+        assert p.session.calls == []
