@@ -139,6 +139,32 @@ Size estimates cost **zero requests** (duration × nominal bitrate, −0.3% to
 −2.1% error on AAC; duration already in the cache index) so all four tiers
 can be shown at once — label with `~`.
 
+## Cache admission (Garrett, 2026-07-26 — partially decided)
+
+Eviction was deferred earlier; admission came up from the other end:
+
+> "If a song playing now isn't worth caching in a circumstance where there
+> are a bunch of very high value songs already cached, it should just stream
+> in chunks and not cache."
+
+**Decided:** refuse to cache **only when the cache is already full** and the
+playing song is lower value than what is in there. With room to spare,
+behaviour is unchanged — cache everything, as today. Rationale: at the moment
+a song starts you know almost nothing about it (zero plays, like every staple
+on its first day), so an unconditional value test would freeze the cache into
+whatever it held the day the rule was turned on. Only under pressure do both
+sides have a history to compare.
+
+**Still open, Garrett is thinking about it:** the value function itself, shared
+by eviction and admission. Candidates discussed — cache on second play; cache
+only if the track was played most of the way through; plays-then-oldest (his
+original eviction design). Also open: whether the downloads tier
+(`~/Music/Ticli`) sits outside admission entirely, the way it already sits
+outside eviction and the budget.
+
+**Both halves matter to him** — "Both eviction and admission are important."
+Do not build either until the value function is settled.
+
 ## Backlog (requested, not yet scheduled)
 
 - **`r` (start radio) must not restart the current song** (Garrett,
