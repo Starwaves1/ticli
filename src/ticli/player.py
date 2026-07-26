@@ -81,6 +81,11 @@ from ticli.utils import artwork
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
 
+# How long a name the "+ New playlist" row will take. A cap so the row cannot
+# grow past the panel, not a rule from TIDAL — nothing in tidalapi documents a
+# limit, so this errs generous.
+PLAYLIST_NAME_MAX = 100
+
 AUDIO_PLAYERS = ["mpv", "ffplay"]
 
 IS_MACOS = sys.platform == "darwin"
@@ -1261,6 +1266,13 @@ class HeadlessTidalPlayer:
         self._picker_cursor = 0
         self._picker_loading = False
         self._picker_busy = False
+        # The name being typed into the "+ New playlist" row, or None when it
+        # is not open. None vs "" is the whole state: "" is an open prompt with
+        # nothing typed yet, which is not the same as no prompt at all.
+        self._picker_new_name: Optional[str] = None
+        # The playlist a track was last added to, pinned to the top of the
+        # picker and persisted in the state file (see _remember_last_playlist).
+        self._last_playlist_id: Optional[str] = None
         # Settings page state. _settings_edit is the digits typed into a number
         # row so far, or None when the arrows are just navigating; it is only
         # ever replaced wholesale, never appended to in place
@@ -1634,6 +1646,38 @@ class HeadlessTidalPlayer:
         except Exception as e:
             logger.debug("Failed to merge position into saved state: %s", e)
 
+    def _remember_last_playlist(self, playlist):
+        """Pin the playlist a track was just added to, and persist it.
+
+        This lives in the *state* file, not the config: the config is a
+        schema'd set of things the user chose, each with a row on the settings
+        page and a migration when it changes. Which playlist you last used is
+        none of those — it is incidental, machine-written, and it belongs next
+        to the queue and the search history, which are already here.
+
+        Written through immediately (read-modify-write of the same atomic
+        file) rather than left to the shutdown save, because a session that
+        ends by anything other than [q] would otherwise lose it. Always called
+        from the background thread that did the adding, never the UI thread.
+        """
+        pid = str(getattr(playlist, "id", "") or "")
+        if not pid:
+            return
+        self._last_playlist_id = pid
+        data = {}
+        try:
+            if STATE_FILE.exists():
+                loaded = json.loads(STATE_FILE.read_text())
+                if isinstance(loaded, dict):
+                    data = loaded
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug("Failed to read state before pinning playlist: %s", e)
+        data["last_playlist_id"] = pid
+        try:
+            self._write_state_file(data)
+        except OSError as e:
+            logger.debug("Failed to persist last-used playlist: %s", e)
+
     def _save_state(self):
         """Save queue and playback state to disk for next session."""
         # If the restore never finished attaching the queue, our in-memory
@@ -1654,6 +1698,10 @@ class HeadlessTidalPlayer:
                 "position": self._get_position(),
                 "search_history": self._search_history[:20],
             }
+            # A full save rewrites the whole file, so the pin has to be carried
+            # through it or the last add of the session would be forgotten
+            if self._last_playlist_id:
+                state["last_playlist_id"] = self._last_playlist_id
             self._write_state_file(state)
         except Exception as e:
             logger.debug("Failed to save player state: %s", e)
@@ -1684,6 +1732,7 @@ class HeadlessTidalPlayer:
         except (json.JSONDecodeError, OSError):
             return
         self._search_history = data.get("search_history", [])[:20]
+        self._last_playlist_id = data.get("last_playlist_id") or None
         track_ids = data.get("track_ids", [])
         queue_index = data.get("queue_index", 0)
         position = data.get("position", 0) or 0
@@ -2617,16 +2666,32 @@ class HeadlessTidalPlayer:
         content.append("   Add to playlist: ", style="bold magenta")
         content.append(track_name, style="bold white")
 
+        # The "+ New playlist" row is cursor -1 and always on screen, above the
+        # list and off the paging, so it is reachable from any page and from an
+        # empty list. Typing turns it into a textbox with a visible caret, the
+        # way the settings page does, so typing never looks like navigating.
+        content.append("\n\n")
+        if self._picker_new_name is not None:
+            content.append("  ▸ ", style="bold cyan")
+            content.append("New playlist: ", style="bold white")
+            content.append(f"‹ {self._picker_new_name}▏›", style="bold yellow")
+            content.append("   [Enter] create  [Esc] cancel", style="dim")
+        else:
+            selected = self._picker_cursor < 0
+            content.append("  ▸ " if selected else "    ", style="bold cyan" if selected else "")
+            content.append("+ New playlist", style="bold white" if selected else "white")
+
+        playlists = self._picker_playlists()
         if self._picker_loading:
             content.append("\n\n   Loading playlists...", style="dim yellow")
-        elif self._editable_playlists:
-            total = len(self._editable_playlists)
+        elif playlists:
+            total = len(playlists)
             page = self._page_size
-            page_start = (self._picker_cursor // page) * page
+            page_start = (max(self._picker_cursor, 0) // page) * page
             page_end = min(page_start + page, total)
             content.append("\n", style="")
             for i in range(page_start, page_end):
-                pl = self._editable_playlists[i]
+                pl = playlists[i]
                 content.append("\n")
                 if i == self._picker_cursor:
                     content.append("  ▸ ", style="bold cyan")
@@ -2637,8 +2702,12 @@ class HeadlessTidalPlayer:
                 content.append(pl_name, style="bold white" if i == self._picker_cursor else "white")
                 if num_tracks != "":
                     content.append(f"  {num_tracks} tracks", style="dim cyan")
+                # Say why this one is at the top, rather than reordering silently
+                if i == 0 and self._last_playlist_id and str(
+                        getattr(pl, "id", "") or "") == self._last_playlist_id:
+                    content.append("  last used", style="dim")
             if total > page:
-                page_num = (self._picker_cursor // page) + 1
+                page_num = (max(self._picker_cursor, 0) // page) + 1
                 total_pages = (total + page - 1) // page
                 content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
         else:
@@ -2923,12 +2992,20 @@ class HeadlessTidalPlayer:
             controls.append("[\u2190/Esc]", style="bold")
             controls.append(" back", style="dim")
         elif self._mode == self.MODE_ADD_TO_PLAYLIST:
-            controls.append("   [Enter]", style="bold")
-            controls.append(" add  ", style="dim")
-            controls.append("[\u2191/\u2193]", style="bold")
-            controls.append(" navigate  ", style="dim")
-            controls.append("[\u2190/Esc]", style="bold")
-            controls.append(" cancel", style="dim")
+            if self._picker_new_name is not None:
+                # Typing: the arrows do nothing here, so the row must not
+                # advertise them
+                controls.append("   [Enter]", style="bold")
+                controls.append(" create  ", style="dim")
+                controls.append("[Esc]", style="bold")
+                controls.append(" cancel", style="dim")
+            else:
+                controls.append("   [Enter]", style="bold")
+                controls.append(" add  ", style="dim")
+                controls.append("[\u2191/\u2193]", style="bold")
+                controls.append(" navigate  ", style="dim")
+                controls.append("[\u2190/Esc]", style="bold")
+                controls.append(" cancel", style="dim")
         elif self._mode == self.MODE_SETTINGS:
             controls.append("   [\u2191/\u2193]", style="bold")
             controls.append(" select  ", style="dim")
@@ -3885,6 +3962,23 @@ class HeadlessTidalPlayer:
                     return row["obj"]
         return self._current_track
 
+    def _picker_playlists(self) -> list:
+        """The picker's rows, last-used first.
+
+        Derived on read rather than stored: the cache in _editable_playlists
+        stays whatever TIDAL said, and a pin naming a playlist that is no
+        longer in it — deleted on the web since the last run — simply matches
+        nothing and the normal order comes back. No ghost row, no error.
+        """
+        playlists = self._editable_playlists  # read once: another thread replaces it
+        pid = self._last_playlist_id
+        if not pid or not playlists:
+            return playlists
+        pinned = [p for p in playlists if str(getattr(p, "id", "") or "") == pid]
+        if not pinned:
+            return playlists
+        return pinned + [p for p in playlists if str(getattr(p, "id", "") or "") != pid]
+
     def _open_playlist_picker(self):
         """Open the add-to-playlist picker for the targeted track."""
         track = self._target_track_for_picker()
@@ -3894,7 +3988,10 @@ class HeadlessTidalPlayer:
         self._push_nav()
         self._mode = self.MODE_ADD_TO_PLAYLIST
         self._picker_track = track
-        self._picker_cursor = 0
+        self._picker_new_name = None
+        # -1 is the "+ New playlist" row, the same way -1 is "Play All" in
+        # browse. With nothing to add to, that row is the only one there is.
+        self._picker_cursor = 0 if self._editable_playlists else -1
         # Reuse the cached list for a minute — listing re-fetches every playlist
         if not self._editable_playlists or time.time() - self._editable_playlists_time > 60:
             self._picker_loading = True
@@ -3906,6 +4003,8 @@ class HeadlessTidalPlayer:
                         p for p in (playlists or []) if isinstance(p, tidalapi.UserPlaylist)
                     ]
                     self._editable_playlists_time = time.time()
+                    if not self._editable_playlists:
+                        self._picker_cursor = -1
                 except Exception:
                     pass
                 finally:
@@ -3924,6 +4023,9 @@ class HeadlessTidalPlayer:
         def _run():
             try:
                 added = playlist.add([str(track.id)])  # server skips duplicates
+                # Pinned before the toast, so "the toast appeared" implies the
+                # pin is already on disk — both for the user and for the tests
+                self._remember_last_playlist(playlist)
                 if added:
                     self._set_toast(f'Added to "{playlist.name}"')
                 else:
@@ -3932,6 +4034,57 @@ class HeadlessTidalPlayer:
                 self._set_toast("Failed to add to playlist")
             finally:
                 self._picker_busy = False
+            self._wake()
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _picker_create_and_add(self, name: str):
+        """Create a playlist and put the picked track in it, in one gesture.
+
+        Two requests on a background thread, and they fail separately: a
+        creation that worked followed by an add that didn't is not "failed to
+        create a playlist", and saying so would send the user looking for a
+        playlist that is already there.
+        """
+        if self._picker_busy:
+            return
+        name = (name or "").strip()
+        if not name:
+            # Nothing is created for an empty name, and the prompt stays open
+            # rather than closing as if something had happened
+            self._set_toast("Playlist name can't be empty")
+            return
+        track = self._picker_track
+        # Set before anything else: a second Enter arriving on the same tick
+        # has to find this already true, or the playlist is created twice
+        self._picker_busy = True
+        self._picker_new_name = None
+        self._go_back()
+
+        def _run():
+            try:
+                playlist = self.session.user.create_playlist(name, "")
+            except Exception:
+                self._set_toast(f'Failed to create "{name}"')
+                self._picker_busy = False
+                self._wake()
+                return
+            # Created, so it is the last one used whatever the add does next
+            self._remember_last_playlist(playlist)
+            # Whole-object assignment, never an insert into the shared list
+            pid = str(getattr(playlist, "id", "") or "")
+            self._editable_playlists = [playlist] + [
+                p for p in self._editable_playlists
+                if not pid or str(getattr(p, "id", "") or "") != pid
+            ]
+            try:
+                playlist.add([str(track.id)])
+                self._set_toast(f'Created "{name}" and added track')
+            except Exception:
+                self._set_toast(f'Created "{name}", but failed to add track')
+            finally:
+                self._picker_busy = False
+            self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4362,21 +4515,37 @@ class HeadlessTidalPlayer:
                 self._open_playlist(self._playlists[self._playlists_cursor])
 
     def _handle_add_to_playlist_key(self, key: str):
+        # While a name is being typed the picker is a textbox, so this runs
+        # before anything else and swallows every key it doesn't use: Space
+        # types a space rather than pausing, and an arrow must not navigate a
+        # list the user cannot see the cursor on.
+        if self._picker_new_name is not None:
+            if key == KEY_ESC:
+                self._picker_new_name = None  # nothing was created
+            elif key in (KEY_BACKSPACE, KEY_BACKSPACE2):
+                self._picker_new_name = self._picker_new_name[:-1]
+            elif key in (KEY_ENTER, KEY_ENTER2):
+                self._picker_create_and_add(self._picker_new_name)
+            elif len(key) == 1 and key.isprintable():
+                if len(self._picker_new_name) < PLAYLIST_NAME_MAX:
+                    self._picker_new_name = self._picker_new_name + key
+            return
         if key == KEY_ESC or key == KEY_LEFT:
             self._go_back()
             return
         if key == " ":
             self._toggle_play_key()
             return
+        playlists = self._picker_playlists()
         if key == KEY_UP:
-            if self._editable_playlists:
-                self._picker_cursor = max(0, self._picker_cursor - 1)
+            self._picker_cursor = max(-1, self._picker_cursor - 1)
         elif key == KEY_DOWN:
-            if self._editable_playlists:
-                self._picker_cursor = min(len(self._editable_playlists) - 1, self._picker_cursor + 1)
+            self._picker_cursor = min(len(playlists) - 1, self._picker_cursor + 1)
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
-            if self._editable_playlists and self._picker_cursor < len(self._editable_playlists):
-                self._picker_add_to(self._editable_playlists[self._picker_cursor])
+            if self._picker_cursor < 0:
+                self._picker_new_name = ""
+            elif playlists and self._picker_cursor < len(playlists):
+                self._picker_add_to(playlists[self._picker_cursor])
 
     def _handle_settings_key(self, key: str):
         # Typing a number into a row: digits extend it, Backspace shortens it,
