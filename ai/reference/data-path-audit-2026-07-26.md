@@ -199,6 +199,15 @@ track").
 
 ### F3 — Every play of an already-cached track still pays a `playbackinfo` request it throws away
 
+> **FIXED 2026-07-26.** `_local_copy()` answers "is there a copy on this disk
+> good enough to play?" before anything is asked of TIDAL, in `_play_track`
+> and in `_maybe_prefetch_next`. "Good enough" is a real question now that the
+> tracker records the granted tier: below the current setting is skipped (the
+> re-download-at-higher-quality behaviour Garrett asked for), above it is
+> kept, unrecorded is left alone. The stated cost — the quality gate learns
+> nothing on a cache hit — is in HISTORY rather than hidden. Everything below
+> is the diagnosis as written.
+
 **Read, then confirmed by tracing the two functions.**
 
 `_play_track`:
@@ -241,6 +250,11 @@ exists for precisely this window.
 ---
 
 ### F4 — A track that is already in the cache is re-downloaded from scratch when the user downloads it
+
+> **FIXED 2026-07-26**, by exactly the route sketched below: the cache tracker
+> records the granted tier, and `_promote_cached_copy()` copies rather than
+> fetches on an **exact** tier match with a file that is really there.
+> Everything below is the diagnosis as written.
 
 **Read.** `_start_download_job` goes straight to `_download_stream_url` → one
 API request → `fetch_to_file` over the CDN. It never looks at

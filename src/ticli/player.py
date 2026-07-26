@@ -9,6 +9,7 @@ import logging
 import os
 import signal
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -306,7 +307,14 @@ from ticli.utils.config import (
     load_config,
     save_config,
 )
-from ticli.utils.cache import CachedTrack, MetadataCache, format_gb
+from ticli.utils.cache import (
+    PLAY_COUNTS_AFTER,
+    cached_audio_path,
+    CachedTrack,
+    MetadataCache,
+    format_gb,
+    is_owned_audio,
+)
 from ticli.utils import artwork, downloads, tags
 
 STATE_DIR = Path.home() / ".config" / "ticli"
@@ -853,6 +861,40 @@ class AudioPlayer:
         except Exception as e:  # a cache sweep must never break playback
             logger.debug("Cache sweep failed: %s", e)
 
+    def _drop_other_copies(self, base: str, keeping: str) -> None:
+        """Remove any earlier cached copy of the same track.
+
+        Only `{track_id}{ext}` under the cache's own audio directory, only
+        ones this module wrote, never the one that just landed and never a
+        directory — the same rule as everywhere else here.
+        """
+        directory, stem = os.path.split(base)
+        try:
+            for path in Path(directory).glob(f"{stem}.*"):
+                if str(path) == keeping or path.suffix == ".part":
+                    continue
+                if not is_owned_audio(path.name) or not path.is_file():
+                    continue
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _admit(self, key) -> bool:
+        """Whether the cache will take this track. One question, one place.
+
+        Asked at the start of the download today; the rule is written so that
+        asking it at the *end* of the track instead — when "was it actually
+        listened to?" is answerable — needs no change to the rule, only a
+        different caller.
+        """
+        try:
+            return self.cache.should_cache(key)
+        except Exception:  # pragma: no cover - a bookkeeping failure caches
+            return True
+
     def _audio_cache_base(self, key) -> Optional[str]:
         """Where a kept copy of this track lives, minus the extension — which
         isn't known until the CDN answers. None when audio caching is off (or
@@ -871,19 +913,11 @@ class AudioPlayer:
         out to be. One glob of a directory we own beats an index that could go
         stale; a half-written ".part" is never an answer.
         """
-        base = self._audio_cache_base(key)
-        if not base:
+        if not self._audio_cache_base(key):
             return None
-        directory, stem = os.path.split(base)
-        try:
-            for path in sorted(Path(directory).glob(f"{stem}.*")):
-                if path.suffix != ".part" and path.is_file():
-                    return str(path)
-        except OSError:
-            pass
-        return None
+        return cached_audio_path(key)
 
-    def _start_download(self, url: str, cache_key, gen: int):
+    def _start_download(self, url: str, cache_key, gen: int, quality=None):
         """Fetch the whole track to disk on a daemon thread.
 
         TIDAL hands out unencrypted URLs, so this is a plain GET: the bytes
@@ -901,6 +935,12 @@ class AudioPlayer:
         if not sources:
             return
         base = self._audio_cache_base(cache_key)
+        if base is not None and not self._admit(cache_key):
+            # The cache is full of things worth more than this one. Refusing
+            # is not a failure: the track streams exactly as it would with
+            # song caching switched off, which is the behaviour this is
+            # deliberately identical to.
+            base = None
         keep = base is not None
         if not keep:
             if self.player_cmd != "ffplay":
@@ -925,6 +965,13 @@ class AudioPlayer:
                                     abandoned=lambda: self._download_gen != gen)
                 path = base + ext
                 os.replace(part, path)
+                # A re-fetch at a higher tier can change the container
+                # (AAC-in-MP4 to FLAC-in-MP4 is the same .m4a, but not
+                # always), and _cached_audio_path globs by stem — so the
+                # copy this one replaces has to go, or the stale one could
+                # be the answer. By exact name, and only ones ticli wrote.
+                if keep:
+                    self._drop_other_copies(base, path)
             except Exception as e:
                 # A missed cache is a slower track, never a broken one — and
                 # a partial file must not survive to be mistaken for a whole
@@ -946,8 +993,12 @@ class AudioPlayer:
                 # a scratch copy for a player that has stopped does not.
                 _drop(path)
             if keep and os.path.exists(path):
-                # One more song on disk: the settings page's count is stale
+                # One more song on disk: the settings page's count is stale,
+                # and the tracker has to learn about it *before* the sweep,
+                # or the sweep will value it at nothing and evict it first
                 try:
+                    self.cache.note_cached(
+                        cache_key, ext, os.path.getsize(path), quality=quality)
                     self.cache.invalidate_audio_count()
                 except Exception:  # pragma: no cover - bookkeeping only
                     pass
@@ -1066,7 +1117,7 @@ class AudioPlayer:
         return path
 
     def play_url(self, url: str, seek: float = 0, title: Optional[str] = None,
-                 cache_key=None, local: Optional[str] = None):
+                 cache_key=None, local: Optional[str] = None, quality=None):
         """Play an audio URL, stopping any current playback.
 
         With audio caching on, a track played before is already on disk, so
@@ -1137,7 +1188,7 @@ class AudioPlayer:
         # Off the lock and off this thread: fetching the track must never hold
         # up the process that is playing it
         if not have_kept:
-            self._start_download(url, cache_key, gen)
+            self._start_download(url, cache_key, gen, quality=quality)
 
     def _ffplay_cmd(self, source: str, seek: float) -> list:
         """How ffplay is asked to play `source` from `seek`.
@@ -1659,6 +1710,10 @@ class HeadlessTidalPlayer:
         # twice a second and the folder changes about once a song. On the
         # instance rather than in the module, so nothing outlives a test.
         self._downloads_usage: Optional[tuple] = None
+        # The _play_gen whose play has already been counted, so one
+        # listen is one point however many ticks go past (see
+        # _maybe_count_play). -1 is "none yet", which no gen ever is.
+        self._play_counted = -1
         # Transient toast message
         self._toast = ""
         self._toast_until = 0.0
@@ -2220,12 +2275,19 @@ class HeadlessTidalPlayer:
                         self._queue = [real if t is track else t for t in queue]
                     if self._play_gen == gen:
                         self._current_track = real
-                # A deliberate download is played from the user's own folder
-                # and costs no request at all — so it is looked for before the
-                # stream URL is asked for, not after
-                owned = downloads.path_for(real.id)
-                url = "" if owned else (
-                    self._take_prefetched(real.id) or self._stream_url(real))
+                # A copy already on this disk costs no request at all, so it
+                # is looked for *before* the stream URL is asked for rather
+                # than after. Both tiers, not just downloads: the cache used
+                # to be discovered inside play_url, one whole `get_stream()`
+                # too late, so replaying a 20-track cached playlist spent 20
+                # playbackinfo requests on URLs it then threw away — the
+                # exact endpoint whose burst rate got the owner blocked.
+                local = self._local_copy(real)
+                if local:
+                    url, granted = "", None
+                else:
+                    url, granted = (self._take_prefetched(real.id)
+                                    or self._stream_description(real))
                 # Superseded by a newer track, or paused while we were
                 # fetching — either way this start is no longer wanted
                 if self._play_gen != gen or not self._playing:
@@ -2233,7 +2295,7 @@ class HeadlessTidalPlayer:
                 artist = ", ".join(a.name for a in real.artists) if real.artists else ""
                 title = f"{real.name} — {artist}" if artist else real.name
                 self.audio.play_url(url, seek=seek, title=title, cache_key=real.id,
-                                    local=str(owned) if owned else None)
+                                    local=local, quality=granted)
                 if self._play_gen != gen:
                     return
                 self._playing = True
@@ -2248,17 +2310,66 @@ class HeadlessTidalPlayer:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _take_prefetched(self, track_id) -> Optional[str]:
-        """A stream URL fetched moments ago for this track, if there is one.
-        Consumed on use — a signed URL is worth having exactly once."""
+    def _local_copy(self, track) -> Optional[str]:
+        """A copy of this track already on disk that is good enough to play.
+
+        Two tiers and one rule. The **download** is preferred — it is the
+        user's own file and means a downloaded library plays offline — and
+        the **cache** is next; either is verified at the moment of use rather
+        than trusted, so a file deleted by hand falls straight through to the
+        network, which is the whole of "manual deletion is handled durably".
+
+        "Good enough" is the quality question, and both wrong answers matter:
+        a copy stored *below* the tier now selected is skipped, so the track
+        is fetched at the quality that was asked for rather than silently
+        served the old one; a copy stored *above* it is kept, because being
+        temporarily set to LOW must never destroy a hi-res copy. A copy whose
+        tier was never recorded counts as good enough — unknown is not
+        evidence of a downgrade, and re-fetching a whole library on the
+        strength of a missing field is not something to do without being
+        asked (the settings page has an action for that, deliberately).
+
+        The quality gate learns nothing on this path, since no stream is
+        described. It still learns on every cache *miss*, which is every new
+        track; the only user who would notice is one whose entire library is
+        cached, and for them `[U]` re-fetches at the new tier.
+        """
+        track_id = getattr(track, "id", None)
+        owned = downloads.path_for(track_id)
+        if owned is not None:
+            entry = downloads.load_index().get(str(track_id)) or {}
+            if self._tier_is_enough(entry.get("granted")):
+                return str(owned)
+        cached = cached_audio_path(track_id) if self._cache.keeps_audio else None
+        if cached:
+            record = self._cache.audio_record(track_id) or {}
+            if self._tier_is_enough(record.get("quality")):
+                return cached
+        return None
+
+    def _tier_is_enough(self, stored) -> bool:
+        """Whether a copy stored at `stored` still satisfies the current
+        quality setting. Unknown says yes — see `_local_copy`."""
+        wanted = self.QUALITY_MAP.get(self._quality_name)
+        if stored not in QUALITY_RANK or wanted not in QUALITY_RANK:
+            return True
+        if self._quality_unavailable(self._quality_name):
+            # TIDAL has shown it will not serve this tier, so re-fetching for
+            # it would spend a request to be handed the same thing again
+            return True
+        return QUALITY_RANK[stored] >= QUALITY_RANK[wanted]
+
+    def _take_prefetched(self, track_id) -> Optional[tuple]:
+        """`(url, granted tier)` fetched moments ago for this track, if there
+        is one. Consumed on use — a signed URL is worth having exactly once."""
         prefetched = self._prefetch
         self._prefetch = None
         if not prefetched:
             return None
-        pid, url, fetched_at = prefetched
+        pid, url, granted, fetched_at = prefetched
         if pid != track_id or time.time() - fetched_at > PREFETCH_MAX_AGE:
             return None
-        return url
+        return url, granted
 
     def _maybe_prefetch_next(self):
         """Fetch the next track's stream URL just before we need it.
@@ -2280,12 +2391,18 @@ class HeadlessTidalPlayer:
         if track_id is None:
             return
         self._prefetch_id = track_id  # latch, so the tick can't refire it
+        if self._local_copy(nxt) is not None:
+            # It is already on this disk at a tier that will do. The URL would
+            # be fetched and then thrown away by _play_track, which is the
+            # same wasted request the cache check there removes.
+            return
 
         def _run():
             try:
                 real = self._resolve_track(nxt)
                 if real is not None:
-                    self._prefetch = (real.id, self._stream_url(real), time.time())
+                    url, granted = self._stream_description(real)
+                    self._prefetch = (real.id, url, granted, time.time())
             except Exception:
                 pass
 
@@ -2303,12 +2420,24 @@ class HeadlessTidalPlayer:
         unlocks aren't served that way. A BTS manifest still names one whole
         file; an MPEG-DASH one names segments, which become a local playlist.
         """
+        return self._stream_description(track)[0]
+
+    def _stream_description(self, track) -> tuple:
+        """`(url, the tier TIDAL actually granted)`. One request, both facts.
+
+        The tier is not decoration: it is what the cache tracker records
+        against the file, which is what makes "is this copy below the quality
+        I have now set?" and "is this copy already what a download at this
+        tier would fetch?" answerable without asking TIDAL again.
+        """
         stream = track.get_stream()
-        self._note_granted_quality(getattr(stream, "audio_quality", None))
+        granted = getattr(stream, "audio_quality", None)
+        self._note_granted_quality(granted)
         manifest = stream.get_stream_manifest()
         if manifest.is_bts:
-            return manifest.get_urls()[0]
-        return _write_hls_playlist(track.id, _hls_playlist(manifest.dash_info))
+            return manifest.get_urls()[0], granted
+        return (_write_hls_playlist(track.id, _hls_playlist(manifest.dash_info)),
+                granted)
 
     def _note_granted_quality(self, granted: Optional[str]) -> None:
         """Record a tier TIDAL served that was below the one we asked for.
@@ -2682,6 +2811,7 @@ class HeadlessTidalPlayer:
                     if pos is not None:
                         self._play_offset = pos
                         self._play_start_time = time.time()
+                self._maybe_count_play()
                 self._maybe_prefetch_next()
             # A press that came in too soon after the last one left its
             # position waiting; this tick is what delivers it
@@ -2704,6 +2834,37 @@ class HeadlessTidalPlayer:
         if duration <= 0:
             return True
         return self._get_position() < duration - margin
+
+    def _maybe_count_play(self) -> None:
+        """Give the playing track its point, once, when it has earned it.
+
+        A skip is not a play. The eviction rule is points per play, so
+        counting one the moment a track starts would let a four-hour shuffle
+        through a hundred previews out-score a staple — the exact thing the
+        rule exists to prevent. `PLAY_COUNTS_AFTER` seconds in, or half way
+        through anything shorter than that.
+
+        On the monitor's existing 0.5 s tick, so it costs no new wakeups, and
+        latched on `_play_gen` so it cannot fire twice for one play or once
+        for a track the user has already skipped past. The write is a few
+        hundred bytes of JSON, off the UI thread.
+        """
+        if self._play_counted == self._play_gen or not self._playing:
+            return
+        track = self._current_track
+        track_id = getattr(track, "id", None)
+        if track_id is None:
+            return
+        duration = getattr(track, "duration", 0) or 0
+        threshold = min(PLAY_COUNTS_AFTER, duration / 2) if duration > 0 \
+            else PLAY_COUNTS_AFTER
+        if self._get_position() < threshold:
+            return
+        self._play_counted = self._play_gen
+        try:
+            self._cache.note_played(track_id)
+        except Exception as e:  # pragma: no cover - bookkeeping only
+            logger.debug("Could not record a play: %s", e)
 
     def _stream_ended_early(self) -> bool:
         """Whether the backend stopped a long way short of the end of the track.
@@ -3331,6 +3492,33 @@ class HeadlessTidalPlayer:
             content.append("\n\n   No playlists you can edit", style="dim")
 
         return content
+
+    def _reconcile_cache(self) -> None:
+        """Bring the cache tracker back in line with what is on disk.
+
+        The tracker is the source of truth for *intent* — what ticli meant to
+        cache, at which tier, and how often it has been played — and the disk
+        is the source of truth for *existence*. Songs deleted from the cache
+        folder by hand have to be handled durably, so an entry whose file is
+        gone is dropped and the totals corrected, and a file with no entry is
+        adopted at zero plays (which is also how a cache from before the
+        tracker, or a crash between the rename and the tracker write, is
+        picked up).
+
+        A daemon thread, because it is a directory listing plus a stat per
+        file, and the settings page must never pay for that.
+        """
+        def _run():
+            try:
+                dropped, adopted = self._cache.reconcile()
+                if dropped or adopted:
+                    logger.debug("Cache tracker reconciled: -%d +%d",
+                                 dropped, adopted)
+                    self._wake()
+            except Exception as e:  # pragma: no cover - bookkeeping only
+                logger.debug("Could not reconcile the cache tracker: %s", e)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _download_usage(self) -> tuple:
         """`(downloads on disk, what they cost)`, measured once and kept.
@@ -5082,10 +5270,6 @@ class HeadlessTidalPlayer:
                 if real is None:
                     raise RuntimeError("track could not be resolved")
                 meta = downloads.track_metadata(real)
-                url = self._download_stream_url(real, tier)
-                sources = stream_sources(url)
-                if not sources:
-                    raise RuntimeError("stream named nothing to fetch")
                 # The extension is not known until the CDN answers, so the
                 # file is written under a provisional name and moved once the
                 # container has identified itself
@@ -5103,17 +5287,23 @@ class HeadlessTidalPlayer:
                     last[0] = now
                     _update(done=done, total=total)
 
-                ext = fetch_to_file(
-                    sources, str(staging),
-                    abandoned=lambda: self._download_job_gen != gen,
-                    progress=_progress)
+                ext, granted = self._promote_cached_copy(track_id, tier, staging)
+                if ext is None:
+                    url, granted = self._download_stream_url(real, tier)
+                    sources = stream_sources(url)
+                    if not sources:
+                        raise RuntimeError("stream named nothing to fetch")
+                    ext = fetch_to_file(
+                        sources, str(staging),
+                        abandoned=lambda: self._download_job_gen != gen,
+                        progress=_progress)
                 final = downloads.destination(meta, ext)
                 final.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staging, final)
                 written = tags.write_tags(final, meta, self._cover_bytes(real))
                 size = final.stat().st_size
                 downloads.record(track_id, final.relative_to(downloads.download_dir()),
-                                 tier, size)
+                                 tier, size, granted=granted)
                 self._downloads_usage = None  # one more song in the folder
                 if self._download_job_gen != gen:
                     return
@@ -5150,9 +5340,52 @@ class HeadlessTidalPlayer:
         except OSError:
             pass
 
-    def _download_stream_url(self, track, tier: str) -> str:
-        """A stream URL for this track at a tier that may not be the one
-        playing. Network — callers are already off the UI thread.
+    def _promote_cached_copy(self, track_id, tier: str, staging) -> tuple:
+        """Copy an existing cached file into the download's staging path.
+
+        Returns `(extension, granted tier)`, or `(None, None)` when there is
+        nothing to promote and the bytes have to come off the network. Play a
+        hi-res track and then press `[d]` and this is **1 API request and
+        ~30 MB saved** — the same bytes are already on the disk.
+
+        Three conditions, and each of them is a way of getting it wrong:
+
+        * the tracker has to know the tier the cached file was **granted**.
+          `.m4a` is AAC-HIGH on a device-flow session and FLAC-in-MP4 on a
+          PKCE one and the names are identical, so promoting on the strength
+          of a filename would quietly install the wrong quality in somebody's
+          music folder — which is worse than the re-fetch.
+        * it has to be an **exact** match for what this download asked for.
+          Cached HIGH does not satisfy a HIRES download; nothing is promoted
+          upwards or downwards.
+        * the file has to actually be there, checked at the moment of use.
+
+        Anything else falls through to the network, which is the same "the
+        index is a hint, the file is the answer" rule `path_for` already uses.
+        The copy can lose its source to eviction mid-way; on POSIX the open
+        descriptor survives and the copy completes, and if it does not, the
+        exception falls through to the network too.
+        """
+        if not self._cache.keeps_audio:
+            return None, None
+        wanted = self.QUALITY_MAP.get(tier)
+        record = self._cache.audio_record(track_id) or {}
+        granted = record.get("quality")
+        if not wanted or not granted or granted != wanted:
+            return None, None
+        source = cached_audio_path(track_id)
+        if not source:
+            return None, None
+        try:
+            shutil.copyfile(source, staging)
+        except OSError as e:
+            logger.debug("Could not promote the cached copy: %s", e)
+            return None, None
+        return os.path.splitext(source)[1], granted
+
+    def _download_stream_url(self, track, tier: str) -> tuple:
+        """`(url, granted tier)` at a tier that may not be the one playing.
+        Network — callers are already off the UI thread.
 
         tidalapi reads the quality off the session, and there is no per-call
         override, so the setting is moved for the length of one request and
@@ -5166,7 +5399,7 @@ class HeadlessTidalPlayer:
         try:
             if wanted:
                 self.session.audio_quality = wanted
-            return self._stream_url(track)
+            return self._stream_description(track)
         finally:
             self.session.audio_quality = previous
 
@@ -6023,6 +6256,11 @@ class HeadlessTidalPlayer:
         # Login
         if not self._login():
             return
+
+        # Make the cache tracker agree with the disk before anything reads
+        # either. Off the UI thread because it is a directory listing plus a
+        # stat per file — the one place that walk is allowed to happen.
+        self._reconcile_cache()
 
         # Load favorites in background
         self._load_favorites()

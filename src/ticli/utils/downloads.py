@@ -258,14 +258,25 @@ def _save_index(tracks: dict) -> None:
         logger.debug("Could not write the download index: %s", e)
 
 
-def record(track_id, relpath: Path, quality: str, size: int) -> None:
-    """Remember a finished download. Whole-dict replacement, no locks."""
+def record(track_id, relpath: Path, quality: str, size: int,
+           granted=None) -> None:
+    """Remember a finished download. Whole-dict replacement, no locks.
+
+    Two tiers are recorded and they are not the same thing. `quality` is the
+    tier the **user asked for** (`LOW`/`HIGH`/`LOSSLESS`/`HIRES`, the settings
+    spelling) and is what the screen says. `granted` is the tier TIDAL
+    actually **served**, in tidalapi's own spelling — the only one that can be
+    compared against anything, and the only honest answer to "is this file
+    below the quality I have set now?". A device-flow session asks for hi-res
+    and is handed `HIGH`; recording the request would make that file look
+    like something it is not, for ever.
+    """
     if track_id is None:
         return
     tracks = dict(load_index())
     tracks[str(track_id)] = {
-        "path": str(relpath), "quality": quality, "bytes": int(size),
-        "at": time.time(),
+        "path": str(relpath), "quality": quality, "granted": granted,
+        "bytes": int(size), "at": time.time(),
     }
     _save_index(tracks)
 

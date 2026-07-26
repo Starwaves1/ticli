@@ -377,7 +377,8 @@ class TestASegmentedDownload:
                 get_stream_manifest=lambda: types.SimpleNamespace(
                     is_bts=False, dash_info=None))
             p._download_track = track
-            p._stream_url = lambda t: path  # the manifest is already written
+            # the manifest is already written; the tier is what a stream says
+            p._stream_description = lambda t: (path, "LOSSLESS")
 
             job = _download(p, "LOSSLESS")
             assert job["state"] == "done", job.get("error")
@@ -465,6 +466,141 @@ class TestOneConnectionPerTrack:
             assert "/s2.mp4" not in server.hits, "it kept going after a failure"
         finally:
             server.close()
+
+
+class TestDownloadingSomethingAlreadyCached:
+    """Play a hi-res track, then press `[d]`. The bytes are already here.
+
+    The two tiers are separate in *lifetime and ownership* — the cache is
+    machine-owned and evictable, the download is the user's and is not — but
+    they are not separate in bytes. Re-fetching ~30 MB that is on the disk
+    two directories away costs an API request and the whole file again.
+    """
+
+    def _cached(self, cache, track_id, quality, body=b"cached bytes", ext=".m4a"):
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{track_id}{ext}"
+        path.write_bytes(body)
+        cache.note_cached(track_id, ext, len(body), quality=quality)
+        return path
+
+    def _player_expecting_no_network(self, monkeypatch, quality="LOSSLESS"):
+        p = _player(quality=quality)
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: pytest.fail("the cached copy was re-fetched"))
+        track = _track()
+        track.get_stream = lambda: pytest.fail("a promotion asked for a stream")
+        p._download_track = track
+        return p
+
+    def test_a_matching_cached_copy_is_copied_not_re_fetched(self, monkeypatch):
+        p = self._player_expecting_no_network(monkeypatch)
+        body = _mp4()
+        self._cached(p._cache, 42, "LOSSLESS", body=body)
+
+        job = _download(p, "LOSSLESS")
+
+        assert job["state"] == "done", job.get("error")
+        landed = downloads.download_dir() / "Daft Punk" / \
+            "Random Access Memories" / "08 Get Lucky.m4a"
+        assert landed.exists()
+        # Tagged in place, so it is not byte-identical — but the audio is
+        assert AUDIO in landed.read_bytes()
+
+    def test_the_cached_copy_is_left_where_it_was(self, monkeypatch):
+        p = self._player_expecting_no_network(monkeypatch)
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        _download(p, "LOSSLESS")
+        assert cached.exists(), "promoting moved the cache's own copy"
+
+    def test_the_recorded_tier_is_the_one_that_was_granted(self, monkeypatch):
+        p = self._player_expecting_no_network(monkeypatch)
+        self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        _download(p, "LOSSLESS")
+        entry = downloads.load_index()["42"]
+        assert entry["granted"] == "LOSSLESS"
+        assert entry["quality"] == "LOSSLESS"
+
+    def test_a_lower_cached_tier_is_never_promoted(self, monkeypatch):
+        """Cached HIGH does not satisfy a HIRES download. Silently installing
+        the wrong quality in someone's music folder is worse than re-fetching
+        — `.m4a` is AAC on a device-flow session and FLAC on a PKCE one, and
+        the names are identical."""
+        p = _player(quality="HIRES")
+        self._cached(p._cache, 42, "HIGH", body=_mp4())
+        calls = []
+        p._download_track = _track()
+        p._download_track.get_stream = lambda: (
+            calls.append(1) or types.SimpleNamespace(
+                audio_quality="HI_RES_LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["https://cdn/hi.mp4"])))
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: _FakeStream(_mp4()))
+
+        job = _download(p, "HIRES")
+
+        assert job["state"] == "done", job.get("error")
+        assert calls, "it promoted a lower-quality file instead of fetching"
+
+    def test_a_cached_file_of_unknown_tier_is_never_promoted(self, monkeypatch):
+        """Everything cached before the tracker existed has no tier. Unknown
+        must never be read as "the tier you asked for"."""
+        p = _player(quality="LOSSLESS")
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "42.m4a").write_bytes(_mp4())
+        p._cache.reconcile()  # adopts it, at no known tier
+        calls = []
+        p._download_track = _track()
+        p._download_track.get_stream = lambda: (
+            calls.append(1) or types.SimpleNamespace(
+                audio_quality="LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["https://cdn/x.mp4"])))
+        patch_get(monkeypatch, player_mod, lambda *a, **k: _FakeStream(_mp4()))
+
+        _download(p, "LOSSLESS")
+
+        assert calls, "an unknown tier was treated as a match"
+
+    def test_a_cached_entry_whose_file_is_gone_falls_through(self, monkeypatch):
+        p = _player(quality="LOSSLESS")
+        self._cached(p._cache, 42, "LOSSLESS", body=_mp4()).unlink()
+        calls = []
+        p._download_track = _track()
+        p._download_track.get_stream = lambda: (
+            calls.append(1) or types.SimpleNamespace(
+                audio_quality="LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["https://cdn/x.mp4"])))
+        patch_get(monkeypatch, player_mod, lambda *a, **k: _FakeStream(_mp4()))
+
+        _download(p, "LOSSLESS")
+
+        assert calls, "the tracker was trusted over the disk"
+
+
+class _FakeStream:
+    """A streaming response over a fixed body."""
+
+    def __init__(self, body, content_type="audio/mp4"):
+        self.headers = {"Content-Type": content_type,
+                        "Content-Length": str(len(body))}
+        self._body = body
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, size):
+        yield self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *e):
+        return False
 
 
 class TestPartialFilesAreNeverServed:
