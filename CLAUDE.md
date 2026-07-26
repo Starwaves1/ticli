@@ -183,6 +183,38 @@ every row, which matches everything or nothing. Each row says which playlist it
 came from and resolves through `_resolve_track` before playback. An empty index
 or `cache_metadata` turned off says so instead of looking like a query with no
 hits.
+### Track radio
+
+`[r]` seeds an endless mix from the song playing, and **the song playing does
+not stop**. Radio is a change to the *upcoming* queue and nothing else: the
+current track becomes position 0 of the new queue and keeps going out of the
+process and the stream URL it already had. The old path called `_play_track`
+on the first radio track, which restarted the song from 0:00 and paid a second
+`get_stream()` for it; nothing about a mix requires that, since
+`get_track_radio()` is only "give me N tracks".
+
+`_apply_radio_queue` assigns a whole new list — never mutates the one the paint
+thread and the monitor are reading — drops the seed out of the mix so it cannot
+play twice, re-arms the prefetch (a URL fetched for whatever used to be next is
+not next any more) and puts the queue screen's cursor back on the playing
+track. `_go_back` clamps a remembered queue cursor for the same reason.
+
+The fetch is a round trip and uses the brakes already in the codebase rather
+than new ones: `_radio_fetching` single-flights it, `RADIO_FETCH_MIN_INTERVAL`
+floors the gap between one fetch and the next so a held-down `[r]` cannot fan
+out even between two fast replies, and `_play_gen` — bumped by every
+`_play_track` — is the generation counter, so a mix that lands after the user
+skipped on is thrown away instead of taking the new song's queue. A failure,
+an empty mix, or a mix that was only the seed leaves the queue exactly as it
+was and toasts `Radio unavailable`; a success toasts how many tracks are up
+next, because otherwise a key that changes nothing audible looks dead.
+
+One wrinkle worth keeping: radio leaves the *current track* unchanged, which is
+the very thing `_restore_state` checks before attaching a restored queue, so a
+restore still in flight at startup would land on top of the radio queue.
+`_restore_pending` is therefore also the claim on the queue — the radio drops
+it, and the restore stands down.
+
 ### The artist page
 
 Four tabs — Top Tracks, Albums, Playlists, Suggestions — and `Tab` /

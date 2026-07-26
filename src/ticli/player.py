@@ -203,6 +203,11 @@ KEY_REPEAT_WINDOW = 0.15
 # worth of rows, so a held-down arrow can never fan out into requests.
 SEARCH_MAX_OFFSET = 300
 SEARCH_FETCH_MIN_INTERVAL = 1.0
+# Track radio. One request buys a whole endless mix, so the same brakes the
+# search pages use apply here: one fetch in flight blocks the next, and the
+# interval is the floor between them, so a held-down [r] is one request.
+RADIO_LIMIT = 25
+RADIO_FETCH_MIN_INTERVAL = 1.0
 # How long to wait for the tail of an escape sequence that straddled a read.
 # Only a bare Esc ever pays it in full; kept generous so an arrow key over a
 # slow SSH link can't decode as Esc and quit the player.
@@ -1200,6 +1205,9 @@ class HeadlessTidalPlayer:
         self._play_start_time: Optional[float] = None
         self._play_offset: float = 0
         self._liked_ids: set = set()
+        # Track radio: a fetch is in flight, and when the last one started
+        self._radio_fetching = False
+        self._radio_last_fetch = 0.0
         # Scrubbing. _player_focus is what ↑ hands to the player: while it is
         # set, ←/→ move within the track instead of between tracks (or in the
         # list below). _seek_target is the position the user has scrubbed to
@@ -1721,7 +1729,11 @@ class HeadlessTidalPlayer:
                         pass
                 # Don't clobber anything the user started while we were loading
                 # (playing the restored track itself is fine — attach its queue)
-                if tracks and self._current_track in (None, current):
+                # `_restore_pending` is also the claim on the queue: anything
+                # that deliberately set one while we were fetching (radio keeps
+                # the same track playing, so the check below can't see it) drops
+                # the flag, and this attach stands down rather than clobbering it
+                if tracks and self._restore_pending and self._current_track in (None, current):
                     self._queue = tracks
                     try:
                         self._queue_index = tracks.index(current) if current is not None else min(idx, len(tracks) - 1)
@@ -2066,20 +2078,84 @@ class HeadlessTidalPlayer:
         threading.Thread(target=_run, daemon=True).start()
 
     def _start_track_radio(self):
-        """Start radio based on current track."""
-        if not self._current_track:
+        """Seed an endless mix from the song that is playing — without
+        interrupting it.
+
+        Radio is a queue change and nothing else: the track you pressed [r] on
+        keeps playing, from where it was, out of the process and the stream URL
+        it already had. It used to call `_play_track` on the first radio track,
+        which restarted the song you were enjoying from 0:00 and paid a second
+        `get_stream()` for the privilege. Nothing about the mix requires that —
+        `get_track_radio()` is "give me N tracks", so the whole job is to make
+        those tracks the *upcoming* queue with the current one at its head.
+
+        The fetch is a round trip, so it runs on a daemon thread, and the
+        brakes are the ones already in use elsewhere: `_radio_fetching`
+        single-flights it, `RADIO_FETCH_MIN_INTERVAL` floors the gap between
+        one fetch and the next (so a held-down [r] cannot fan out even between
+        two fast replies), and `_play_gen` — bumped by every `_play_track` —
+        is the generation counter that throws away a mix for a song that has
+        since been skipped past. Failure keeps the music playing and says so.
+        """
+        track = self._current_track
+        if track is None:
             return
-        track_id = self._current_track.id
+        now = time.monotonic()
+        if self._radio_fetching or now - self._radio_last_fetch < RADIO_FETCH_MIN_INTERVAL:
+            return
+        self._radio_fetching = True
+        self._radio_last_fetch = now
+        gen = self._play_gen
+        # Playback does not change, so without this the key looks dead
+        self._set_toast("Starting radio…")
+
         def _run():
+            tracks = None
             try:
-                radio_tracks = self._current_track.get_track_radio(limit=25)
-                if radio_tracks:
-                    self._queue = radio_tracks
-                    self._queue_index = 0
-                    self._play_track(self._queue[0])
-            except Exception:
-                pass
+                tracks = track.get_track_radio(limit=RADIO_LIMIT)
+            except Exception as e:
+                logger.debug("Track radio failed: %s", e)
+            finally:
+                self._radio_fetching = False
+            if self._play_gen != gen:
+                # A different song is playing now — this mix is for a song the
+                # user has already left, and must not take its queue
+                return
+            if not tracks or not self._apply_radio_queue(tracks):
+                self._set_toast("Radio unavailable — queue unchanged")
+            self._wake()
+
         threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_radio_queue(self, tracks: list):
+        """Put the playing track at the head of a fresh radio queue.
+
+        Whole-object assignment, never a mutation of the list the paint thread
+        and the monitor are reading. The current track becomes position 0, so
+        auto-advance, "up next" and the saved state all agree the moment the
+        swap lands, and the seed is dropped from the mix so it can't play
+        twice. The prefetch is re-armed rather than kept: a URL fetched for
+        whatever used to be next is no longer next (`_take_prefetched` would
+        discard it on the id check anyway).
+        """
+        head = self._current_track
+        if head is None:
+            return False
+        seed_id = getattr(head, "id", None)
+        queue = [head] + [t for t in tracks if getattr(t, "id", None) != seed_id]
+        if len(queue) < 2:
+            return False  # the mix was the song itself: nothing to queue
+        self._queue = queue
+        self._queue_index = 0
+        self._prefetch = None
+        self._prefetch_id = None
+        # The rows under the queue screen's cursor are all different rows now
+        self._queue_cursor = 0
+        # This queue is the user's, not the restore's: a restore still fetching
+        # the old one must not land on top of it, and saves are whole again
+        self._restore_pending = False
+        self._set_toast(f"Radio started — {len(queue) - 1} tracks up next")
+        return True
 
     def _handle_media_key(self, action):
         """Apply a media-key action coming from mpv (macOS only)."""
@@ -3071,7 +3147,10 @@ class HeadlessTidalPlayer:
             self._load_artist_section()
         elif mode == self.MODE_QUEUE:
             self._mode = self.MODE_QUEUE
-            self._queue_cursor = state.get("cursor", 0)
+            # Clamped: the queue can have been replaced (radio) or shortened
+            # while we were away, and a cursor past the end pages the screen
+            # to rows that no longer exist
+            self._queue_cursor = min(state.get("cursor", 0), max(len(self._queue) - 1, 0))
         elif mode == self.MODE_PLAYLISTS:
             self._mode = self.MODE_PLAYLISTS
             self._playlists_cursor = state.get("cursor", 0)
