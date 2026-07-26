@@ -18,6 +18,7 @@ import tidalapi
 
 from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
+from ticli.tests.fakes import patch_get
 from ticli.utils import config as config_mod
 from ticli.utils import credential_store as store
 
@@ -572,7 +573,8 @@ class TestSegmentedPlayback:
 
     def test_ffplay_is_given_the_protocols_it_needs(self):
         flags = self._audio("ffplay")._hls_flags()
-        assert flags == ["-protocol_whitelist", player_mod.HLS_PROTOCOLS, "-f", "hls"]
+        assert flags == ["-infbuf", "-protocol_whitelist",
+                         player_mod.HLS_PROTOCOLS, "-f", "hls"]
 
     def test_https_is_on_both_backends_whitelists(self):
         # The default for a local file input is "file,crypto,data", which turns
@@ -606,7 +608,7 @@ class TestSegmentedPlayback:
             fetched.append(url)
             return _Response(url)
 
-        monkeypatch.setattr(player_mod.requests, "get", _get)
+        patch_get(monkeypatch, player_mod, _get)
         audio = player_mod.AudioPlayer.__new__(player_mod.AudioPlayer)
         audio.player_cmd = "mpv"
         audio.cache = None

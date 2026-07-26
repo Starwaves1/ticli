@@ -368,10 +368,88 @@ class TestDeletedCacheFile:
         assert p._queue_index == 1
 
     def test_a_track_that_simply_ended_still_advances(self, tmp_path):
-        p = _make_player(position=45.0)
+        # At the end of the track, which is what "simply ended" means — the
+        # clock is now what tells an ending apart from a dead stream
+        p = _make_player(position=199.0)
         p.audio = self._audio(tmp_path, exists=True)  # file is fine, track ended
 
         self._monitor_once(p)
+
+        assert p._queue_index == 2
+
+
+class TestTruncatedStream:
+    """A stream that dies mid-track must not look like a track that finished.
+
+    Measured against a loopback HLS server returning `403 Request has expired`
+    from segment 3: **both** mpv and ffplay play their buffer out and exit `0`
+    with an empty stderr, 12.1 s into a 176 s track. `failure()` reads exit 0
+    as end-of-track — correctly, by its own contract — so the monitor used to
+    advance, and the user heard twelve seconds of a three-minute song with
+    nothing said. Reachable by pausing longer than the ~1 h signed-URL life,
+    or by any network blip. ai/INCIDENTS #3 by another door.
+    """
+
+    def _audio(self):
+        """A backend whose process is gone, cleanly, with nothing to report —
+        which is exactly what both of them do on a dead stream."""
+        audio = AudioPlayer("mpv", cache=None)
+        assert audio.failure() is None
+        assert audio.source_vanished() is False
+        return audio
+
+    def _monitor_once(self, p, until):
+        import threading
+        import time
+
+        p.running = True
+        thread = threading.Thread(target=p._monitor_playback, daemon=True)
+        thread.start()
+        deadline = time.time() + 3
+        while time.time() < deadline and not until():
+            time.sleep(0.02)
+        p.running = False
+        thread.join(timeout=2)
+
+    def test_the_queue_does_not_advance_and_the_user_is_told(self):
+        p = _make_player(position=12.1)   # of a 200s track
+        p.audio = self._audio()
+
+        self._monitor_once(p, lambda: not p._playing)
+
+        assert p._queue_index == 1, "a dead stream must not advance the queue"
+        assert p._plays == [], "and must not silently restart it either"
+        assert p._playing is False
+        assert "stopped early" in (p._toast or "")
+        # The honest part: where it stopped and how long the track was
+        assert "0:12" in p._toast and "3:20" in p._toast
+
+    def test_the_position_is_kept_so_space_resumes_where_it_died(self):
+        p = _make_player(position=12.1)
+        p.audio = self._audio()
+
+        self._monitor_once(p, lambda: not p._playing)
+
+        assert p._get_position() == pytest.approx(12.1, abs=1.0)
+
+    def test_an_unknown_duration_advances_exactly_as_before(self):
+        """The opposite of _track_has_time_left's rule, deliberately: here a
+        wrong "yes" stops the queue on a track that really did end."""
+        p = _make_player(position=12.1)
+        p._current_track.duration = 0
+        p.audio = self._audio()
+
+        self._monitor_once(p, lambda: p._queue_index != 1)
+
+        assert p._queue_index == 2
+
+    def test_a_second_short_of_the_end_is_an_ending_not_a_failure(self):
+        """TIDAL's duration is metadata and disagrees with the audio by a
+        second or two; that must not stop the queue."""
+        p = _make_player(position=198.0)
+        p.audio = self._audio()
+
+        self._monitor_once(p, lambda: p._queue_index != 1)
 
         assert p._queue_index == 2
 

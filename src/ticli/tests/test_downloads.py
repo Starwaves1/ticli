@@ -25,6 +25,7 @@ import pytest
 
 from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
+from ticli.tests.fakes import patch_get
 from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
 from ticli.utils import downloads, tags
@@ -66,6 +67,17 @@ def _track(tid=42, duration=200, cover=None):
     )
 
 
+def _rendered(player) -> str:
+    """The whole pane as plain text, confirmations and all."""
+    from rich.console import Console
+
+    console = Console(width=100, height=40)
+    player.console = console
+    with console.capture() as cap:
+        console.print(player._build_display())
+    return cap.get()
+
+
 def _player(quality="HIGH"):
     p = HeadlessTidalPlayer(quality=quality)
     p.session = types.SimpleNamespace(audio_quality=None, is_pkce=False,
@@ -80,9 +92,20 @@ class _Server:
     def __init__(self, routes):
         self.routes = routes
         self.hits = []
+        # One entry per accepted TCP connection, which is what a keep-alive
+        # session buys and a fresh `requests.get` per segment does not
+        self.connections = []
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            # HTTP/1.0 closes after every response, so without this the
+            # connection count could never tell the two apart
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                outer.connections.append(1)
+                return super().setup()
+
             def do_GET(self):
                 outer.hits.append(self.path)
                 body = outer.routes.get(self.path)
@@ -98,7 +121,8 @@ class _Server:
             def log_message(self, *a):
                 pass
 
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def url(self, path):
@@ -182,7 +206,7 @@ class TestEstimatesCostNothing:
         def _forbidden(*a, **kw):
             raise AssertionError("a size estimate made a network request")
 
-        monkeypatch.setattr(player_mod.requests, "get", _forbidden)
+        patch_get(monkeypatch, player_mod, _forbidden)
         p = _player()
         p._download_track = _track(duration=197)
         estimates = {tier: p._download_estimate(tier)
@@ -201,8 +225,8 @@ class TestEstimatesCostNothing:
         assert downloads.format_bytes(0) == "—"
 
     def test_the_screen_shows_all_four_estimates_and_one_action(self, monkeypatch):
-        monkeypatch.setattr(player_mod.requests, "get",
-                            lambda *a, **k: pytest.fail("no requests here"))
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: pytest.fail("no requests here"))
         p = _player(quality="LOSSLESS")
         p._download_track = _track(duration=197)
         p._download_cursor = 2  # LOSSLESS
@@ -364,7 +388,8 @@ class TestASegmentedDownload:
                 get_stream_manifest=lambda: types.SimpleNamespace(
                     is_bts=False, dash_info=None))
             p._download_track = track
-            p._stream_url = lambda t: path  # the manifest is already written
+            # the manifest is already written; the tier is what a stream says
+            p._stream_description = lambda t: (path, "LOSSLESS")
 
             job = _download(p, "LOSSLESS")
             assert job["state"] == "done", job.get("error")
@@ -376,6 +401,217 @@ class TestASegmentedDownload:
             assert server.hits == ["/init.mp4", "/s1.mp4", "/s2.mp4", "/s3.mp4"]
         finally:
             server.close()
+
+
+class TestOneConnectionPerTrack:
+    """46 requests to one host should not be 46 TLS handshakes.
+
+    The real cached hi-res track (FLAC 24/48, 175.9 s, 29,575,234 bytes)
+    parses to 45 media segments plus an initialization segment. Measured over
+    loopback HTTPS, 46 x 657 KB, median of 5: 0.250 s with a fresh
+    `requests.get` per segment against 0.032 s with one `Session`, and with a
+    40 ms per-connection setup delay modelling TCP+TLS at a 20 ms RTT CDN,
+    2.430 s against 0.086 s — **+2.3 s and 45 avoidable handshakes per track**.
+    """
+
+    def _segmented(self, count=8):
+        init = _mp4(audio=b"")[:120]
+        parts = [bytes([65 + i]) * 4000 for i in range(count)]
+        routes = {"/init.mp4": init}
+        routes.update({f"/s{i}.mp4": part for i, part in enumerate(parts)})
+        return init, parts, _Server(routes)
+
+    def test_every_segment_of_a_track_shares_one_connection(self):
+        init, parts, server = self._segmented()
+        try:
+            urls = [server.url("/init.mp4")] + \
+                [server.url(f"/s{i}.mp4") for i in range(len(parts))]
+            part = str(cache_mod.CACHE_DIR / "seg.part")
+            cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            player_mod.fetch_to_file(urls, part)
+
+            assert len(server.hits) == 9, "every segment should still be fetched"
+            assert open(part, "rb").read() == init + b"".join(parts)
+            assert len(server.connections) == 1, \
+                f"{len(server.connections)} connections for one track"
+        finally:
+            server.close()
+
+    def test_the_pool_is_closed_when_a_download_is_abandoned(self, monkeypatch):
+        """Per call, not module-level: an abandoned download must not leave a
+        connection pool alive behind it."""
+        class _Response:
+            headers = {"Content-Type": "audio/mp4"}
+
+            def raise_for_status(self):
+                pass
+
+            def iter_content(self, size):
+                yield b"x" * 100
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                return False
+
+        sessions = patch_get(monkeypatch, player_mod, lambda *a, **k: _Response())
+        part = str(cache_mod.CACHE_DIR / "abandoned.part")
+        cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with pytest.raises(player_mod._DownloadSuperseded):
+            player_mod.fetch_to_file(["https://cdn/1.mp4"], part,
+                                     abandoned=lambda: True)
+        assert sessions and all(s.closed for s in sessions)
+
+    def test_a_segment_that_fails_still_raises(self, monkeypatch):
+        """The failure path is unchanged: a 4xx mid-track raises where it
+        always did, out of `raise_for_status`."""
+        init, parts, server = self._segmented(count=3)
+        try:
+            urls = [server.url("/init.mp4"), server.url("/s0.mp4"),
+                    server.url("/gone.mp4"), server.url("/s2.mp4")]
+            part = str(cache_mod.CACHE_DIR / "broken.part")
+            cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            with pytest.raises(Exception):
+                player_mod.fetch_to_file(urls, part)
+            assert "/s2.mp4" not in server.hits, "it kept going after a failure"
+        finally:
+            server.close()
+
+
+class TestDownloadingSomethingAlreadyCached:
+    """Play a hi-res track, then press `[d]`. The bytes are already here.
+
+    The two tiers are separate in *lifetime and ownership* — the cache is
+    machine-owned and evictable, the download is the user's and is not — but
+    they are not separate in bytes. Re-fetching ~30 MB that is on the disk
+    two directories away costs an API request and the whole file again.
+    """
+
+    def _cached(self, cache, track_id, quality, body=b"cached bytes", ext=".m4a"):
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{track_id}{ext}"
+        path.write_bytes(body)
+        cache.note_cached(track_id, ext, len(body), quality=quality)
+        return path
+
+    def _player_expecting_no_network(self, monkeypatch, quality="LOSSLESS"):
+        p = _player(quality=quality)
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: pytest.fail("the cached copy was re-fetched"))
+        track = _track()
+        track.get_stream = lambda: pytest.fail("a promotion asked for a stream")
+        p._download_track = track
+        return p
+
+    def test_a_matching_cached_copy_is_copied_not_re_fetched(self, monkeypatch):
+        p = self._player_expecting_no_network(monkeypatch)
+        body = _mp4()
+        self._cached(p._cache, 42, "LOSSLESS", body=body)
+
+        job = _download(p, "LOSSLESS")
+
+        assert job["state"] == "done", job.get("error")
+        landed = downloads.download_dir() / "Daft Punk" / \
+            "Random Access Memories" / "08 Get Lucky.m4a"
+        assert landed.exists()
+        # Tagged in place, so it is not byte-identical — but the audio is
+        assert AUDIO in landed.read_bytes()
+
+    def test_the_cached_copy_is_left_where_it_was(self, monkeypatch):
+        p = self._player_expecting_no_network(monkeypatch)
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        _download(p, "LOSSLESS")
+        assert cached.exists(), "promoting moved the cache's own copy"
+
+    def test_the_recorded_tier_is_the_one_that_was_granted(self, monkeypatch):
+        p = self._player_expecting_no_network(monkeypatch)
+        self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        _download(p, "LOSSLESS")
+        entry = downloads.load_index()["42"]
+        assert entry["granted"] == "LOSSLESS"
+        assert entry["quality"] == "LOSSLESS"
+
+    def test_a_lower_cached_tier_is_never_promoted(self, monkeypatch):
+        """Cached HIGH does not satisfy a HIRES download. Silently installing
+        the wrong quality in someone's music folder is worse than re-fetching
+        — `.m4a` is AAC on a device-flow session and FLAC on a PKCE one, and
+        the names are identical."""
+        p = _player(quality="HIRES")
+        self._cached(p._cache, 42, "HIGH", body=_mp4())
+        calls = []
+        p._download_track = _track()
+        p._download_track.get_stream = lambda: (
+            calls.append(1) or types.SimpleNamespace(
+                audio_quality="HI_RES_LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["https://cdn/hi.mp4"])))
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: _FakeStream(_mp4()))
+
+        job = _download(p, "HIRES")
+
+        assert job["state"] == "done", job.get("error")
+        assert calls, "it promoted a lower-quality file instead of fetching"
+
+    def test_a_cached_file_of_unknown_tier_is_never_promoted(self, monkeypatch):
+        """Everything cached before the tracker existed has no tier. Unknown
+        must never be read as "the tier you asked for"."""
+        p = _player(quality="LOSSLESS")
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "42.m4a").write_bytes(_mp4())
+        p._cache.reconcile()  # adopts it, at no known tier
+        calls = []
+        p._download_track = _track()
+        p._download_track.get_stream = lambda: (
+            calls.append(1) or types.SimpleNamespace(
+                audio_quality="LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["https://cdn/x.mp4"])))
+        patch_get(monkeypatch, player_mod, lambda *a, **k: _FakeStream(_mp4()))
+
+        _download(p, "LOSSLESS")
+
+        assert calls, "an unknown tier was treated as a match"
+
+    def test_a_cached_entry_whose_file_is_gone_falls_through(self, monkeypatch):
+        p = _player(quality="LOSSLESS")
+        self._cached(p._cache, 42, "LOSSLESS", body=_mp4()).unlink()
+        calls = []
+        p._download_track = _track()
+        p._download_track.get_stream = lambda: (
+            calls.append(1) or types.SimpleNamespace(
+                audio_quality="LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["https://cdn/x.mp4"])))
+        patch_get(monkeypatch, player_mod, lambda *a, **k: _FakeStream(_mp4()))
+
+        _download(p, "LOSSLESS")
+
+        assert calls, "the tracker was trusted over the disk"
+
+
+class _FakeStream:
+    """A streaming response over a fixed body."""
+
+    def __init__(self, body, content_type="audio/mp4"):
+        self.headers = {"Content-Type": content_type,
+                        "Content-Length": str(len(body))}
+        self._body = body
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, size):
+        yield self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *e):
+        return False
 
 
 class TestPartialFilesAreNeverServed:
@@ -406,8 +642,7 @@ class TestPartialFilesAreNeverServed:
             def __exit__(self, *e):
                 return False
 
-        monkeypatch.setattr(player_mod.requests, "get",
-                            lambda *a, **k: _Response())
+        patch_get(monkeypatch, player_mod, lambda *a, **k: _Response())
         p = _player()
         track = _track()
         track.get_stream = lambda: types.SimpleNamespace(
@@ -444,7 +679,7 @@ class TestPartialFilesAreNeverServed:
             def __exit__(self, *e):
                 return False
 
-        monkeypatch.setattr(player_mod.requests, "get", lambda *a, **k: _Response())
+        patch_get(monkeypatch, player_mod, lambda *a, **k: _Response())
         p = _player()
         track = _track()
         track.get_stream = lambda: types.SimpleNamespace(
@@ -522,8 +757,8 @@ class TestManualDeletion:
                 pass
 
         monkeypatch.setattr(player_mod.subprocess, "Popen", _Proc)
-        monkeypatch.setattr(player_mod.requests, "get",
-                            lambda *a, **k: pytest.fail("no fetch expected"))
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: pytest.fail("no fetch expected"))
         audio = AudioPlayer("mpv", cache=MetadataCache(songs=False))
         gone = str(downloads.download_dir() / "not" / "there.m4a")
         audio.play_url("http://cdn.example/t.mp4", local=gone)
@@ -790,7 +1025,409 @@ class TestWhatTheFileActuallyCarries:
         assert "the folder and filename carry" in text.replace("\n   ", " ")
 
 
+class TestTheSettingsPageIsCheapToPaint:
+    """The settings page repaints twice a second, on the UI thread.
+
+    `downloaded_count()` and `total_bytes()` each called `path_for()` per
+    track, and `path_for()` re-read and re-parsed the whole `downloads.json`
+    every call — 2(N+1) reads and parses of an O(N)-sized file per frame.
+    Measured before: 4.54 ms at 50 downloads, 42.70 ms at 200, **229.48 ms at
+    500** — the same order as the 231 ms keypress latency `auto_refresh=False`
+    existed to remove. Assert the reads, not the milliseconds: a timing
+    threshold on a shared machine is a flaky test waiting to happen.
+    """
+
+    def _library(self, count):
+        root = downloads.download_dir()
+        for tid in range(count):
+            path = root / "A" / "B" / f"{tid:02d} T.m4a"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"music")
+            downloads.record(tid, path.relative_to(root), "HIGH", 5)
+
+    def _counting_reads(self, monkeypatch):
+        reads = []
+        real = downloads.load_index
+
+        def _load():
+            reads.append(1)
+            return real()
+
+        monkeypatch.setattr(downloads, "load_index", _load)
+        return reads
+
+    def test_both_numbers_cost_one_index_read(self, monkeypatch):
+        self._library(20)
+        reads = self._counting_reads(monkeypatch)
+        assert downloads.usage() == (20, 100)
+        assert len(reads) == 1, f"{len(reads)} reads of the index for one frame"
+
+    def test_the_reads_do_not_grow_with_the_library(self, monkeypatch):
+        self._library(60)
+        reads = self._counting_reads(monkeypatch)
+        downloads.usage()
+        assert len(reads) == 1
+
+    def test_a_repaint_does_not_re_measure(self, monkeypatch):
+        self._library(5)
+        p = _player()
+        p._user_display_name = "Garrett"
+        p._build_settings_display()
+        reads = self._counting_reads(monkeypatch)
+        for _ in range(10):  # five seconds of idle repaints
+            p._build_settings_display()
+        assert reads == [], "the page re-measured the download folder per frame"
+
+    def test_opening_the_page_re_measures(self, monkeypatch):
+        p = _player()
+        p._user_display_name = "Garrett"
+        assert "Downloads     0 songs" in p._build_settings_display().plain
+        self._library(3)   # e.g. downloaded from another window, or by hand
+        p._handle_key("c")
+        assert "Downloads     3 songs" in p._build_settings_display().plain
+
+
+class TestTheTwoTiersReadAsTwoTiers:
+    """Garrett: "Downloaded songs should not count towards cache limit…
+    both should have a disk usage metric… good cached/downloaded buttons and
+    metrics." Two rows of one little table, so the numbers can be read against
+    each other, and each row carries only what is true of its own tier."""
+
+    def _page(self, songs, song_bytes, kept, kept_bytes, budget=2):
+        p = _player()
+        p._user_display_name = "Garrett"
+        p.config["cache_budget_gb"] = budget
+        p._cache.audio_count = lambda: songs
+        p._cache.disk_bytes = lambda: song_bytes
+        p._download_usage = lambda: (kept, kept_bytes)
+        return p._build_settings_display().plain
+
+    def test_the_cache_is_shown_against_its_budget(self):
+        gb = cache_mod.BYTES_PER_GB
+        text = self._page(12, gb // 2, 0, 0, budget=4)
+        assert "Cache        12 songs · 0.500 GB of 4.000 GB" in text
+
+    def test_the_downloads_carry_no_budget_and_say_so(self):
+        gb = cache_mod.BYTES_PER_GB
+        text = self._page(0, 0, 3, 3 * gb)
+        assert "Downloads     3 songs · 3.000 GB · not counted against" in text
+        # No [x] on the downloads row: nothing in ticli deletes a track
+        # somebody asked for
+        rows = [line for line in text.splitlines() if "Downloads" in line]
+        assert rows and "[x]" not in rows[0]
+
+    def test_the_two_numbers_line_up(self):
+        """The point of the redesign: they are meant to be compared."""
+        gb = cache_mod.BYTES_PER_GB
+        text = self._page(7, gb, 1234, 9 * gb)
+        rows = [line for line in text.splitlines()
+                if line.startswith(("   Cache ", "   Downloads "))]
+        assert len(rows) == 2, rows
+        assert rows[0].index("·") == rows[1].index("·")
+
+    def test_the_page_fits_eighty_by_twentyfour_with_every_action_on_it(self):
+        """The bar `9c96d63` set, and the one Garrett restated: fit at 80x24
+        with [x], [o] and [u] on screen. Below that, degraded is fine."""
+        from rich.console import Console
+
+        gb = cache_mod.BYTES_PER_GB
+        p = _player()
+        p._mode = p.MODE_SETTINGS
+        p._user_display_name = "Garrett"
+        p._cache.audio_count = lambda: 9999
+        p._cache.disk_bytes = lambda: 12 * gb
+        p._download_usage = lambda: (9999, 12 * gb)
+        console = Console(width=80, height=24)
+        p.console = console
+        with console.capture() as cap:
+            console.print(p._build_display())
+        lines = cap.get().splitlines()
+        assert len(lines) <= 24, f"the pane is {len(lines)} rows in a 24-row window"
+        assert all(len(line) <= 80 for line in lines)
+        rendered = "\n".join(lines)
+        for key in ("[x]", "[o]", "[u]", "[R]"):
+            assert key in rendered, f"{key} fell off the page"
+
+
+class TestReFetchingEverything:
+    """The one action in the app that deliberately makes hundreds of requests.
+
+    ai/INCIDENTS #1 is 53 `playbackinfo` calls in 2.8 s getting the owner's IP
+    blocked and his music stopping. So the tests here are about the brakes:
+    that it asks first, that it is serial and paced, that it can be stopped,
+    and that evidence of a block ends it rather than being retried.
+    """
+
+    def _library(self, downloaded=(), cached=()):
+        p = _player(quality="HIRES")
+        root = downloads.download_dir()
+        for tid, granted in downloaded:
+            path = root / "A" / "B" / f"{tid:02d} T.m4a"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"music")
+            downloads.record(tid, path.relative_to(root), "HIGH", 5,
+                             granted=granted)
+        for tid, granted in cached:
+            directory = cache_mod.audio_dir()
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{tid}.m4a").write_bytes(b"music")
+            p._cache.note_cached(tid, ".m4a", 5, quality=granted)
+        return p
+
+    # ── what it says it will do ──
+
+    def test_it_counts_both_tiers(self):
+        p = self._library(downloaded=[(1, "HIGH")], cached=[(2, "LOSSLESS")])
+        plan = p._refetch_candidates()
+        assert plan["downloads"] == ["1"]
+        assert plan["cache"] == ["2"]
+
+    def test_anything_already_at_the_target_tier_is_left_alone(self):
+        p = self._library(downloaded=[(1, "HI_RES_LOSSLESS")],
+                          cached=[(2, "HI_RES_LOSSLESS")])
+        plan = p._refetch_candidates()
+        assert plan["downloads"] == [] and plan["cache"] == []
+        assert plan["skipped"] == 2
+
+    def test_a_download_also_in_the_cache_is_only_counted_once(self):
+        p = self._library(downloaded=[(1, "HIGH")], cached=[(1, "HIGH")])
+        plan = p._refetch_candidates()
+        assert plan["downloads"] == ["1"] and plan["cache"] == []
+
+    def test_a_file_deleted_by_hand_is_not_re_fetched(self):
+        p = self._library(downloaded=[(1, "HIGH")])
+        downloads.path_for(1).unlink()
+        assert p._refetch_candidates()["downloads"] == []
+
+    def test_the_plan_costs_no_network(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HIGH")], cached=[(2, "HIGH")])
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: pytest.fail("counting made a request"))
+        p.session.track = lambda tid: pytest.fail("counting resolved a track")
+        assert p._refetch_candidates()["bytes"] == 10
+
+    # ── it asks first ──
+
+    def test_nothing_happens_until_the_confirmation_is_answered(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HIGH")])
+        started = []
+        monkeypatch.setattr(p, "_start_refetch_job", lambda: started.append(1))
+        p._mode = p.MODE_SETTINGS
+        p._handle_key("R")
+        assert p._refetch_pending is True
+        assert started == [], "it started before it asked"
+
+        rendered = _rendered(p)
+        assert "Re-fetch 1 song at HIRES?" in rendered
+        assert "About" in rendered, "it did not say how much it would fetch"
+
+    def test_any_other_key_is_a_true_no_op(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HIGH")])
+        started = []
+        monkeypatch.setattr(p, "_start_refetch_job", lambda: started.append(1))
+        p._mode = p.MODE_SETTINGS
+        p._handle_key("R")
+        p._handle_key("n")
+        assert started == []
+        assert p._refetch_pending is False and p._refetch_plan is None
+
+    def test_y_starts_it(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HIGH")])
+        started = []
+        monkeypatch.setattr(p, "_start_refetch_job", lambda: started.append(1))
+        p._mode = p.MODE_SETTINGS
+        p._handle_key("R")
+        p._handle_key("y")
+        assert started == [1]
+
+    def test_with_nothing_to_do_it_says_so_rather_than_starting(self, monkeypatch):
+        p = self._library(downloaded=[(1, "HI_RES_LOSSLESS")])
+        p._mode = p.MODE_SETTINGS
+        p._handle_key("R")
+        assert "already at HIRES" in _rendered(p)
+
+    # ── the brakes ──
+
+    def test_it_is_serial_and_paced(self, monkeypatch):
+        """One at a time, and never faster than REFETCH_MIN_INTERVAL between
+        the *starts* — so a run of instant failures cannot become a burst."""
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.3)
+        p = self._library(downloaded=[(1, "HIGH"), (2, "HIGH"), (3, "HIGH")])
+        starts = []
+        overlapping = []
+        running = []
+
+        def _one(kind, key, tier, gen):
+            starts.append(time.monotonic())
+            overlapping.append(len(running))
+            running.append(key)
+            time.sleep(0.02)
+            running.pop()
+
+        monkeypatch.setattr(p, "_refetch_one", _one)
+        p._start_refetch_job()
+        assert _wait_for(lambda: (p._refetch_job or {}).get("state") == "done", 10)
+
+        assert len(starts) == 3
+        assert overlapping == [0, 0, 0], "two tracks were fetched at once"
+        gaps = [b - a for a, b in zip(starts, starts[1:])]
+        assert all(g >= 0.28 for g in gaps), f"paced too fast: {gaps}"
+
+    def test_a_rate_limit_stops_everything_and_retries_nothing(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.01)
+        p = self._library(downloaded=[(1, "HIGH"), (2, "HIGH"), (3, "HIGH")])
+        seen = []
+
+        def _one(kind, key, tier, gen):
+            seen.append(key)
+            raise RuntimeError("429 Too Many Requests")
+
+        monkeypatch.setattr(p, "_refetch_one", _one)
+        p._start_refetch_job()
+        assert _wait_for(lambda: (p._refetch_job or {}).get("state") == "blocked", 10)
+
+        assert seen == ["1"], "it kept going after TIDAL said stop"
+        assert "rate-limiting" in p._toast
+
+    def test_a_streaming_privileges_401_stops_it_too(self):
+        # The escalation the incident actually hit, once 429s were ignored
+        assert player_mod._looks_rate_limited(
+            "401 subStatus 4006 Session does not have streaming privileges")
+        assert not player_mod._looks_rate_limited("404 Not Found")
+
+    def test_one_failure_does_not_stop_the_rest(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.01)
+        p = self._library(downloaded=[(1, "HIGH"), (2, "HIGH")])
+
+        def _one(kind, key, tier, gen):
+            if key == "1":
+                raise RuntimeError("that one is gone")
+
+        monkeypatch.setattr(p, "_refetch_one", _one)
+        p._start_refetch_job()
+        assert _wait_for(lambda: (p._refetch_job or {}).get("state") == "done", 10)
+        assert p._refetch_job["done"] == 1 and p._refetch_job["failed"] == 1
+
+    def test_esc_stops_it_and_it_stays_stopped(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.05)
+        p = self._library(downloaded=[(i, "HIGH") for i in range(1, 8)])
+        seen = []
+
+        def _one(kind, key, tier, gen):
+            seen.append(key)
+            time.sleep(0.05)
+
+        monkeypatch.setattr(p, "_refetch_one", _one)
+        p._mode = p.MODE_SETTINGS
+        p._start_refetch_job()
+        assert _wait_for(lambda: len(seen) >= 2, 5)
+        p._handle_key(player_mod.KEY_ESC)
+
+        assert p._mode == p.MODE_SETTINGS, "Esc left the page instead of stopping"
+        stopped_at = len(seen)
+        time.sleep(0.4)
+        assert len(seen) <= stopped_at + 1, "it kept fetching after being stopped"
+        assert "cancelled" in p._toast
+
+    def test_a_second_press_does_not_start_a_second_run(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.05)
+        p = self._library(downloaded=[(i, "HIGH") for i in range(1, 6)])
+        runs = []
+        monkeypatch.setattr(p, "_refetch_one",
+                            lambda *a: (runs.append(1), time.sleep(0.05)))
+        p._start_refetch_job()
+        p._start_refetch_job()
+        p._start_refetch_job()
+        time.sleep(0.3)
+        p._cancel_refetch()
+        assert len(runs) <= 5, "held [R] fanned out into more than one run"
+
+    # ── it says what it is doing ──
+
+    def test_progress_is_on_the_page_while_it_runs(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.05)
+        p = self._library(downloaded=[(i, "HIGH") for i in range(1, 5)])
+        monkeypatch.setattr(p, "_refetch_one", lambda *a: time.sleep(0.05))
+        p._user_display_name = "Garrett"
+        p._start_refetch_job()
+        assert _wait_for(lambda: (p._refetch_job or {}).get("done", 0) >= 1, 5)
+        rendered = p._build_settings_display().plain
+        assert "Re-fetching at HIRES" in rendered
+        assert "/4" in rendered
+        assert "[Esc]" in rendered
+        p._cancel_refetch()
+
+    # ── and the bytes really change ──
+
+    def test_a_cached_song_is_replaced_with_the_new_tier(self, monkeypatch):
+        """End to end over a loopback server: the file on disk afterwards is
+        the bytes the server sent, and the tracker says the new tier."""
+        fresh = _mp4(audio=b"HI-RES" * 5000)
+        server = _Server({"/hires.mp4": fresh})
+        try:
+            p = self._library(cached=[(42, "HIGH")])
+            p.audio = player_mod.AudioPlayer("mpv", cache=p._cache)
+            real = _track(42)
+            real.get_stream = lambda: types.SimpleNamespace(
+                audio_quality="HI_RES_LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: [server.url("/hires.mp4")]))
+            p.session.track = lambda tid: real
+
+            p._refetch_one("cache", "42", "HIRES", p._refetch_gen)
+
+            landed = cache_mod.cached_audio_path(42)
+            assert landed is not None
+            assert open(landed, "rb").read() == fresh
+            assert p._cache.audio_record(42)["quality"] == "HI_RES_LOSSLESS"
+        finally:
+            server.close()
+
+    def test_a_downloaded_song_is_replaced_in_the_music_folder(self):
+        fresh = _mp4(audio=b"BETTER" * 5000)
+        server = _Server({"/hires.mp4": fresh})
+        try:
+            p = self._library(downloaded=[(42, "HIGH")])
+            real = _track(42)
+            real.get_stream = lambda: types.SimpleNamespace(
+                audio_quality="HI_RES_LOSSLESS",
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: [server.url("/hires.mp4")]))
+            p.session.track = lambda tid: real
+
+            p._refetch_one("download", "42", "HIRES", p._refetch_gen)
+
+            landed = downloads.path_for(42)
+            assert landed is not None and landed.exists()
+            assert b"BETTER" in landed.read_bytes()
+            assert downloads.load_index()["42"]["granted"] == "HI_RES_LOSSLESS"
+            # The old file was at a different path (the index row is rewritten
+            # too), and nothing in the folder is a leftover of it
+            files = sorted(f.name for f in downloads.download_dir().rglob("*")
+                           if f.is_file())
+            assert files == ["08 Get Lucky.m4a"], files
+        finally:
+            server.close()
+
+    def test_a_blocked_run_says_so_on_the_page(self):
+        p = self._library()
+        p._refetch_job = {"state": "blocked", "done": 3, "error": "429"}
+        p._user_display_name = "Garrett"
+        rendered = p._build_settings_display().plain
+        assert "rate-limiting" in rendered
+        assert "nothing retried" in rendered
+
+
 class TestSettingsShowsTheFolder:
+    def test_the_folder_is_shown_as_a_full_absolute_path(self):
+        """Garrett asked for the absolute path rather than `~/Music/Ticli` —
+        one you can paste into Finder. Not `resolve()`, which on macOS turns
+        /Users/... into /System/Volumes/Data/Users/... through the firmlink."""
+        shown = downloads.display_dir()
+        assert shown.startswith("/")
+        assert "~" not in shown
+        assert "/System/Volumes/Data/" not in shown
+
     def test_the_path_and_the_count_are_on_the_settings_page(self):
         root = downloads.download_dir()
         path = root / "A" / "B" / "01 T.m4a"
@@ -802,7 +1439,8 @@ class TestSettingsShowsTheFolder:
         p._user_display_name = "Garrett"
         text = p._build_settings_display().plain
         assert str(root) in text
-        assert "1 song downloaded" in text
-        # Why they are exempt is prose, and prose is what a short window drops
-        # first (see _fit_levers) — the count and the path are not
-        assert "never evicted and never counted against the cache budget" in text
+        assert "Downloads     1 song " in text
+        # Exemption from the budget is a fact about the number beside it, not
+        # prose about the feature, so it is on the row and survives a short
+        # window the way the count and the path do
+        assert "not counted against the budget" in text

@@ -344,6 +344,372 @@ visible rather than implicit.
 
 ---
 
+## 2026-07-26 — the data path audit, acted on
+
+A read-only audit of streaming, caching and downloading
+(`ai/reference/data-path-audit-2026-07-26.md`, zero live requests, everything
+measured against a loopback server and the real cached hi-res track) produced
+eight findings. What follows is the work order being executed; each finding is
+its own commit so any one can be reverted alone, and each is marked **Fixed**
+in the audit rather than deleted from it.
+
+The audit's own summary of *why* these existed is worth keeping: five of the
+eight were seams — two pieces of the path each behaving correctly and
+disagreeing with each other. None of them is visible from inside the function
+that causes it, which is why they survived a green suite.
+
+### F1 — a leaked `.part` file was invisible to the cache, and evicted real songs
+
+`AudioPlayer._start_download` opens `{audio_dir}/{track_id}.part` — **no
+extension**, because the container is not known until the CDN's first response
+header arrives; the file is renamed to `{track_id}{ext}` when it is whole.
+`cache.is_owned_audio()` stripped `.part` and then *required* an audio
+extension, so it answered False for every part file production has ever
+written.
+
+The consequence is not cosmetic. `total_bytes()` is a plain directory size and
+does not consult the predicate, so a leaked part file — from a SIGKILL, a
+crash, a power loss, anything that is not `stop()` — **is** counted against the
+budget, while `owned_audio_files()` cannot see it. Measured with the real
+modules at a 1 GB budget, a 1.5 GB leak beside a 0.25 GB song:
+`enforce_budget()` deleted the song, kept the leak, and `clear_audio()`
+returned `(0, 0)`. Once leaked bytes exceed the budget the cache can never hold
+anything again, while the settings page reads `0 songs cached · 1.500 GB` —
+honest about the bytes, silent about why.
+
+The fix widens the predicate: on a `.part`, the extension is optional. The
+extended `{track_id}{ext}.part` form is still accepted, because a rename
+landing mid-sweep is still ours. `audio_count()` keeps excluding `.part` by
+suffix, so a half-written file is still not a song.
+
+**The tests were part of the bug.** `test_cache.py` asserted on `12.m4a.part`
+in four places — a filename production never creates. They now use what the
+writer writes, and a new test monkeypatches `fetch_to_file` to capture the path
+`_start_download` actually opens and asserts `is_owned_audio` on *that*, so the
+predicate is pinned to the writer rather than to a name somebody believed the
+writer used. Three more assert the leak scenario in bytes on disk: the leak is
+evicted before the real song, `clear_audio` removes it, and it is still not
+counted as a song. Filed as INCIDENTS #6 — it is INCIDENTS #2's lesson again.
+
+The `important.txt` decoy tests still pass: the predicate only widened over
+names that are already `{track_id}`-shaped.
+
+### F2 — a stream that died mid-track looked exactly like one that finished
+
+Measured against a loopback HLS server returning `403 Request has expired`
+from segment 3 of 45: **both** mpv and ffplay play out whatever they had
+buffered and then exit **`0` with an empty stderr**, 12.1 s into a 176 s
+track. That is byte for byte what reaching the end of a song looks like, so
+`failure()` says nothing — correctly, by its own contract — and
+`_monitor_playback` fell through to the auto-advance. The user heard twelve
+seconds of a three-minute song and the player moved on with nothing said. If
+the cause is systemic (an expired session, the network down) it walks the
+whole queue like that. INCIDENTS #3 through a door its fix does not cover.
+
+Reachable without anything exotic: a pause longer than the ~1 h life of a
+signed URL, because ffplay's `resume()` respawns against the *same* expired
+string and `AudioPlayer` has no session to get a fresh one with; or any
+network blip mid-track.
+
+The clock is the only witness, so `_stream_ended_early()` is the whole fix:
+duration known, and the position more than `STREAM_TRUNCATED_MARGIN` (15 s)
+short of it. **Stop and say so** — `Playback stopped early — the stream ended
+at 0:12 of 2:56. [space] to resume` — rather than retry. The audit proposed an
+automatic restart with a one-retry latch; the owner's established answer for a
+stream the backend could not play is a stop with an honest toast, and a silent
+retry loop against a dead URL would be the same silence with more requests.
+The position is kept, so `[space]` restarts through `_play_track`, which
+fetches a fresh URL.
+
+Deliberately the **opposite** of `_track_has_time_left`'s rule on an unknown
+duration. There, "can't say" means resume: a wrong guess costs one extra
+spawn. Here a wrong "yes" stops the queue on a track that really did end, so
+"can't say" advances exactly as before. The 15 s margin is for the same
+reason — TIDAL's `duration` is metadata and disagrees with the audio by a
+second or two, and the measured failure stopped 164 s short.
+
+Tests assert what the brief asked for: the queue index does not move, no
+restart is attempted, and the toast carries both times. Plus the premise, run
+against the real backends over loopback — exit 0, `failure()` None, dead well
+short of the end.
+
+**Found on the way, and fixed:** `_split` in `test_buffering.py` returned the
+whole 24-second track as a *single* segment (it kept only the first `sidx`),
+so the segment the buffering tests delay was never requested and those
+assertions were passing over a stream with nothing to buffer. Fixed to cut at
+every `moof`. With 12 real segments the delayed one had to move from index 2
+to 6: at the very start of a track nothing is buffered yet, so a slow segment
+there stalls any player — measured, mpv reports `paused-for-cache` once at
+2.1 s and then runs 21 s ahead for the rest of the track, which is the
+property the test means to assert.
+
+### F5 — ffplay had the readahead weakness mpv had just been fixed for
+
+Bytes served on one 45-segment playlist (990 kbps, 176 s, 21.8 MB):
+
+| backend / flags | @1 s | @3 s | @8 s |
+|---|---|---|---|
+| mpv, `--cache=yes --cache-secs=60` | 9.19 MB | 9.68 | 10.16 |
+| mpv, no cache flags (the bug that was fixed) | 1.88 | 2.37 | 2.86 |
+| **ffplay, before this** | **1.40** | 1.40 | 2.37 |
+| **ffplay, `+ -infbuf`** | **21.71** | 21.71 | 21.71 |
+
+ffplay sat at the *un-fixed* mpv level — about two segments, ~11 s — because
+its read thread stops once every stream has enough packets queued
+(`MIN_FRAMES` / `stream_has_enough_packets` in ffplay.c). Any segment slower
+than that window is the hitch that was reported for mpv.
+
+There is no `--cache-secs` analogue for ffplay, so the choice is between ~11 s
+and unbounded; for a VOD track of known, bounded length (~30 MB hi-res)
+unbounded is the right side of that trade. In `_hls_flags()` next to the mpv
+cache flags it mirrors, so it is **segmented only** — on the BTS path both
+backends already read the whole file at once and need nothing.
+
+Tested by running the real ffplay against the loopback server and counting
+segments requested: 12 of 12 within four seconds with the flag, 6 of 12
+without, and the second of those is a control — without it the first would
+pass on any track short enough to fit ffplay's default queue anyway.
+
+### F6 — the settings page did O(N²) JSON reads on the UI thread
+
+`downloaded_count()` and `total_bytes()` each iterated the index and called
+`path_for()` per track, and **`path_for()` re-read and re-parsed the whole
+`downloads.json` every call** — so one repaint was 2(N+1) reads and 2(N+1)
+parses of an O(N)-sized file:
+
+```
+ 50 downloads    4.54 ms per settings repaint
+200 downloads   42.70 ms
+500 downloads  229.48 ms
+```
+
+paid **twice a second** while the page is open, because `_repaint` builds the
+display before it can decide whether the frame changed. That is the same order
+as the 231 ms keypress latency the `auto_refresh=False` work existed to remove
+(`bd4f95f`), on the UI thread, growing back in a new place.
+
+`downloads.usage()` now returns both numbers from **one** index read and one
+stat per entry, and the player memoises the pair, dropped by the two things
+that move it: opening the page, and a download landing. Both halves, because
+the linear version is still disk work and `_repaint` pays it on every idle
+tick. The memo lives on the player instance rather than in the module — a
+module-level one would outlive a test and leak into the next.
+
+Semantics unchanged and deliberately so: every file is still stat-ed and the
+index is still only a hint about where to look, so a track dragged to the
+trash is still not downloaded.
+
+Tests assert the reads rather than the milliseconds — a timing threshold on a
+shared machine is a flaky test waiting to happen. One index read for both
+numbers, no growth with the library, zero re-measures across ten repaints, and
+a re-measure when the page is opened.
+
+### F7 — 46 TLS handshakes per hi-res track
+
+The real cached hi-res track (FLAC 24/48, 175.9 s, 29,575,234 bytes) parses to
+**45 media segments plus an initialization segment**, mean 657 KB each — so a
+hi-res download is 46 sequential `requests.get` calls, each building its own
+Session, its own pool and its own TLS connection. Loopback HTTPS, 46 × 657 KB,
+median of 5:
+
+| | fresh `requests.get` | one `Session` | delta |
+|---|---|---|---|
+| no added latency | 0.250 s | 0.032 s | 7.8× |
+| +40 ms per connection setup (TCP+TLS at a 20 ms RTT CDN) | 2.430 s | 0.086 s | **+2.34 s** |
+
+One `requests.Session()` per call of `fetch_to_file`, in the same `with` as
+the output handle. Per call rather than module-level: the `with` closes the
+pool on every path out including the abandoned one, so an abandoned download
+cannot leave sockets alive, and the cache thread and a download job never
+share one.
+
+**The test fakes had to move with it.** Six sites replaced `requests.get`,
+which `fetch_to_file` no longer calls — a fake of a function production has
+stopped calling is INCIDENTS #2's shape exactly. `tests/fakes.py` now has one
+`patch_get` that replaces `requests.get` *and* `requests.Session().get`
+together, so nothing has to remember. Asserted over a real loopback server
+with `protocol_version = "HTTP/1.1"` and a per-connection counter: nine
+segments, **one** connection, bytes identical; plus the pool closed on an
+abandoned download, and a mid-track 404 still raising where it always did.
+
+### The cache tracker, and the value function on top of it
+
+Garrett's framing, and it is the reason this is one change rather than four:
+
+> "Caching needs a cache tracker and the actual cached files. The cache
+> tracker will be updated and the cached files are merely a downstream result
+> of that."
+
+`CACHE_DIR/audio.json` — its own file, not a section of `metadata.json`,
+because the two are gated by different settings: this is bookkeeping about
+*audio*, so it lives and dies with `cache_songs`, and turning the metadata
+index off must not blind eviction. Per track: the extension, the tier TIDAL
+**granted**, the size, the play count, and when it was last played.
+
+**Tracker is the authority on intent; disk is the authority on existence.**
+That second half is Garrett's standing requirement — a song deleted from the
+folder by hand has to be handled durably — and it is what stops "tracker is
+the source of truth" turning into "trust the tracker blindly". `reconcile()`
+is where the two meet: an entry whose file is gone is dropped and the totals
+corrected, a file with no entry is adopted at **zero plays and no known
+tier**, and a size that moved is corrected. It runs on a daemon thread at
+startup, because it is a directory listing plus a stat per file and that walk
+must never happen on a paint. Either order of a crash is survivable, because
+it reads both sides.
+
+**The value function**, one place, `audio_value(track_id, playing)` →
+`(plays, last played)`. Garrett's rule from the start: a point per play, evict
+the oldest among the tracks with the fewest plays. Not LRU, because a
+four-hour binge on a new playlist would evict long-term staples and the whole
+point of counting plays is that it cannot. His refinement held too: the
+timestamp is **ours**, stamped at play time, never the filesystem's `atime`,
+which `relatime` makes roughly daily-granular.
+
+A play is counted on the monitor's existing 0.5 s tick, once per `_play_gen`,
+after `PLAY_COUNTS_AFTER` (30 s, or half of anything shorter). **A skip is not
+a play** — counting one at track start would let a shuffle through a hundred
+previews out-score a staple, which is the exact thing the rule exists to stop.
+
+**Admission: refuse only under pressure**, as decided. With room in the budget
+nothing is refused and behaviour is exactly as before. When the cache is full,
+the candidate has to beat the cheapest resident; a refused track streams
+without being cached, which is byte for byte the `cache_songs`-off path.
+
+The freeze problem, and the rule chosen for it. A brand-new track has zero
+plays, so a naive comparison refuses *everything* once the cache is full and
+the cache freezes into whatever it held that day. The rule here is
+`playing=True`: **the song being listened to counts the play it is earning
+right now.** So it displaces the oldest *other* one-play track and nothing
+else — the same rule, honestly applied to a song that is actually being
+played, and no special case. It needs no scratch tier, and it is deliberately
+expressible at any moment: moving the decision from the start of a track to
+its end (where "was it actually listened to?" is answerable) is a change of
+*caller*, not of rule. `_admit()` is that one caller.
+
+### F3 — every play of a cached track paid a request it threw away
+
+`_play_track` checked `downloads.path_for()` before asking for a stream URL
+but never checked the cache, because `play_url` only discovered the cached
+file *after* it had been handed a URL — and then ignored the URL. So replaying
+a 20-track cached playlist cost **20 `playbackinfo` requests** thrown away,
+plus up to 20 more from the prefetch, against the exact endpoint whose burst
+rate got the owner's IP blocked (INCIDENTS #1).
+
+`_local_copy()` now answers "is there a copy on this disk good enough to
+play?" before anything is asked of TIDAL, for both tiers, and
+`_maybe_prefetch_next` asks the same question before spending its request.
+
+Which makes the *quality* question unavoidable, and both wrong answers matter.
+A copy stored **below** the tier now selected is skipped, so the track is
+fetched at the quality that was asked for — that is Garrett's "songs should
+re-download at higher quality when played again". A copy stored **above** it
+is kept, because being temporarily set to LOW must never destroy a hi-res
+copy. A copy whose tier was never recorded counts as good enough: unknown is
+not evidence of a downgrade, and re-fetching a whole library on the strength
+of a missing field is not something to do unasked.
+
+Two smaller things that fall out. `_stream_description()` returns `(url,
+granted tier)` from the one request `_stream_url` already made, which is where
+the tracker's tier comes from. And a re-fetch that lands under a *different*
+extension unlinks the copy it replaced — `_cached_audio_path` globs by stem,
+so the stale file would otherwise still be a possible answer.
+
+Known cost, stated rather than hidden: the quality gate learns from stream
+descriptions, so it learns nothing on a cache hit. It still learns on every
+cache *miss*, which is every new track; only a user whose entire library is
+cached would notice.
+
+### F4 — downloading something already cached re-fetched all of it
+
+`_start_download_job` went straight to the network. Play a hi-res track and
+press `[d]`: one API request and ~30 MB fetched again for bytes two
+directories away. The two tiers are separate in lifetime and ownership, not
+in bytes.
+
+`_promote_cached_copy()` copies the cached file into the download's staging
+path, after which the existing rename, tagging and record steps run unchanged.
+Three conditions, each of them a way of getting it wrong: the tracker has to
+know the tier the cached copy was **granted** (`.m4a` is AAC-HIGH on a
+device-flow session and FLAC-in-MP4 on a PKCE one, and the names are
+identical); it has to be an **exact** match, so nothing is promoted upwards or
+downwards; and the file has to be there at the moment of use. Anything else
+falls through to the network.
+
+The download index now records `granted` beside `quality` for the same reason
+— `quality` is what the user asked for and what the screen says, `granted` is
+what TIDAL served and the only one that can be compared with anything.
+
+### Re-fetch everything at the current quality, and two tiers that read as two
+
+Three requests from Garrett, and they turned out to be one screen.
+
+**`[R]` re-fetches every local copy at the tier currently selected** — both
+tiers, because he asked for "specifically downloaded songs as well as cached
+songs". Downloads go back into `~/Music/Ticli` through the same
+`_download_to_music` the download screen uses (tagged, and the old file
+removed if the container changed); cached songs go back into the cache.
+
+This is **the most rate-limit-dangerous thing in the app**, and the incident
+it could repeat is the worst one in this project's history — 53 `playbackinfo`
+calls in 2.8 s got the owner's IP blocked and his music stopped mid-session.
+So the design question was not "how fast can this go" but "how do we make it
+impossible for a user to do that to themselves". Four answers, all structural:
+
+* **Serial.** One track, one thread, no fan-out, nothing to tune.
+* **Paced.** `REFETCH_MIN_INTERVAL` (2 s) between the *starts*, so a run of
+  instant failures cannot become a burst. A track is two requests (resolve,
+  then stream), so the ceiling is about one request a second and the sustained
+  rate is far below that — an order of magnitude under the 19/s that caused
+  the block.
+* **Interruptible.** A generation counter, bumped by `Esc`, checked before
+  every track *and* passed into `fetch_to_file` as its `abandoned` callback,
+  so a cancel lands inside a chunk read rather than at the end of a 30 MB
+  file. On this page `Esc` stops the run rather than leaving, so the key that
+  starts the only long job here is also the key that stops it.
+* **Stop, never retry, on evidence of a block.** A 429, or a 401 with
+  subStatus 4006, ends the whole run and says so in red. Retrying is what
+  turned a rate limit into an edge block.
+
+And opt-in twice: a key, then a confirmation that says how many songs, roughly
+how many bytes and roughly how long *before* anything is fetched. The estimate
+is the size already recorded against each copy, so it costs nothing — asking
+TIDAL for real sizes would be one request per track, which is the pattern that
+caused the incident. Copies already at the target tier are skipped and counted,
+because spending a request to be handed back the file you already have is the
+opposite of the point.
+
+**The two tiers now read as two rows of one small table:**
+
+```
+   Cache      9999 songs · 12.000 GB of 2.000 GB   [x] clear
+   Downloads  9999 songs · 12.000 GB · not counted against the budget
+   /Users/garrett/Music/Ticli   [R] re-fetch all at HIRES
+```
+
+Aligned, so the two numbers can be read against each other — which was the
+point of the request. Each row carries only what is true of its own tier: the
+cache has a budget and an `[x]`, the downloads have a folder and neither,
+because nothing in ticli deletes a track somebody asked for and their bytes are
+not the cache's to reclaim. `of`, not `/`, because the budget can be 0 and a
+fraction with a zero denominator reads as broken. Three decimals, as before.
+
+The folder is now the **full absolute path** — `expanduser()`, deliberately
+not `resolve()`, which on macOS rewrites `/Users/garrett/…` to
+`/System/Volumes/Data/Users/garrett/…` through the firmlink: accurate and
+unreadable. `[R]` shares that line, and which of the two goes first depends on
+what fits, with the tie-break stated: a path that runs off the end is a
+truncated path, an action that runs off the end is a feature nobody can find.
+A run in progress takes the line for the same reason, only more so.
+
+Fits 80x24 with `[x]`, `[o]`, `[u]` and `[R]` all on screen and three settings
+rows, and overflows at no size (checked 40x15 through 120x40). Below 80x24 it
+is degraded and that is explicitly fine.
+
+The settings readouts are cheap by construction now: the cache's from the
+tracker, the downloads' from one memoised index read.
+
+---
+
 ## In flight at time of writing
 
 - **Responsive narrow-width layout + `v` volume overlay** — width-derived

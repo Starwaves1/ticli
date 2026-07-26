@@ -1,6 +1,6 @@
 # Incidents
 
-Five things that went wrong, and what each changed. This is the highest-value
+Six things that went wrong, and what each changed. This is the highest-value
 file in `ai/` — every rule in WORKING-RULES.md that matters came from one of
 these.
 
@@ -151,6 +151,46 @@ many**. A real bug in eviction, surfaced as test noise.
 rewritten to place files with stated times and no threads, and a new test
 pinning the race directly. Rule adopted: a flaky test is a bug until proven
 otherwise.
+
+---
+
+## 6. The cache did not recognise the file it was writing
+
+**What happened.** `AudioPlayer._start_download` writes the in-progress copy to
+`{audio_dir}/{track_id}.part` — no extension, because the container is only
+known once the CDN's first response header arrives, and the file is renamed to
+`{track_id}{ext}` when it is whole. `cache.is_owned_audio()` stripped `.part`
+and then *required* a recognised audio extension, so it expected
+`{track_id}{ext}.part` and returned **False for every part file production has
+ever written**.
+
+**Impact.** A part file leaked by any exit that is not `stop()` — SIGKILL, a
+crash, power loss — is counted against the budget (`total_bytes` is a plain
+directory size and never asks the predicate) while being invisible to
+`owned_audio_files`. So it could be neither evicted nor cleared. Measured with
+the real modules, 1 GB budget, a 1.5 GB leak beside a 0.25 GB song:
+`enforce_budget()` **deleted the song and kept the leak**, and "clear cached
+songs" returned `(0 deleted, 0 kept)`. Past that point every sweep evicts every
+real song and the cache can never hold anything again — while the settings page
+says `0 songs cached · 1.500 GB`, honest about the bytes and silent about why.
+
+**Why the tests didn't catch it.** They asserted on `12.m4a.part`, in four
+places. **Production never creates that name.** The tests and the predicate
+agreed with each other and both disagreed with the writer — which is INCIDENTS
+#2 exactly: five green tests over an inert feature, because the assertion was
+about a belief rather than about what was on disk.
+
+**What changed.**
+- The predicate widened: on a `.part` the extension is optional. The extended
+  form is still accepted (a rename landing mid-sweep is still ours), and
+  `audio_count()` still excludes `.part` by suffix.
+- The four tests now use the name the writer writes, and a new one
+  monkeypatches `fetch_to_file` to capture the path `_start_download` actually
+  opens and asserts the predicate against **that** — pinning it to the writer,
+  not to a name. Three more assert the leak scenario in bytes on disk.
+- Rule reinforced, and it is the generalizable one: **a test for a filename
+  must obtain the filename from the code that writes it.** Where a test cannot
+  do that, the constant belongs in one place that both sides import.
 
 ---
 

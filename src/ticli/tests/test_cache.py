@@ -18,6 +18,7 @@ import pytest
 
 from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
+from ticli.tests.fakes import patch_get
 from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
 from ticli.utils.cache import CachedPlaylist, CachedTrack, MetadataCache
@@ -155,7 +156,7 @@ def _fake_get(monkeypatch, body=BODY, content_type="audio/mp4", on_chunk=None):
         calls.append(url)
         return _FakeResponse(body, content_type, on_chunk)
 
-    monkeypatch.setattr(player_mod.requests, "get", _get)
+    patch_get(monkeypatch, player_mod, _get)
     return calls
 
 
@@ -202,6 +203,19 @@ def _player(session=None):
     p = HeadlessTidalPlayer()
     p.session = session or _FakeSession()
     return p
+
+
+def _stamp(cache, track_id, plays=0, last=0.0, quality=None, size=0, ext=".m4a"):
+    """Write a tracker record with stated numbers.
+
+    Times are stated rather than measured for the same reason the eviction
+    test places its files by hand: the rule under test is an ordering, and an
+    ordering that depended on how long the test took would be noise.
+    """
+    tracks = dict(cache._load_tracker())
+    tracks[str(track_id)] = {"ext": ext, "quality": quality, "bytes": size,
+                             "plays": plays, "last": last, "at": last}
+    cache._save_tracker(tracks)
 
 
 def _first_paint(action, rows):
@@ -692,7 +706,7 @@ class TestAudioRetention:
     def test_a_failed_download_leaves_nothing_behind(self, monkeypatch):
         def _boom(*a, **k):
             raise OSError("connection reset")
-        monkeypatch.setattr(player_mod.requests, "get", _boom)
+        patch_get(monkeypatch, player_mod, _boom)
         audio = self._audio()
 
         audio._start_download(URL, 12, audio._download_gen)
@@ -705,7 +719,7 @@ class TestAudioRetention:
         audio = self._audio()
         path = cache_mod.audio_dir()
         path.mkdir(parents=True, exist_ok=True)
-        (path / "12.m4a.part").write_bytes(BODY[:10])
+        (path / "12.part").write_bytes(BODY[:10])
         assert audio._cached_audio_path(12) is None
 
     # ── the budget, against files that now really exist ──
@@ -730,20 +744,22 @@ class TestAudioRetention:
 
     def test_the_oldest_download_is_the_one_evicted(self, monkeypatch):
         # Both files are placed directly, with times stated rather than
-        # measured: what is under test is "least recently used goes first",
-        # and nothing about that should depend on when the test ran, how long
-        # a download thread took, or whether a sweep it started is still in
-        # flight. The version of this that raced one was flaky about 1 run in 4.
+        # measured: what is under test is the eviction *order*, and nothing
+        # about that should depend on when the test ran, how long a download
+        # thread took, or whether a sweep it started is still in flight. The
+        # version of this that raced one was flaky about 1 run in 4.
         audio = self._audio()
         directory = cache_mod.audio_dir()
         directory.mkdir(parents=True, exist_ok=True)
         old = directory / "12.m4a"
         old.write_bytes(BODY)
-        os.utime(old, (1_000_000, 1_000_000))
         # A second track that only overshoots the budget with the first there
         big = directory / "13.m4a"
         big.write_bytes(b"x" * 1_040_000)
-        os.utime(big, (2_000_000, 2_000_000))
+        # Equal plays, so the older one goes — the tracker's own stamp, not
+        # the filesystem's atime, which `relatime` makes ~daily-granular
+        _stamp(audio.cache, 12, plays=1, last=1_000_000)
+        _stamp(audio.cache, 13, plays=1, last=2_000_000)
         monkeypatch.setattr(cache_mod, "BYTES_PER_GB", 1024 * 1024)
         audio.cache.budget_gb = 1
 
@@ -798,7 +814,7 @@ class TestSongCount:
     def test_counts_whole_tracks_only(self):
         self._song("1.m4a")
         self._song("2.flac")
-        self._song("3.m4a.part")  # still downloading — not a song yet
+        self._song("3.part")  # still downloading — not a song yet
         assert MetadataCache().audio_count() == 2
 
     def test_an_empty_or_missing_directory_is_zero(self):
@@ -868,11 +884,55 @@ class TestOwnedFilesOnly:
     def test_the_names_ticli_writes_are_the_names_it_owns(self):
         assert cache_mod.is_owned_audio("12345.m4a")
         assert cache_mod.is_owned_audio("12345.flac")
+        # What _start_download actually opens: no extension, because the CDN
+        # has not said what container it is sending yet
+        assert cache_mod.is_owned_audio("12345.part")
+        # And the extended form, which a rename landing mid-sweep can show
         assert cache_mod.is_owned_audio("12345.m4a.part")
         assert not cache_mod.is_owned_audio("important.txt")
         assert not cache_mod.is_owned_audio("mixtape.m4a")
+        assert not cache_mod.is_owned_audio("mixtape.part")
         assert not cache_mod.is_owned_audio("12345")
         assert not cache_mod.is_owned_audio(".part")
+
+    def test_the_part_file_the_downloader_opens_is_owned(self, monkeypatch):
+        """Pins the predicate to the writer rather than to a name someone
+        thought the writer used. The bug was exactly this gap."""
+        opened = []
+        monkeypatch.setattr(player_mod, "fetch_to_file",
+                            lambda sources, part, **kw: opened.append(part))
+        audio = player_mod.AudioPlayer("mpv", cache=MetadataCache())
+        audio._start_download(URL, 12, audio._download_gen)
+        assert _wait_for(lambda: opened)
+        assert cache_mod.is_owned_audio(os.path.basename(opened[0])), opened[0]
+
+    def test_a_leaked_part_file_is_evicted_before_a_real_song(self, monkeypatch):
+        """The whole of the bug, in bytes on disk.
+
+        A part file left behind by a kill is counted by total_bytes (a plain
+        directory size) whether or not this module recognises it. When it did
+        not, every sweep evicted the real songs and kept the leak for ever.
+        """
+        monkeypatch.setattr(cache_mod, "BYTES_PER_GB", 1024)
+        cache = MetadataCache(budget_gb=1)
+        leak = self._write("111.part", 1536)   # over budget on its own
+        song = self._write("222.m4a", 256)
+        os.utime(leak, (1, 1))                 # least recently used: goes first
+
+        cache.enforce_budget()
+
+        assert not leak.exists(), "a leaked .part must be evictable"
+        assert song.exists(), "the real song must not be the one deleted"
+
+    def test_clearing_the_cache_clears_a_leaked_part_file(self):
+        cache = MetadataCache()
+        leak = self._write("111.part")
+        assert cache.clear_audio() == (1, 0)
+        assert not leak.exists()
+
+    def test_a_leaked_part_file_is_not_counted_as_a_song(self):
+        self._write("111.part")
+        assert MetadataCache().audio_count() == 0
 
     def test_every_extension_the_downloader_can_produce_is_owned(self):
         """If player._audio_extension grows a container, the delete list has
@@ -909,7 +969,7 @@ class TestOwnedFilesOnly:
 
     def test_half_written_files_go_too(self):
         cache = MetadataCache()
-        part = self._write("12.m4a.part")
+        part = self._write("12.part")
         cache.clear_audio()
         assert not part.exists()
 
@@ -940,6 +1000,539 @@ class TestOwnedFilesOnly:
         assert stuck.exists()
         assert not any(f.exists() for f in others)
         assert cache.audio_count() == 1, "the count must match what is really left"
+
+
+class TestTheCacheTracker:
+    """The tracker is the source of truth for intent; the disk is for existence.
+
+    Both halves are load-bearing. "Tracker decides" is what makes the settings
+    page cheap and eviction ordered by something better than `atime`. "Disk
+    decides existence" is Garrett's standing requirement that a song deleted
+    from the folder by hand is handled durably — it must not be reported as
+    present, played as though it exists, or counted against the budget for
+    ever.
+    """
+
+    def _song(self, cache, track_id, size=32, **stamp):
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{track_id}.m4a"
+        path.write_bytes(b"x" * size)
+        _stamp(cache, track_id, size=size, **stamp)
+        return path
+
+    def test_it_survives_a_round_trip_through_the_file(self):
+        cache = MetadataCache()
+        cache.note_cached(12, ".m4a", 4096, quality="LOSSLESS")
+        cache.note_played(12)
+        again = MetadataCache()
+        record = again.audio_record(12)
+        assert record["quality"] == "LOSSLESS"
+        assert record["bytes"] == 4096
+        assert record["plays"] == 1
+
+    def test_it_is_written_atomically_and_privately(self):
+        cache = MetadataCache()
+        cache.note_cached(12, ".m4a", 4096)
+        path = cache_mod.tracker_file()
+        assert path.exists()
+        assert oct(path.stat().st_mode)[-3:] == "600"
+        assert not list(path.parent.glob("audio.tmp"))
+
+    def test_a_corrupt_tracker_reads_as_empty_rather_than_raising(self):
+        cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_mod.tracker_file().write_text("{ not json")
+        assert MetadataCache().cached_usage() == (0, 0)
+
+    def test_it_is_not_the_metadata_index(self):
+        """Different settings gate them, so they cannot share a file: turning
+        the metadata index off must not blind eviction."""
+        cache = MetadataCache(metadata=False, songs=True)
+        cache.note_cached(12, ".m4a", 4096, quality="HIGH")
+        assert cache.audio_record(12)["quality"] == "HIGH"
+        assert not cache_mod.index_file().exists()
+
+    def test_metadata_only_mode_records_nothing(self):
+        cache = MetadataCache(metadata=True, songs=False)
+        cache.note_cached(12, ".m4a", 4096)
+        cache.note_played(12)
+        assert cache.audio_record(12) is None
+
+    # ── disk is the authority on existence ──
+
+    def test_a_song_deleted_by_hand_stops_being_claimed(self):
+        cache = MetadataCache()
+        path = self._song(cache, 12, size=100, plays=3, last=1_000)
+        assert cache.cached_usage() == (1, 100)
+
+        path.unlink()  # the user dragged it to the trash
+        dropped, adopted = cache.reconcile()
+
+        assert (dropped, adopted) == (1, 0)
+        assert cache.cached_usage() == (0, 0)
+        assert cache.audio_record(12) is None
+
+    def test_a_file_the_tracker_never_heard_of_is_adopted(self):
+        """A cache written before the tracker existed, or a crash between the
+        rename and the tracker write. Zero plays, and no known tier — unknown
+        is not the same as "whatever you have set now"."""
+        cache = MetadataCache()
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "77.m4a").write_bytes(b"x" * 64)
+
+        dropped, adopted = cache.reconcile()
+
+        assert (dropped, adopted) == (0, 1)
+        assert cache.audio_record(77)["plays"] == 0
+        assert cache.audio_record(77)["quality"] is None
+        assert cache.cached_usage() == (1, 64)
+
+    def test_a_size_that_changed_on_disk_is_corrected(self):
+        cache = MetadataCache()
+        path = self._song(cache, 12, size=100)
+        path.write_bytes(b"x" * 250)
+        cache.reconcile()
+        assert cache.cached_usage() == (1, 250)
+
+    def test_a_half_written_file_is_not_a_cached_song(self):
+        cache = MetadataCache()
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "12.part").write_bytes(b"x" * 64)
+        assert cache.reconcile() == (0, 0)
+        assert cache.cached_usage() == (0, 0)
+
+    def test_the_readout_costs_no_directory_walk(self, monkeypatch):
+        """The whole reason to maintain an index. The settings page reads
+        this on every paint."""
+        cache = MetadataCache()
+        self._song(cache, 12, size=100)
+        self._song(cache, 13, size=200)
+        monkeypatch.setattr(
+            cache_mod, "owned_audio_files",
+            lambda: pytest.fail("the settings readout walked the directory"))
+        assert cache.cached_usage() == (2, 300)
+
+    def test_eviction_takes_the_file_out_of_the_tracker_too(self, monkeypatch):
+        monkeypatch.setattr(cache_mod, "BYTES_PER_GB", 1024)
+        cache = MetadataCache(budget_gb=1)
+        self._song(cache, 12, size=2048, plays=1, last=1_000)
+
+        cache.enforce_budget()
+
+        assert cache.audio_record(12) is None, \
+            "the tracker went on claiming a song eviction had deleted"
+        assert cache.cached_usage() == (0, 0)
+
+    def test_clearing_the_cache_clears_the_tracker(self):
+        cache = MetadataCache()
+        self._song(cache, 12, size=100)
+        cache.clear_audio()
+        assert cache.cached_usage() == (0, 0)
+
+
+class TestPlayCountEviction:
+    """Garrett's rule: a point per play, and the oldest among the tracks with
+    the fewest plays goes first.
+
+    The reason it is not plain LRU, in his words: a four-hour binge on a new
+    playlist must not evict long-term staples. Under LRU it does.
+    """
+
+    def _song(self, cache, track_id, size, plays, last):
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{track_id}.m4a"
+        path.write_bytes(b"x" * size)
+        _stamp(cache, track_id, plays=plays, last=last, size=size)
+        return path
+
+    def _cache(self, monkeypatch, budget=1):
+        monkeypatch.setattr(cache_mod, "BYTES_PER_GB", 1024)
+        return MetadataCache(budget_gb=budget)
+
+    def test_the_staple_survives_the_binge(self, monkeypatch):
+        """The whole design, in one test. The staple was last played days
+        ago and would go first under LRU; it has twenty plays, so it stays."""
+        cache = self._cache(monkeypatch)
+        staple = self._song(cache, 1, 400, plays=20, last=1_000)
+        binge = [self._song(cache, i, 400, plays=1, last=9_000 + i)
+                 for i in range(2, 5)]
+
+        cache.enforce_budget()
+
+        assert staple.exists(), "a binge evicted a long-term staple"
+        assert sum(1 for p in binge if p.exists()) < 3
+
+    def test_within_the_same_play_count_the_oldest_goes(self, monkeypatch):
+        cache = self._cache(monkeypatch)
+        older = self._song(cache, 1, 700, plays=2, last=1_000)
+        newer = self._song(cache, 2, 700, plays=2, last=2_000)
+
+        cache.enforce_budget()
+
+        assert not older.exists()
+        assert newer.exists()
+
+    def test_one_play_goes_before_two_however_recent(self, monkeypatch):
+        cache = self._cache(monkeypatch)
+        once = self._song(cache, 1, 700, plays=1, last=9_999)
+        twice = self._song(cache, 2, 700, plays=2, last=1)
+
+        cache.enforce_budget()
+
+        assert not once.exists()
+        assert twice.exists()
+
+    def test_a_half_written_file_goes_before_any_song(self, monkeypatch):
+        cache = self._cache(monkeypatch)
+        song = self._song(cache, 1, 700, plays=0, last=0)
+        directory = cache_mod.audio_dir()
+        leak = directory / "999.part"
+        leak.write_bytes(b"x" * 700)
+
+        cache.enforce_budget()
+
+        assert not leak.exists()
+        assert song.exists()
+
+    def test_the_stamp_is_ours_not_the_filesystems(self, monkeypatch):
+        """`relatime` makes atime roughly daily-granular, which cannot order
+        a listening session — so the ordering must not move when atime does."""
+        cache = self._cache(monkeypatch)
+        loved = self._song(cache, 1, 700, plays=5, last=1_000)
+        spare = self._song(cache, 2, 700, plays=1, last=9_000)
+        os.utime(loved, (1, 1))          # ancient by the filesystem's reckoning
+        os.utime(spare, (2_000_000_000, 2_000_000_000))
+
+        cache.enforce_budget()
+
+        assert loved.exists(), "eviction fell back to atime"
+        assert not spare.exists()
+
+    def test_a_play_is_a_point_and_a_timestamp(self):
+        cache = MetadataCache()
+        before = time.time()
+        cache.note_played(12)
+        cache.note_played(12)
+        record = cache.audio_record(12)
+        assert record["plays"] == 2
+        assert record["last"] >= before
+
+
+class TestCacheAdmission:
+    """Refuse only under pressure — Garrett's decision, 2026-07-26.
+
+    With room in the budget nothing is refused, because at the moment a song
+    starts you know almost nothing about it. Under pressure the candidate has
+    to beat the cheapest thing already in there.
+    """
+
+    def _cache(self, monkeypatch, budget=1):
+        monkeypatch.setattr(cache_mod, "BYTES_PER_GB", 1024)
+        return MetadataCache(budget_gb=budget)
+
+    def _resident(self, cache, track_id, size, plays, last):
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{track_id}.m4a").write_bytes(b"x" * size)
+        _stamp(cache, track_id, plays=plays, last=last, size=size)
+
+    def test_with_room_to_spare_everything_is_cached(self, monkeypatch):
+        cache = self._cache(monkeypatch)
+        assert cache.should_cache(99, size=100) is True
+
+    def test_an_empty_cache_never_refuses(self, monkeypatch):
+        cache = self._cache(monkeypatch)
+        assert cache.should_cache(99, size=100_000) is True
+
+    def test_a_full_cache_of_staples_refuses_a_new_track(self, monkeypatch):
+        cache = self._cache(monkeypatch)
+        self._resident(cache, 1, 1024, plays=9, last=1_000)
+        assert cache.should_cache(99, size=100) is False
+
+    def test_a_full_cache_of_one_play_tracks_does_not_freeze(self, monkeypatch):
+        """The failure mode this rule had to avoid: a brand-new track has zero
+        plays, so a naive comparison refuses everything for ever and the cache
+        freezes into whatever it held the day it filled. The song being played
+        counts the play it is earning right now, so it displaces the oldest
+        *other* one-play track and nothing else."""
+        cache = self._cache(monkeypatch)
+        self._resident(cache, 1, 1024, plays=1, last=1_000)
+        assert cache.should_cache(99, size=100) is True
+
+    def test_a_track_does_not_have_to_beat_itself(self, monkeypatch):
+        """Replaying something already cached must not read as a newcomer
+        losing to itself."""
+        cache = self._cache(monkeypatch)
+        self._resident(cache, 1, 1024, plays=1, last=1_000)
+        assert cache.should_cache(1, size=100) is True
+
+    def test_song_caching_off_refuses_everything(self, monkeypatch):
+        cache = self._cache(monkeypatch)
+        cache.songs = False
+        assert cache.should_cache(99, size=1) is False
+
+    def test_a_zero_budget_refuses_everything(self, monkeypatch):
+        cache = self._cache(monkeypatch, budget=0)
+        assert cache.should_cache(99, size=1) is False
+
+    def test_the_rule_is_one_function(self):
+        """Admission and eviction must not drift apart: both read
+        `audio_value`, so a change to the rule is a change in one place."""
+        import inspect
+        source = inspect.getsource(MetadataCache.should_cache)
+        assert "audio_value" in source
+        assert "audio_value" in inspect.getsource(MetadataCache.enforce_budget)
+
+    def test_the_decision_can_be_asked_at_any_moment(self):
+        """Shaped for the scratch tier: the same question, asked at the end of
+        a track instead of the start, must need no new rule — only better
+        evidence, which is the play that has by then been counted."""
+        cache = MetadataCache()
+        at_start = cache.audio_value(12, playing=True)
+        cache.note_played(12)
+        at_end = cache.audio_value(12)
+        assert at_end[0] == at_start[0], \
+            "the play counted at track end must be the same one admission assumed"
+
+
+class _RecordingAudio:
+    """Stands in for AudioPlayer, recording what it was asked to play."""
+
+    def __init__(self):
+        self.plays = []
+        self.is_paused = False
+
+    def play_url(self, url, seek=0, title="", cache_key=None, local=None,
+                 quality=None):
+        self.plays.append({"url": url, "local": local, "quality": quality})
+
+
+def _streaming_track(tid, calls, quality="LOSSLESS", url="https://cdn/x.mp4"):
+    """A track whose `get_stream()` counts every time it is asked."""
+    track = _track(tid)
+
+    def get_stream():
+        calls.append(tid)
+        return types.SimpleNamespace(
+            audio_quality=quality,
+            get_stream_manifest=lambda: types.SimpleNamespace(
+                is_bts=True, get_urls=lambda: [url]))
+
+    track.get_stream = get_stream
+    return track
+
+
+def _cached_file(cache, track_id, quality="LOSSLESS", ext=".m4a", size=64):
+    directory = cache_mod.audio_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{track_id}{ext}"
+    path.write_bytes(b"x" * size)
+    _stamp(cache, track_id, plays=1, last=time.time(), quality=quality,
+           size=size, ext=ext)
+    return path
+
+
+class TestACachedTrackCostsNoRequest:
+    """Playing something already on this disk must not spend a `playbackinfo`.
+
+    Downloads were checked before the stream URL; the cache was not, so
+    `play_url` only discovered the cached file *after* it had been handed a
+    URL — and then ignored it. Replaying a 20-track cached playlist cost 20
+    requests it threw away, plus up to 20 more from the prefetch, against the
+    exact endpoint whose burst rate got the owner's IP blocked (INCIDENTS #1).
+    """
+
+    def _player_with(self, quality="LOSSLESS"):
+        p = HeadlessTidalPlayer(quality=quality)
+        p.session = _FakeSession(latency=0)
+        p._cache = MetadataCache(songs=True)
+        p.audio = _RecordingAudio()
+        return p
+
+    def _play(self, p, track):
+        p._play_track(track)
+        assert _wait_for(lambda: p.audio.plays or not p._track_changing)
+        _settle()
+
+    def test_a_cached_track_makes_no_request_at_all(self):
+        p = self._player_with()
+        path = _cached_file(p._cache, 12)
+        calls = []
+        self._play(p, _streaming_track(12, calls))
+
+        assert calls == [], "a cached track still asked TIDAL for a stream"
+        assert p.audio.plays[0]["local"] == str(path)
+        assert p.audio.plays[0]["url"] == ""
+
+    def test_a_track_that_is_not_cached_still_costs_one(self):
+        p = self._player_with()
+        calls = []
+        self._play(p, _streaming_track(12, calls))
+        assert calls == [12]
+        assert p.audio.plays[0]["url"] == "https://cdn/x.mp4"
+
+    def test_a_file_deleted_by_hand_falls_through_to_the_network(self):
+        """The tracker still claims it; the disk is what decides."""
+        p = self._player_with()
+        _cached_file(p._cache, 12).unlink()
+        calls = []
+        self._play(p, _streaming_track(12, calls))
+        assert calls == [12]
+        assert p.audio.plays[0]["local"] is None
+
+    def test_the_prefetch_does_not_spend_one_either(self):
+        p = self._player_with()
+        _cached_file(p._cache, 13)
+        calls = []
+        upcoming = _streaming_track(13, calls)
+        p._queue = [_track(12), upcoming]
+        p._queue_index = 0
+        p._current_track = p._queue[0]
+        p._current_track.duration = 100
+        p._playing = True
+        p._play_offset = 95   # inside PREFETCH_LEAD of the end
+
+        p._maybe_prefetch_next()
+        _settle()
+
+        assert calls == [], "the prefetch fetched a URL for a cached track"
+
+    def test_the_granted_tier_is_recorded_against_the_file(self):
+        p = self._player_with()
+        calls = []
+        self._play(p, _streaming_track(12, calls, quality="HIGH"))
+        assert p.audio.plays[0]["quality"] == "HIGH"
+
+
+class TestReplayingAtAHigherQuality:
+    """A copy stored below the tier now selected is re-fetched; one stored
+    above it is not; one whose tier was never recorded is left alone."""
+
+    def _player_with(self, quality):
+        p = HeadlessTidalPlayer(quality=quality)
+        p.session = _FakeSession(latency=0)
+        p._cache = MetadataCache(songs=True)
+        p.audio = _RecordingAudio()
+        return p
+
+    def test_a_low_copy_is_re_fetched_at_the_higher_setting(self):
+        p = self._player_with("HIRES")
+        _cached_file(p._cache, 12, quality="HIGH")
+        calls = []
+        p._play_track(_streaming_track(12, calls))
+        assert _wait_for(lambda: p.audio.plays)
+        _settle()
+        assert calls == [12], "the old lower-quality copy was served instead"
+        assert p.audio.plays[0]["local"] is None
+
+    def test_a_higher_copy_is_never_thrown_away_for_a_lower_setting(self):
+        """Listening at LOW for a while must not destroy a hi-res copy."""
+        p = self._player_with("LOW")
+        path = _cached_file(p._cache, 12, quality="HI_RES_LOSSLESS")
+        calls = []
+        p._play_track(_streaming_track(12, calls))
+        assert _wait_for(lambda: p.audio.plays)
+        _settle()
+        assert calls == []
+        assert p.audio.plays[0]["local"] == str(path)
+
+    def test_an_unrecorded_tier_is_left_alone(self):
+        """Every file cached before the tracker existed has no tier. Unknown
+        is not evidence of a downgrade, and re-fetching someone's whole
+        library on the strength of a missing field is not something to do
+        unasked — the settings page has an action for exactly that."""
+        p = self._player_with("HIRES")
+        path = _cached_file(p._cache, 12, quality=None)
+        calls = []
+        p._play_track(_streaming_track(12, calls))
+        assert _wait_for(lambda: p.audio.plays)
+        _settle()
+        assert calls == []
+        assert p.audio.plays[0]["local"] == str(path)
+
+    def test_a_tier_tidal_will_not_serve_does_not_cause_a_re_fetch(self):
+        """The gate has already seen a downgrade, so re-fetching would spend
+        a request to be handed the same thing back."""
+        p = self._player_with("HIRES")
+        p._quality_ceiling = "HIGH"
+        path = _cached_file(p._cache, 12, quality="HIGH")
+        calls = []
+        p._play_track(_streaming_track(12, calls))
+        assert _wait_for(lambda: p.audio.plays)
+        _settle()
+        assert calls == []
+        assert p.audio.plays[0]["local"] == str(path)
+
+    def test_the_replacement_leaves_no_second_copy_behind(self, monkeypatch):
+        """`_cached_audio_path` globs by stem, so a re-fetch that lands under
+        a different extension would leave the stale file as a possible
+        answer."""
+        _fake_get(monkeypatch, content_type="audio/flac")
+        audio = player_mod.AudioPlayer("mpv", cache=MetadataCache(songs=True))
+        stale = cache_mod.audio_dir()
+        stale.mkdir(parents=True, exist_ok=True)
+        (stale / "12.m4a").write_bytes(b"old")
+
+        audio._start_download(URL, 12, audio._download_gen, quality="LOSSLESS")
+
+        assert _wait_for(lambda: (stale / "12.flac").exists())
+        _settle()
+        assert not (stale / "12.m4a").exists(), "the old copy is still there"
+        assert audio.cache.audio_record(12)["quality"] == "LOSSLESS"
+
+
+class TestPlaysAreCountedOnce:
+    def _player(self):
+        p = HeadlessTidalPlayer()
+        p._cache = MetadataCache(songs=True)
+        p._current_track = _track(12)
+        p._current_track.duration = 200
+        p._playing = True
+        return p
+
+    def test_a_skip_is_not_a_play(self):
+        p = self._player()
+        p._play_offset = 5
+        p._maybe_count_play()
+        assert p._cache.audio_record(12) is None
+
+    def test_a_listen_is(self):
+        p = self._player()
+        p._play_offset = cache_mod.PLAY_COUNTS_AFTER + 1
+        p._maybe_count_play()
+        assert p._cache.audio_record(12)["plays"] == 1
+
+    def test_it_is_counted_once_however_many_ticks_go_past(self):
+        p = self._player()
+        p._play_offset = cache_mod.PLAY_COUNTS_AFTER + 1
+        for _ in range(20):
+            p._maybe_count_play()
+        assert p._cache.audio_record(12)["plays"] == 1
+
+    def test_the_next_track_gets_its_own_point(self):
+        p = self._player()
+        p._play_offset = cache_mod.PLAY_COUNTS_AFTER + 1
+        p._maybe_count_play()
+        p._play_gen += 1  # what _play_track does
+        p._maybe_count_play()
+        assert p._cache.audio_record(12)["plays"] == 2
+
+    def test_a_short_track_counts_at_half_way(self):
+        p = self._player()
+        p._current_track.duration = 20
+        p._play_offset = 11
+        p._maybe_count_play()
+        assert p._cache.audio_record(12)["plays"] == 1
+
+    def test_metadata_only_mode_counts_nothing(self):
+        p = self._player()
+        p._cache = MetadataCache(metadata=True, songs=False)
+        p._play_offset = 500
+        p._maybe_count_play()
+        assert p._cache.audio_record(12) is None
 
 
 class TestDisableSongsPrompt:
@@ -1065,7 +1658,9 @@ class TestClearCacheAction:
         p._cache.invalidate_audio_count()
         rendered = p._build_settings_display().plain
         # like "[o] log out", with what the cache is actually costing
-        assert "1 song cached · 0.000 GB   [x] clear cache" in rendered
+        # like "[o] log out", with what the cache is actually costing
+        assert "Cache         1 song  · 0.000 GB of 2.000 GB   [x] clear" \
+            in rendered
 
     def test_the_footer_still_fits_eighty_columns(self):
         """The settings footer is already exactly as wide as the panel allows,
@@ -1189,14 +1784,15 @@ class TestDiskUsageOnScreen:
     def test_an_empty_cache_reads_zero(self):
         p = self._settings()
         rendered = p._build_settings_display().plain
-        assert "0 songs cached · 0.000 GB" in rendered
+        assert "Cache         0 songs · 0.000 GB of 2.000 GB" in rendered
 
     def test_the_total_is_what_is_really_on_disk(self):
         p = self._settings()
         self._song("12.m4a", size=3 * 1024 ** 2)
         self._song("13.m4a", size=1024 ** 2)
         p._cache.invalidate_audio_count()
-        assert "2 songs cached · 0.004 GB" in p._build_settings_display().plain
+        assert "Cache         2 songs · 0.004 GB" \
+            in p._build_settings_display().plain
 
     def test_the_row_fits_eighty_columns_even_when_full(self, monkeypatch):
         """A full cache reads longer than an empty one — 12.500 GB across a
@@ -1212,9 +1808,9 @@ class TestDiskUsageOnScreen:
             console.print(p._build_display())
         lines = cap.get().splitlines()
         assert all(len(line) <= 80 for line in lines)
-        matched = [l for l in lines if "clear cache" in l]
+        matched = [l for l in lines if "[x] clear" in l]
         assert matched, "the cache line is missing"
-        assert "9999 songs cached · 12.500 GB" in matched[0], "the row wrapped"
+        assert "9999 songs · 12.500 GB" in matched[0], "the row wrapped"
 
     def test_it_is_measured_once_and_remembered(self, monkeypatch):
         """No stat-per-frame: the settings page repaints on every keystroke."""
@@ -1242,7 +1838,8 @@ class TestDiskUsageOnScreen:
         p._handle_settings_key("x")
         p._handle_key("y")
 
-        assert "0 songs cached · 0.000 GB" in p._build_settings_display().plain
+        assert "Cache         0 songs · 0.000 GB" \
+            in p._build_settings_display().plain
 
     def test_eviction_moves_the_number_back(self):
         cache = MetadataCache(budget_gb=0)

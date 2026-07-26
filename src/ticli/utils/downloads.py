@@ -136,14 +136,18 @@ def download_dir() -> Path:
 
 
 def display_dir() -> str:
-    """The download folder the way a person says it — `~/Music/Ticli`. The
-    settings page and the download screen both show a path, and an absolute
-    one wraps onto two lines for no information."""
-    path = download_dir()
-    try:
-        return "~/" + str(path.relative_to(Path.home()))
-    except ValueError:
-        return str(path)
+    """The download folder as a full absolute path.
+
+    Garrett asked for the absolute path rather than `~/Music/Ticli`: the
+    folder is user-owned, and a path you can paste into Finder or a terminal
+    is worth the columns.
+
+    `expanduser()`, deliberately **not** `resolve()`. On macOS `resolve()`
+    rewrites `/Users/garrett/Music/Ticli` to
+    `/System/Volumes/Data/Users/garrett/Music/Ticli` through the firmlink —
+    accurate, and unreadable. `expanduser()` is already absolute.
+    """
+    return str(download_dir().expanduser())
 
 
 def index_file() -> Path:
@@ -258,29 +262,35 @@ def _save_index(tracks: dict) -> None:
         logger.debug("Could not write the download index: %s", e)
 
 
-def record(track_id, relpath: Path, quality: str, size: int) -> None:
-    """Remember a finished download. Whole-dict replacement, no locks."""
+def record(track_id, relpath: Path, quality: str, size: int,
+           granted=None) -> None:
+    """Remember a finished download. Whole-dict replacement, no locks.
+
+    Two tiers are recorded and they are not the same thing. `quality` is the
+    tier the **user asked for** (`LOW`/`HIGH`/`LOSSLESS`/`HIRES`, the settings
+    spelling) and is what the screen says. `granted` is the tier TIDAL
+    actually **served**, in tidalapi's own spelling — the only one that can be
+    compared against anything, and the only honest answer to "is this file
+    below the quality I have set now?". A device-flow session asks for hi-res
+    and is handed `HIGH`; recording the request would make that file look
+    like something it is not, for ever.
+    """
     if track_id is None:
         return
     tracks = dict(load_index())
     tracks[str(track_id)] = {
-        "path": str(relpath), "quality": quality, "bytes": int(size),
-        "at": time.time(),
+        "path": str(relpath), "quality": quality, "granted": granted,
+        "bytes": int(size), "at": time.time(),
     }
     _save_index(tracks)
 
 
-def path_for(track_id):
-    """The downloaded file for this track, or None.
+def _entry_path(entry):
+    """The file an index record points at, if it is really there.
 
-    Stats the file every time. The index is a hint about where to look, never
-    an answer about what exists — which is the whole of "manual deletion is
-    handled durably": a file the user removed is not downloaded, and the next
-    thing that wants it fetches it.
+    Split out of `path_for` because the whole-folder readouts need it without
+    paying for another `load_index()` each — see `usage()`.
     """
-    if track_id is None:
-        return None
-    entry = load_index().get(str(track_id))
     if not isinstance(entry, dict):
         return None
     relative = entry.get("path")
@@ -293,23 +303,63 @@ def path_for(track_id):
         return None
 
 
-def downloaded_count() -> int:
-    """How many recorded downloads are really on disk."""
-    return sum(1 for tid in load_index() if path_for(tid) is not None)
+def path_for(track_id):
+    """The downloaded file for this track, or None.
+
+    Stats the file every time. The index is a hint about where to look, never
+    an answer about what exists — which is the whole of "manual deletion is
+    handled durably": a file the user removed is not downloaded, and the next
+    thing that wants it fetches it.
+    """
+    if track_id is None:
+        return None
+    return _entry_path(load_index().get(str(track_id)))
 
 
-def total_bytes() -> int:
-    """What the download folder is costing, from the files that are there."""
+def usage() -> tuple:
+    """`(how many downloads are really on disk, what they cost)`.
+
+    **One** index read for both numbers, and one `stat` per entry. The two
+    readouts used to call `path_for` per track, and `path_for` re-read and
+    re-parsed the whole JSON file every call — so a settings-page repaint was
+    2(N+1) reads and 2(N+1) parses of an O(N)-sized file:
+
+        50 downloads     4.54 ms per repaint
+        200 downloads   42.70 ms
+        500 downloads  229.48 ms
+
+    paid **twice a second** while the page is open, because `_repaint` builds
+    the display before deciding whether the frame changed. That is the same
+    order as the 231 ms keypress latency `auto_refresh=False` existed to
+    remove (bd4f95f), on the UI thread, in a new place.
+
+    The semantics are unchanged and deliberately so: every file is still
+    stat-ed, and the index is still only a hint about where to look. Kept
+    pure — the remembering is the caller's, on the player instance, because
+    module-level memo state would outlive a test and leak into the next one.
+    """
+    count = 0
     total = 0
-    for tid in load_index():
-        path = path_for(tid)
+    for entry in load_index().values():
+        path = _entry_path(entry)
         if path is None:
             continue
+        count += 1
         try:
             total += path.stat().st_size
         except OSError:
             continue
-    return total
+    return count, total
+
+
+def downloaded_count() -> int:
+    """How many recorded downloads are really on disk."""
+    return usage()[0]
+
+
+def total_bytes() -> int:
+    """What the download folder is costing, from the files that are there."""
+    return usage()[1]
 
 
 # ── estimates ──

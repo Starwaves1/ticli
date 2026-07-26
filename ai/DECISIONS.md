@@ -92,7 +92,36 @@ Last updated: 2026-07-24 (initial brainstorm with Garrett).
       `seek 0 absolute` on TIDAL streams (NACK → audible-gap respawn
       fallback, still correct) and ffplay `-volume` acceptance.
 
-## Downloads + play-count eviction (downloads **built** 2026-07-26)
+## Downloads + play-count eviction (both **built** 2026-07-26)
+
+**Eviction and admission shipped**, on a **cache tracker** —
+`CACHE_DIR/audio.json`, Garrett's framing: *"caching needs a cache tracker and
+the actual cached files… the cached files are merely a downstream result of
+that."* Per track it holds the extension, the tier TIDAL granted, the size,
+the play count and our own last-played stamp. It is the authority on **intent
+and metadata**; the disk stays the authority on **existence**, which is how
+his other standing requirement — *songs deleted from the folder by hand must
+be handled durably* — survives. `MetadataCache.reconcile()` is the one place
+the two meet: entries with no file are dropped, files with no entry are
+adopted at zero plays and no known tier, sizes are corrected. Daemon thread at
+startup; never a directory walk on a paint.
+
+**The rule as built.** `audio_value(track_id, playing)` → `(plays, last
+played)`, one function read by both eviction and admission so they cannot
+drift. Eviction takes the lowest value first: fewest plays, then oldest — his
+original design, and not LRU, because a four-hour binge must not evict
+staples. A half-written `.part` sorts below every song. A play is counted
+once, on the monitor's existing tick, after 30 seconds (or half of a shorter
+track): **a skip is not a play**. The stamp is ours, never `atime`.
+
+**Admission refuses only under pressure**, as decided below. The freeze
+problem — a new track has zero plays, so a full cache would refuse everything
+for ever — is answered by `playing=True`: *the song being listened to counts
+the play it is earning right now*, so it displaces the oldest **other**
+one-play track and nothing else. Same rule, no special case, no scratch tier
+needed. And deliberately expressible at any moment, so moving the decision to
+track end (where "was it really listened to?" is answerable) is a change of
+caller and not of rule — `_admit()` is that single caller.
 
 **Downloads shipped.** `[d]` from the player, browse, artist and queue screens
 opens a single-column quality picker, cursor pre-placed on the settings tier;
@@ -139,7 +168,7 @@ Size estimates cost **zero requests** (duration × nominal bitrate, −0.3% to
 −2.1% error on AAC; duration already in the cache index) so all four tiers
 can be shown at once — label with `~`.
 
-## Cache admission (Garrett, 2026-07-26 — partially decided)
+## Cache admission (Garrett, 2026-07-26 — **built** 2026-07-26)
 
 Eviction was deferred earlier; admission came up from the other end:
 
@@ -155,15 +184,19 @@ on its first day), so an unconditional value test would freeze the cache into
 whatever it held the day the rule was turned on. Only under pressure do both
 sides have a history to compare.
 
-**Still open, Garrett is thinking about it:** the value function itself, shared
-by eviction and admission. Candidates discussed — cache on second play; cache
-only if the track was played most of the way through; plays-then-oldest (his
-original eviction design). Also open: whether the downloads tier
-(`~/Music/Ticli`) sits outside admission entirely, the way it already sits
-outside eviction and the budget.
+**Settled and built 2026-07-26:** the value function is **plays-then-oldest**,
+his original eviction design, shared by both halves as one function
+(`audio_value`). The candidates that lost: "cache on second play" is the
+freeze in another costume, and "played most of the way through" is a better
+signal but is not available at the moment the download starts — it becomes
+available if the decision moves to track end, which the code is shaped for
+and which changes the *caller*, not the rule.
+
+The downloads tier stays outside admission entirely, the way it is already
+outside eviction and the budget: `~/Music/Ticli` is not reachable from
+`owned_audio_files()`, and nothing in the admission path looks at it.
 
 **Both halves matter to him** — "Both eviction and admission are important."
-Do not build either until the value function is settled.
 
 ## Single-fetch playback + the scratch tier (Garrett, 2026-07-26 — proposed)
 

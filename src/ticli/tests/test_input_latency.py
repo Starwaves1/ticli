@@ -55,7 +55,8 @@ class _FakeAudio:
         self.plays = []
         self.is_paused = False
 
-    def play_url(self, url, seek=0, title="", cache_key=None, local=None):
+    def play_url(self, url, seek=0, title="", cache_key=None, local=None,
+                 quality=None):
         self.plays.append((url, seek, title))
 
 

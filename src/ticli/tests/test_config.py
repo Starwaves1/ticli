@@ -772,7 +772,7 @@ class TestVolumeAboveUnity:
 
         monkeypatch.setattr(player_mod.subprocess, "Popen", _Proc)
         audio = AudioPlayer("mpv", volume=250)
-        monkeypatch.setattr(audio, "_start_download", lambda *a: None)
+        monkeypatch.setattr(audio, "_start_download", lambda *a, **kw: None)
         audio.play_url("https://cdn.example/t.mp4")
         assert f"--volume-max={player_mod.VOLUME_MAX}" in spawned["cmd"]
         assert "--volume=250" in spawned["cmd"]
