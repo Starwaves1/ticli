@@ -104,6 +104,13 @@ SETTINGS_SPEC: list[dict] = [
         "desc": "Playback volume. Instant on mpv; ffplay takes it from the next track.",
     },
     {
+        "key": "show_artwork",
+        "label": "Album art",
+        "kind": "bool",
+        "default": True,
+        "desc": "Show the album cover as pixel art. Needs a 256-colour terminal and room for it.",
+    },
+    {
         "key": "cache_metadata",
         "label": "Cache metadata",
         "kind": "bool",

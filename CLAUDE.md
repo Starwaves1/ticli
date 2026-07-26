@@ -13,6 +13,7 @@ Ticli: a terminal music player for TIDAL. Streams lossless/hi-res audio directly
   - `ticli/cli.py` — Click CLI entry point
   - `ticli/utils/credential_store.py` — Secure OAuth token storage
   - `ticli/utils/cache.py` — On-disk metadata/audio cache + budget
+  - `ticli/utils/artwork.py` — Cover art: JPEG decode, pixel art, art cache
   - `ticli/tests/` — E2E tests
 
 ## Commands
@@ -44,6 +45,43 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
   media keys / AirPods taps / Control Center reach it. Ticli rebinds those keys over
   IPC (`keybind`) to write `user-data/ticli/media-key`, which `_monitor_playback` polls
   on its existing 0.5s tick. Gated on `IS_MACOS`; a silent no-op elsewhere and on ffplay.
+
+### Album artwork
+
+`utils/artwork.py` paints the cover above the track line as half-block pixel
+art (`▀`, foreground = top pixel, background = bottom pixel, so one cell is
+two pixels). On by default; `show_artwork` in `SETTINGS_SPEC` toggles it live.
+
+No new dependency was added to get there. TIDAL serves covers as JPEG from
+`resources.tidal.com` — unauthenticated, so no API call is involved, only
+`album.cover` — and the stdlib cannot decode a JPEG, so this module does. It
+never needs full resolution: the DC coefficient of an 8x8 block *is* that
+block's mean, so decoding only the DC terms yields the image at 1/8 scale
+(measured against ffmpeg: within 1/255 on real covers). The images TIDAL
+sends are progressive (SOF2), whose **first scan is the DC scan**, so the
+decoder reads one scan of a 320x320 file — about 2 ms — and stops. Baseline
+JPEG works too (DCs kept, ACs stepped over). Anything else (arithmetic
+coding, lossless, 12-bit) falls through to ffmpeg if it happens to be
+installed, and to no artwork if it isn't; ffmpeg is not a dependency.
+
+Fetch, decode and rescale all happen on a daemon thread — the paint that
+wants a picture starts one and returns None, and the thread `_wake()`s the
+loop when it lands, because `Live` runs with `auto_refresh=False`. It is
+guarded by `_artwork_request`, a whole-tuple compare of `(cover, cols,
+rows)`, so repaints don't re-fetch and a resize or a track change makes an
+in-flight result stale rather than wrong. Renderings are cached on disk in
+`CACHE_DIR/artwork` as `{cover}-{cols}x{rows}.art` (hex pixels, atomic
+write, 0o600) — keyed on the size because the pixels *are* the render.
+Deliberately outside `audio_dir()`: the song count, `total_bytes` and
+eviction are about audio, and artwork keeps its own `MAX_ART_FILES` ceiling
+instead. `MetadataCache.clear()` clears it; `clear_artwork()` only unlinks
+`.art`/`.tmp`, never the directory.
+
+Every failure is a missing picture, never an error: no cover, no colour
+(Rich reports the terminal's `color_system`; truecolor and 256 render, 16
+and none don't), a terminal too small (`art_size`), an offline fetch, an
+undecodable file. Art is only drawn in full player mode — not in the mini
+player, not above a list.
 
 ### Caching
 
@@ -92,6 +130,7 @@ delete itself.
 | `cli.py` | CLI entry point |
 | `utils/credential_store.py` | OAuth token storage (keychain + fallback) |
 | `utils/cache.py` | Metadata cache, cached audio, budget + eviction |
+| `utils/artwork.py` | JPEG decoder, cover art rendering + its own disk cache |
 
 ## Testing
 

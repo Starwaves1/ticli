@@ -70,6 +70,7 @@ from ticli.utils.config import (
     save_config,
 )
 from ticli.utils.cache import MetadataCache, format_gb
+from ticli.utils import artwork
 
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
@@ -825,6 +826,14 @@ class HeadlessTidalPlayer:
         # Neither touches the setting or the disk until the answer comes back
         self._disable_songs_pending = False
         self._clear_cache_pending = False
+        # Album art. _artwork is (cover_id, cols, rows, pixels-or-None) and is
+        # only ever replaced whole, by the fetch thread; _artwork_request is
+        # the key that thread was started for, so a repaint at the same size
+        # for the same cover never starts a second one. A stored None means
+        # "asked, and there is nothing to show" — not "ask again".
+        self._show_artwork = self.config["show_artwork"]
+        self._artwork = None
+        self._artwork_request = None
         # Mini player mode
         self._mini_player = False
         # Show more controls
@@ -1369,6 +1378,62 @@ class HeadlessTidalPlayer:
             return self._play_offset + (time.time() - self._play_start_time)
         return self._play_offset
 
+    def _artwork_text(self):
+        """The current cover as half-block pixel art, or None.
+
+        None is the normal answer for most of a track's first second: nothing
+        is fetched on this thread. The first paint that wants artwork starts a
+        daemon thread and returns None; when that thread lands it assigns the
+        pixels and wakes the loop, and the next paint has a picture. Every
+        reason there might never be one — no cover, no colour, no room, a
+        failed fetch, an undecodable image — comes out here as None too.
+        """
+        if (not self._show_artwork or self._mini_player
+                or self._mode != self.MODE_PLAYER):
+            return None
+        cover = artwork.cover_id_of(self._current_track)
+        if not cover or not artwork.supports_art(self.console):
+            return None
+        try:
+            width, height = self.console.size
+        except Exception:
+            return None
+        size = artwork.art_size(width, height)
+        if size is None:  # terminal too small to give artwork the room
+            return None
+        cols, rows = size
+        ready = self._artwork
+        if ready is not None and ready[:3] == (cover, cols, rows):
+            # A stored None is an answered question: this cover has no art
+            return artwork.render(ready[3], indent=3) if ready[3] else None
+        self._request_artwork(cover, cols, rows)
+        return None
+
+    def _request_artwork(self, cover: str, cols: int, rows: int):
+        """Fetch and render one cover at one size, off the UI thread.
+
+        Guarded by the request key rather than a lock: the same key means the
+        thread already running will answer it, and a different one (new track,
+        resized terminal) makes whatever that thread returns stale, which it
+        checks for itself before assigning anything.
+        """
+        key = (cover, cols, rows)
+        if self._artwork_request == key:
+            return
+        self._artwork_request = key
+
+        def _run():
+            try:
+                pixels = artwork.load(cover, cols, rows)
+            except Exception:
+                pixels = None  # artwork never takes the player down with it
+            if self._artwork_request != key:
+                return
+            self._artwork = (cover, cols, rows, pixels)
+            self._wake()
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _build_player_display(self) -> Text:
         s = self._current_track
         title = s.name if s else "No track"
@@ -1446,6 +1511,10 @@ class HeadlessTidalPlayer:
                 up_next.append(f" \u2022 {t_artist}", style="dim")
 
         content = Text()
+        art = self._artwork_text()
+        if art is not None:
+            content.append_text(art)
+            content.append("\n\n")
         content.append_text(track_line)
         content.append("\n")
         content.append_text(album_line)
@@ -2465,6 +2534,13 @@ class HeadlessTidalPlayer:
             self._page_size = value
         elif key == "progress_bar_width":
             self._bar_width = value
+        elif key == "show_artwork":
+            self._show_artwork = value
+            if not value:
+                # Forget both the picture and the request that produced it, so
+                # turning it back on re-asks rather than showing a stale cover
+                self._artwork = None
+                self._artwork_request = None
         elif key == "volume":
             if self.audio:
                 self.audio.set_volume(value)
