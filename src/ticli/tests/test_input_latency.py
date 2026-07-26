@@ -225,10 +225,16 @@ class TestPlayTrackOffUiThread:
 
     def _track(self, tid, delay=0.0, url="http://stream"):
         t = _fake_track(tid)
-        def get_url():
+
+        def get_stream():
             time.sleep(delay)
-            return url
-        t.get_url = get_url
+            manifest = types.SimpleNamespace(is_bts=True, get_urls=lambda: [url])
+            return types.SimpleNamespace(
+                audio_quality="HIGH",
+                get_stream_manifest=lambda: manifest,
+            )
+
+        t.get_stream = get_stream
         return t
 
     def test_ui_thread_returns_before_the_network_call_finishes(self):

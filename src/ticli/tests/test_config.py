@@ -860,8 +860,9 @@ class TestCLIQuality:
         seen = {}
 
         class _FakePlayer:
-            def __init__(self, quality=None):
+            def __init__(self, quality=None, login_flow=None):
                 seen["quality"] = quality
+                seen["login_flow"] = login_flow
 
             def run(self):
                 seen["ran"] = True

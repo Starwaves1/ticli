@@ -16,7 +16,7 @@ import time
 import threading
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,7 @@ KEY_SHIFT_TAB = "\x1b[Z"
 
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
+    QUALITY_CHOICES,
     SETTINGS_SPEC,
     coerce,
     cycle_value,
@@ -133,6 +134,47 @@ PREV_RESTART_SECONDS = 30
 PREFETCH_LEAD = 20
 PREFETCH_MAX_AGE = 90
 
+# Login flows. "device" is the default: a code you type on your phone, nothing
+# to paste back, and it is what every saved session already used. Only "pkce"
+# can reach FLAC, though — the device flow's TIDAL client is entitled to AAC
+# and no more, and TIDAL answers its LOSSLESS requests with HIGH rather than
+# with an error. So PKCE is offered as a deliberate upgrade from the settings
+# page (or asked for up front with --login-flow pkce), never chosen for you.
+LOGIN_FLOWS = ("device", "pkce")
+
+# How many times a bad paste can be retried before the PKCE prompt gives up.
+# A one-time code is easy to truncate when it is being relayed by hand.
+PKCE_PASTE_TRIES = 3
+
+# A lossless stream arrives as an MPEG-DASH manifest — a list of fragmented-MP4
+# segment URLs rather than a file. Written out as an HLS playlist, which is the
+# one segmented format ffmpeg (and therefore both backends) can demux, in a
+# per-process directory so two ticlis can't tread on each other. Only the
+# newest few survive each write: a playlist is worthless once its segment URLs
+# expire an hour later, and pruning on write means no timer.
+HLS_KEEP = 4
+# Version 7 is the floor for #EXT-X-MAP, and #EXT-X-MAP is not optional here:
+# the segments are fMP4 fragments with no moov of their own, so without the
+# initialization segment every one of them is undecodable on its own. That is
+# exactly how this broke — ffmpeg reported "trun track id unknown, no tfhd was
+# found" for each segment in turn and played nothing.
+HLS_VERSION = 7
+# ffmpeg refuses to follow a local playlist out to the network unless the
+# protocols are named. The default whitelist for a file input is
+# "file,crypto,data", which silently turns every segment into an error.
+HLS_PROTOCOLS = "file,http,https,tcp,tls,crypto"
+HLS_SUFFIX = ".m3u8"
+# How much of the backend's own complaint fits on the toast line, and how long
+# it stays up — longer than an ordinary toast, because it is the only notice
+# that the thing the user asked for did not happen.
+PLAYER_ERROR_CHARS = 90
+PLAYER_ERROR_SECONDS = 8.0
+
+# Ascending, so "did TIDAL give us less than we asked for?" is a comparison.
+# Keys are tidalapi's own Quality values, which is what a Stream reports back
+# as the tier it actually granted.
+QUALITY_RANK = {"LOW": 0, "HIGH": 1, "LOSSLESS": 2, "HI_RES_LOSSLESS": 3}
+
 # Input / repaint timing. The idle poll doubles as the repaint tick, so it is
 # capped at the monitor thread's own 0.5s cadence — an idle player wakes twice
 # a second and writes nothing unless the screen actually changed.
@@ -154,18 +196,19 @@ SEARCH_FETCH_MIN_INTERVAL = 1.0
 ESC_TAIL_SECONDS = 0.05
 
 
-# Audio downloads. TIDAL serves a track as one contiguous, unencrypted HTTP
-# file, so keeping a copy is a plain GET — no ffmpeg, no remux, and nothing
-# that depends on which player is running.
+# Audio downloads. TIDAL serves a track unencrypted over plain HTTP — as one
+# file, or as a run of segments that concatenate into one — so keeping a copy
+# is a GET (or a run of them). No ffmpeg, no remux, and nothing that depends
+# on which player is running.
 DOWNLOAD_CHUNK = 256 * 1024
 # (connect, read). Generous on read: a slow link should finish the download
 # late, not abandon it. Nothing waits on either.
 DOWNLOAD_TIMEOUT = (10, 60)
 
 # What the CDN says the bytes are → the extension they belong in. The file is
-# named for what actually arrived, never for what was asked for: this session
-# gets AAC-in-MP4 even when it requests lossless, and a session entitled to
-# FLAC would get FLAC through the same code.
+# named for what actually arrived, never for what was asked for: a device-flow
+# session gets AAC-in-MP4 even when it requests lossless, and a PKCE one gets
+# FLAC-in-MP4 through the same code.
 AUDIO_MIME_EXTENSIONS = {
     "audio/mp4": ".m4a",
     "audio/m4a": ".m4a",
@@ -200,6 +243,90 @@ def _audio_extension(content_type: Optional[str], url: str) -> str:
             return AUDIO_MIME_EXTENSIONS[mime]
     suffix = os.path.splitext(urlsplit(url or "").path)[1].lower()
     return AUDIO_URL_EXTENSIONS.get(suffix, DEFAULT_AUDIO_EXT)
+
+
+def _hls_playlist(dash) -> str:
+    """An HLS playlist for a decoded MPEG-DASH manifest.
+
+    Written here rather than taken from tidalapi's own `get_hls()`, which
+    omits the initialization segment's #EXT-X-MAP and lists it as if it were
+    audio — a playlist no ffmpeg build can decode a sample from. The URLs are
+    absolute and already signed, so everything the player needs is inside.
+    """
+    urls = list(getattr(dash, "urls", None) or [])
+    if not urls:
+        raise ValueError("segmented stream named no segments")
+    # tidalapi numbers the segment template from 0, and segment 0 *is* the
+    # initialization segment — same URL as the manifest's own `initialization`.
+    init = getattr(dash, "first_url", None) or urls[0]
+    media = urls[1:] if urls[0] == init else urls
+    if not media:
+        raise ValueError("segmented stream named no audio segments")
+    timescale = float(getattr(dash, "timescale", 0) or 44100)
+    full = float(getattr(dash, "chunk_size", 0) or 0) / timescale
+    last = float(getattr(dash, "last_chunk_size", 0) or 0) / timescale
+    # A duration of 0 would make the playlist a lie; fall back to the one the
+    # rest of the segments report, and to something sane if there is no such
+    # thing. Only the target duration has to be an over-estimate.
+    full = full or last or 10.0
+    last = last or full
+    lines = [
+        "#EXTM3U",
+        f"#EXT-X-VERSION:{HLS_VERSION}",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+        f"#EXT-X-TARGETDURATION:{int(max(full, last)) + 1}",
+        "#EXT-X-MEDIA-SEQUENCE:1",
+        f'#EXT-X-MAP:URI="{init}"',
+    ]
+    for index, url in enumerate(media):
+        lines.append("#EXTINF:%0.3f," % (last if index == len(media) - 1 else full))
+        lines.append(url)
+    lines.append("#EXT-X-ENDLIST")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _hls_segments(path: str) -> list:
+    """The remote segment URLs a local playlist names, initialization first.
+
+    Reading them back out of the playlist keeps a segmented stream a single
+    string everywhere else — the same path that is handed to the player is
+    all the downloader needs to fetch the whole track.
+    """
+    urls = []
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return urls
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-MAP:"):
+            _, _, rest = line.partition('URI="')
+            uri = rest.rpartition('"')[0]
+            if uri:
+                urls.insert(0, uri)
+        elif line and not line.startswith("#"):
+            urls.append(line)
+    return urls
+
+
+def _write_hls_playlist(track_id, playlist: str) -> str:
+    """Write a segmented stream's HLS playlist to a temp file and return its
+    path. Everything the player needs is inside it — the segment URLs are
+    absolute and already signed — so the path can be handed straight to
+    mpv/ffplay wherever a stream URL would have gone."""
+    directory = Path(tempfile.gettempdir()) / f"ticli-hls-{os.getpid()}"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = directory / f"{track_id}.m3u8"
+    path.write_text(playlist)
+    try:
+        by_age = sorted(directory.glob("*.m3u8"),
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+        for stale in by_age[HLS_KEEP:]:
+            stale.unlink()
+    except OSError:
+        pass  # a playlist that vanished under us needed deleting anyway
+    return str(path)
 
 
 class _DownloadSuperseded(Exception):
@@ -303,6 +430,12 @@ class AudioPlayer:
         # True when _cache_file is a kept track, so stop() must not delete it —
         # the whole point of having cached it
         self._cache_persistent = False
+        # Where the running player writes its complaints. Kept rather than
+        # discarded: a backend that cannot play what it was handed says so on
+        # stderr, and that sentence is the difference between a visible error
+        # and a UI that pretends to be playing silence.
+        self._stderr_path: Optional[str] = None
+        self._stderr_handle = None
 
     def volume_ceiling(self) -> int:
         """The loudest this backend can actually be told to go.
@@ -365,12 +498,25 @@ class AudioPlayer:
     def _start_download(self, url: str, cache_key, gen: int):
         """Fetch the whole track to disk on a daemon thread.
 
-        TIDAL hands out one contiguous, unencrypted URL, so this is a plain
-        GET: the bytes that land are the bytes it sent, byte for byte. That
-        makes it independent of the player process — mpv and ffplay both get
-        a cached track — and it needs no ffmpeg. Nothing waits on it, and the
-        file only becomes an answer once it is whole.
+        TIDAL hands out unencrypted URLs, so this is a plain GET: the bytes
+        that land are the bytes it sent, byte for byte. That makes it
+        independent of the player process — mpv and ffplay both get a cached
+        track — and it needs no ffmpeg. Nothing waits on it, and the file only
+        becomes an answer once it is whole.
+
+        A segmented (MPEG-DASH) stream is the same job with more requests:
+        the initialization segment followed by every media segment, written
+        end to end, *is* the fragmented MP4 file. Verified by playing the
+        result — both backends open it with no flags at all.
         """
+        if url.endswith(HLS_SUFFIX):
+            sources = _hls_segments(url)
+            if not sources:
+                return
+        elif url.startswith(("http://", "https://")):
+            sources = [url]
+        else:
+            return
         base = self._audio_cache_base(cache_key)
         keep = base is not None
         if not keep:
@@ -392,15 +538,22 @@ class AudioPlayer:
         def _run():
             path = None
             try:
-                with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
-                    response.raise_for_status()
-                    ext = _audio_extension(response.headers.get("Content-Type"), url)
-                    with open(part, "wb") as handle:
-                        for chunk in response.iter_content(DOWNLOAD_CHUNK):
-                            if self._download_gen != gen:
-                                raise _DownloadSuperseded()
-                            if chunk:
-                                handle.write(chunk)
+                ext = DEFAULT_AUDIO_EXT
+                with open(part, "wb") as handle:
+                    for index, source in enumerate(sources):
+                        with requests.get(source, stream=True,
+                                          timeout=DOWNLOAD_TIMEOUT) as response:
+                            response.raise_for_status()
+                            if index == 0:
+                                # The first segment describes the container the
+                                # whole file is going to be
+                                ext = _audio_extension(
+                                    response.headers.get("Content-Type"), source)
+                            for chunk in response.iter_content(DOWNLOAD_CHUNK):
+                                if self._download_gen != gen:
+                                    raise _DownloadSuperseded()
+                                if chunk:
+                                    handle.write(chunk)
                 path = base + ext
                 os.replace(part, path)
             except Exception as e:
@@ -432,6 +585,82 @@ class AudioPlayer:
                 self._sweep_cache()
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _open_stderr(self):
+        """A fresh file for the next player process to complain into.
+
+        One file per AudioPlayer, truncated per spawn, so nothing accumulates
+        and the contents always belong to the process now running. A pipe
+        would be wrong here: nothing reads it until the process is already
+        dead, and a full pipe buffer would wedge the player mid-track.
+        """
+        try:
+            if self._stderr_handle is not None:
+                self._stderr_handle.close()
+        except OSError:
+            pass
+        self._stderr_handle = None
+        try:
+            path = os.path.join(tempfile.gettempdir(), f"ticli-player-{os.getpid()}.log")
+            self._stderr_handle = open(path, "w+")
+            self._stderr_path = path
+            return self._stderr_handle
+        except OSError:
+            # Losing the log costs an error message, never playback
+            self._stderr_path = None
+            return subprocess.DEVNULL
+
+    def _last_stderr(self) -> str:
+        """The last thing the player said, trimmed to fit a toast."""
+        if not self._stderr_path:
+            return ""
+        try:
+            lines = [ln.strip() for ln in
+                     Path(self._stderr_path).read_text(errors="replace").splitlines()]
+        except OSError:
+            return ""
+        said = [ln for ln in lines if ln]
+        if not said:
+            return ""
+        return said[-1][:PLAYER_ERROR_CHARS]
+
+    def failure(self) -> Optional[str]:
+        """Why playback stopped, when it stopped because it failed.
+
+        None while the process is running, when it reached the end of the
+        track (exit 0), and when *we* ended it (a signal, i.e. a negative
+        return code — that is stop() and pause() doing their job). Anything
+        else is the backend refusing the stream, which the user has to be
+        told about rather than left listening to silence.
+        """
+        with self._lock:
+            process = self._process
+            if process is None:
+                return None
+            code = process.poll()
+            if code is None or code <= 0:
+                return None
+            detail = self._last_stderr()
+        return f"{self.player_cmd} error: {detail}" if detail else \
+            f"{self.player_cmd} exited with status {code}"
+
+    def _hls_flags(self) -> list:
+        """What each backend needs to demux a local HLS playlist.
+
+        Both end up in the same ffmpeg HLS demuxer; only the spelling differs.
+        mpv would otherwise treat an .m3u8 as a list of files to play one
+        after another, and each fMP4 fragment on its own is not a file any
+        demuxer can open.
+        """
+        if self.player_cmd == "mpv":
+            return [
+                "--demuxer=lavf", "--demuxer-lavf-format=hls",
+                # mpv's key-value lists split on commas, so the whitelist has
+                # to be passed length-prefixed to survive intact
+                f"--demuxer-lavf-o=protocol_whitelist="
+                f"%{len(HLS_PROTOCOLS)}%{HLS_PROTOCOLS}",
+            ]
+        return ["-protocol_whitelist", HLS_PROTOCOLS, "-f", "hls"]
 
     def cache_audio_dir(self):
         """The audio cache directory, created if needed. Private like the rest
@@ -468,6 +697,7 @@ class AudioPlayer:
             self._cache_persistent = have_kept
             if have_kept:
                 self._cache_file = kept
+            segmented = source.endswith(HLS_SUFFIX)
             if self.player_cmd == "mpv":
                 self._ipc_path = f"/tmp/ticli-mpv-{os.getpid()}.sock"
                 try:
@@ -475,30 +705,37 @@ class AudioPlayer:
                 except OSError:
                     pass
                 cmd = [
-                    "mpv", "--no-video", "--really-quiet",
+                    "mpv", "--no-video",
+                    # Not --really-quiet: that is what made a stream mpv
+                    # could not decode look exactly like one it could
+                    "--msg-level=all=error",
                     f"--input-ipc-server={self._ipc_path}",
                     # --volume-max first: mpv refuses anything above it, and
                     # its default ceiling (130) is below what the setting allows
                     f"--volume-max={VOLUME_MAX}",
                     f"--volume={self.volume}",
-                    source,
                 ]
+                if segmented:
+                    cmd += self._hls_flags()
                 if seek > 0:
-                    cmd.insert(-1, f"--start={seek}")
+                    cmd.append(f"--start={seek}")
+                cmd.append(source)
             else:  # ffplay
                 self._ipc_path = None
                 # Plays from `source`: a kept file when there is one, the URL
                 # otherwise — a download that has only just started can't
                 # satisfy a seek yet
-                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
                        "-volume", str(self._ffplay_volume())]
+                if segmented:
+                    cmd += self._hls_flags()
                 if seek > 0:
                     cmd += ["-ss", str(seek)]
                 cmd.append(source)
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=self._open_stderr(),
             )
             gen = self._download_gen
         # Off the lock and off this thread: fetching the track must never hold
@@ -508,13 +745,13 @@ class AudioPlayer:
 
     def _play_from_cache(self, seek: float):
         """Resume ffplay from local cached file at given position."""
-        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+        cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
                "-volume", str(self._ffplay_volume()), "-ss", str(seek),
                self._cache_file]
         self._process = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=self._open_stderr(),
         )
         self._play_start = time.time()
         self._paused = False
@@ -790,9 +1027,23 @@ class HeadlessTidalPlayer:
         "HIRES": "HI-RES",
     }
 
-    def __init__(self, quality: Optional[str] = None):
+    def __init__(self, quality: Optional[str] = None, login_flow: Optional[str] = None):
         self.console = Console()
         self.session = tidalapi.Session()
+        # Only consulted when there is no stored session to reuse, so it is a
+        # per-run flag rather than a setting: a settings row for it would sit
+        # there doing nothing on every run after the first. Moving an existing
+        # session onto PKCE is the settings page's job instead.
+        flow = (login_flow or LOGIN_FLOWS[0]).lower()
+        self._login_flow = flow if flow in LOGIN_FLOWS else LOGIN_FLOWS[0]
+        # Set once the TUI owns the terminal, so a PKCE sign-in from the
+        # settings page can hand it back for the length of a paste
+        self._live = None
+        self._tty_settings = None
+        # The best tier TIDAL has actually granted us, when that was less than
+        # what we asked for. None means "never seen a downgrade", which is the
+        # only honest default — the settings page gates nothing until then.
+        self._quality_ceiling: Optional[str] = None
         self.audio = None  # set after finding player
         self.running = True
         self._mode = self.MODE_PLAYER
@@ -938,50 +1189,246 @@ class HeadlessTidalPlayer:
         return f"User {u.id}"
 
     def _login(self) -> bool:
-        """Login to TIDAL via OAuth device flow."""
-        # Try loading existing session from secure storage
+        """Log in to TIDAL, reusing stored tokens when they still work.
+
+        Two flows can have issued those tokens and they refresh against
+        different TIDAL clients, so `is_pkce` has to survive the round trip
+        through the credential store. Get that wrong and nothing looks broken
+        until the access token expires, at which point the refresh is rejected
+        and the user is logged out mid-listen for no visible reason.
+        """
         data = load_tokens()
         if data:
             try:
+                previous_token = data.get("access_token")
                 self.session.load_oauth_session(
                     data["token_type"],
                     data["access_token"],
                     data.get("refresh_token"),
                     data.get("expiry_time"),
+                    is_pkce=data.get("is_pkce", False),
                 )
                 if self.session.check_login():
+                    # Loading may have refreshed on the way in; keep the stored
+                    # copy current so the next start doesn't repeat the round trip
+                    if self.session.access_token != previous_token:
+                        self._save_session()
                     self._user_display_name = self._get_user_display_name()
                     return True
             except Exception as e:
                 logger.debug("Failed to load saved session: %s", e)
 
-        # Fresh login
-        self.console.print("[cyan]Starting TIDAL login...[/cyan]")
-        login, future = self.session.login_oauth()
-        self.console.print(f"\n[bold yellow]Open this URL to login:[/bold yellow]")
-        self.console.print(f"[bold white]https://{login.verification_uri_complete}[/bold white]\n")
-        self.console.print(f"[dim]Or go to [bold]{login.verification_uri}[/bold] and enter code: [bold]{login.user_code}[/bold][/dim]\n")
-        self.console.print("[dim]Waiting for authorization...[/dim]")
+        # Fresh login. The device flow unless PKCE was asked for; a PKCE
+        # attempt that doesn't complete is never quietly downgraded, because a
+        # silent drop back to AAC is exactly the surprise this all exists to
+        # remove — the settings page can upgrade later, at a calmer moment.
+        if self._login_flow == "pkce":
+            if self._login_pkce():
+                return self._finish_login()
+            self.console.print(
+                "[red]Login cancelled.[/red] [dim]Run ticli again to retry, or "
+                "plain `ticli` for the quicker AAC-only sign-in.[/dim]"
+            )
+            return False
 
-        future.result()
-
-        if self.session.check_login():
-            # Save session to secure storage (keychain or chmod-600 file)
-            try:
-                data = {
-                    "token_type": self.session.token_type,
-                    "access_token": self.session.access_token,
-                    "refresh_token": self.session.refresh_token,
-                    "expiry_time": self.session.expiry_time.isoformat() if self.session.expiry_time else None,
-                }
-                save_tokens(data)
-            except Exception as e:
-                logger.warning("Failed to save session: %s", e)
-            self._user_display_name = self._get_user_display_name()
-            return True
+        if self._login_device():
+            return self._finish_login()
 
         self.console.print("[red]Login failed.[/red]")
         return False
+
+    def _finish_login(self) -> bool:
+        """Common tail of a fresh login: persist the tokens and name the user."""
+        if not self.session.check_login():
+            self.console.print("[red]Login failed.[/red]")
+            return False
+        self._save_session()
+        self._user_display_name = self._get_user_display_name()
+        return True
+
+    def _save_session(self) -> None:
+        """Write the current tokens to the keychain (or the chmod-600 file)."""
+        expiry = self.session.expiry_time
+        try:
+            save_tokens({
+                "token_type": self.session.token_type,
+                "access_token": self.session.access_token,
+                "refresh_token": self.session.refresh_token,
+                "expiry_time": expiry.isoformat() if hasattr(expiry, "isoformat") else expiry,
+                # Which flow issued these decides which client may refresh them
+                "is_pkce": bool(self.session.is_pkce),
+            })
+        except Exception as e:
+            logger.warning("Failed to save session: %s", e)
+
+    def _login_device(self) -> bool:
+        """Device-authorization login: a code typed on another device, nothing
+        to paste back. Smooth, but its TIDAL client is only entitled to AAC —
+        a LOSSLESS request from it comes back granted HIGH, without complaint."""
+        self.console.print("[cyan]Starting TIDAL login...[/cyan]")
+        try:
+            login, future = self.session.login_oauth()
+        except Exception as e:
+            logger.debug("Device login failed to start: %s", type(e).__name__)
+            return False
+        self.console.print("\n[bold yellow]Open this URL to login:[/bold yellow]")
+        self.console.print(f"[bold white]https://{login.verification_uri_complete}[/bold white]\n")
+        self.console.print(f"[dim]Or go to [bold]{login.verification_uri}[/bold] and enter code: [bold]{login.user_code}[/bold][/dim]\n")
+        self.console.print("[dim]Waiting for authorization...[/dim]")
+        try:
+            future.result()
+        except Exception as e:
+            logger.debug("Device login did not complete: %s", type(e).__name__)
+            return False
+        return True
+
+    def _login_pkce(self) -> bool:
+        """PKCE authorization-code login — the flow that reaches FLAC.
+
+        Driven a step at a time rather than through tidalapi's `login_pkce()`,
+        which prints with `print()` and reads with a bare `input()`: we want
+        Rich's output, a retry when the paste comes back short, and no
+        exception escaping into the caller with a live one-time code inside
+        its message.
+
+        There is no way around the paste. The redirect URI is fixed to
+        `https://tidal.com/android/login/auth` in tidalapi's config and is sent
+        again, unchanged, in the token exchange — where TIDAL matches it — so a
+        localhost listener cannot be substituted. It would be no use over SSH
+        anyway, which is how this player is often run.
+        """
+        try:
+            url = self.session.pkce_login_url()
+        except Exception as e:
+            logger.debug("Failed to build the PKCE login URL: %s", type(e).__name__)
+            return False
+
+        self.console.print("[cyan]Starting TIDAL sign-in for higher quality...[/cyan]")
+        self.console.print("\n[bold yellow]1.[/bold yellow] Open this URL and sign in:\n")
+        # markup off: the URL is data, not Rich markup. Soft wrap keeps it one
+        # logical line, so selecting it copies the whole thing.
+        self.console.print(url, markup=False, highlight=False, soft_wrap=True)
+        self.console.print(
+            "\n[bold yellow]2.[/bold yellow] TIDAL then sends you to a page that fails to load. "
+            "[dim]That is expected — the address bar is carrying your login code.[/dim]"
+            "\n[bold yellow]3.[/bold yellow] Copy that whole address and paste it below.\n"
+        )
+        self._open_browser(url)
+
+        for remaining in range(PKCE_PASTE_TRIES - 1, -1, -1):
+            try:
+                pasted = input("Paste the address (or just the code): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                self.console.print()
+                return False
+            if not pasted:
+                continue
+            # A bare code is accepted too: relaying the address by hand from a
+            # phone into an SSH session, the code is the only part worth typing.
+            redirect = pasted if "https://" in pasted else (
+                f"{self.session.config.pkce_uri_redirect}?code={quote(pasted)}"
+            )
+            try:
+                token = self.session.pkce_get_auth_token(redirect)
+                self.session.process_auth_token(token, is_pkce_token=True)
+                return True
+            except Exception as e:
+                # Type only — the exception text can quote the pasted address,
+                # and that address contains a live authorization code
+                logger.debug("PKCE token exchange failed: %s", type(e).__name__)
+                if remaining:
+                    self.console.print(
+                        f"[red]That didn't work.[/red] [dim]Copy the full address, "
+                        f"including everything after the '?'. {remaining} "
+                        f"{'try' if remaining == 1 else 'tries'} left.[/dim]"
+                    )
+        return False
+
+    def _upgrade_to_pkce(self) -> None:
+        """Sign in again over PKCE from inside the running player, keeping the
+        session you already have if it doesn't go through.
+
+        The paste needs a normal cooked terminal and a console to print to, so
+        the TUI stands down for the duration and comes back afterwards — the
+        one place in the app where the Live display is deliberately paused.
+        """
+        if self.session.is_pkce:
+            return
+        with self._suspended_tui():
+            upgraded = self._login_pkce() and self._finish_login()
+        if upgraded:
+            # A new entitlement means the old evidence is stale: whatever this
+            # session is granted has to be observed again from scratch, which
+            # is what un-gates the higher tiers without a restart.
+            self._quality_ceiling = None
+            # The queue and the playing track are untouched — the current
+            # signed URL keeps working and the next track picks the new session
+            # up on its own. Songs already cached are the one thing that does
+            # not improve, so say so rather than let him wonder.
+            self._set_toast(
+                "Signed in for higher quality — songs already cached still play "
+                "as before; [x] clears them", seconds=6)
+        else:
+            self._set_toast("Sign-in cancelled — still signed in as before")
+
+    def _suspended_tui(self):
+        """Stand the TUI down for a block of plain console I/O, then bring it
+        back. Terminal handling mirrors run()'s: cbreak while the player owns
+        the keyboard, the user's own settings while they are typing."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _suspend():
+            live = self._live
+            if live is not None:
+                live.stop()
+            self._restore_tty()
+            self.console.print()
+            try:
+                yield
+            finally:
+                self._raw_tty()
+                self.console.clear()
+                if live is not None:
+                    live.start(refresh=False)
+                # The screen was someone else's for a while, so the cached
+                # frame no longer describes it: the next repaint must write
+                self._last_segments = None
+
+        return _suspend()
+
+    def _restore_tty(self) -> None:
+        """Hand the terminal back to its owner's line discipline."""
+        if self._tty_settings is None:
+            return
+        try:
+            import termios
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._tty_settings)
+        except Exception as e:
+            logger.debug("Failed to restore terminal settings: %s", e)
+
+    def _raw_tty(self) -> None:
+        """Take the keyboard back for single-key input."""
+        if self._tty_settings is None:
+            return
+        try:
+            import tty
+            tty.setcbreak(sys.stdin.fileno())
+        except Exception as e:
+            logger.debug("Failed to set cbreak mode: %s", e)
+
+    def _open_browser(self, url: str) -> None:
+        """Open the login URL locally, if there plausibly is a browser to open
+        it in. Deliberately skipped on a bare SSH session, where $BROWSER may
+        be a text browser that would take the terminal over. Never fatal."""
+        if not (IS_MACOS or sys.platform == "win32"
+                or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass
 
     def _logout(self):
         """Log out and clear saved tokens."""
@@ -1167,7 +1614,7 @@ class HeadlessTidalPlayer:
                         self._queue = [real if t is track else t for t in queue]
                     if self._play_gen == gen:
                         self._current_track = real
-                url = self._take_prefetched(real.id) or real.get_url()
+                url = self._take_prefetched(real.id) or self._stream_url(real)
                 # Superseded by a newer track, or paused while we were
                 # fetching — either way this start is no longer wanted
                 if self._play_gen != gen or not self._playing:
@@ -1226,11 +1673,62 @@ class HeadlessTidalPlayer:
             try:
                 real = self._resolve_track(nxt)
                 if real is not None:
-                    self._prefetch = (real.id, real.get_url(), time.time())
+                    self._prefetch = (real.id, self._stream_url(real), time.time())
             except Exception:
                 pass
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _stream_url(self, track) -> str:
+        """Something mpv/ffplay can play for this track. Network — callers must
+        already be off the UI thread.
+
+        One request either way, so this asks for the whole stream description
+        rather than just a URL: the reply says which tier TIDAL *granted*, and
+        that is the only free evidence of what this session is entitled to.
+        `get_url()` isn't an option on a PKCE session in any case — tidalapi
+        refuses it outright (media.py get_url), because the hi-res tiers it
+        unlocks aren't served that way. A BTS manifest still names one whole
+        file; an MPEG-DASH one names segments, which become a local playlist.
+        """
+        stream = track.get_stream()
+        self._note_granted_quality(getattr(stream, "audio_quality", None))
+        manifest = stream.get_stream_manifest()
+        if manifest.is_bts:
+            return manifest.get_urls()[0]
+        return _write_hls_playlist(track.id, _hls_playlist(manifest.dash_info))
+
+    def _note_granted_quality(self, granted: Optional[str]) -> None:
+        """Record a tier TIDAL served that was below the one we asked for.
+
+        Called from a stream fetch, so it costs nothing and needs no probe. It
+        only ever remembers a *downgrade*: getting what you asked for says
+        nothing about the tiers above it, and an unrecognised answer says
+        nothing at all. Anything it doesn't understand leaves the ceiling
+        alone, which leaves the settings page ungated — a tier wrongly marked
+        unavailable is worse than one that is quietly disappointing.
+        """
+        wanted = self.QUALITY_MAP.get(self._quality_name)
+        if granted not in QUALITY_RANK or wanted not in QUALITY_RANK:
+            return
+        if QUALITY_RANK[granted] < QUALITY_RANK[wanted]:
+            self._quality_ceiling = granted
+        elif self._quality_ceiling is not None and \
+                QUALITY_RANK[granted] > QUALITY_RANK[self._quality_ceiling]:
+            # Something changed for the better — believe the newer evidence
+            self._quality_ceiling = None
+
+    def _quality_unavailable(self, choice: str) -> bool:
+        """Is this settings tier one TIDAL has shown it won't actually serve?
+
+        False whenever we can't tell, which is most of the time: before the
+        first track plays there is no evidence at all.
+        """
+        ceiling = self._quality_ceiling
+        wanted = self.QUALITY_MAP.get(choice)
+        if ceiling is None or wanted not in QUALITY_RANK:
+            return False
+        return QUALITY_RANK[wanted] > QUALITY_RANK[ceiling]
 
     def _resolve_track(self, track):
         """Turn a cached row into a real tidalapi Track. Anything that already
@@ -1379,7 +1877,19 @@ class HeadlessTidalPlayer:
                 dead_polls = 0
             if dead_polls >= 2:
                 dead_polls = 0
-                if (self.audio and self._current_track is not None
+                failure = self.audio.failure() if self.audio else None
+                if (failure and self.audio and not self.audio.source_vanished()
+                        and self._track_has_time_left()):
+                    # The backend refused the stream. Say so and stop, rather
+                    # than advancing through the whole queue in silence —
+                    # whatever it could not play, the next track is usually
+                    # the same kind of thing.
+                    self._set_toast(f"Playback failed — {failure}",
+                                    seconds=PLAYER_ERROR_SECONDS)
+                    logger.warning("Playback failed: %s", failure)
+                    self._playing = False
+                    self._play_start_time = None
+                elif (self.audio and self._current_track is not None
                         and self.audio.source_vanished()
                         and self._track_has_time_left()):
                     # The cached file was deleted between "it exists" and the
@@ -1859,11 +2369,17 @@ class HeadlessTidalPlayer:
                 if i:
                     content.append(" · ", style="dim")
                 on = choice == current
-                content.append(choice, style="bold cyan" if on else "dim")
+                # A tier TIDAL has shown it won't serve is dimmed even when
+                # it's the selected one — hiding it would look like a missing
+                # feature, where a dimmed one explains itself
+                gated = self._quality_unavailable(choice)
+                content.append(choice, style="dim" if gated else ("bold cyan" if on else "dim"))
                 # Badge text, unless it just repeats the name (HIRES / HI-RES)
                 short = self.QUALITY_LABELS.get(choice, "")
                 if short and short.replace("-", "") != choice:
-                    content.append(f" {short}", style="cyan" if on else "dim")
+                    content.append(
+                        f" {short}", style="dim" if gated else ("cyan" if on else "dim"))
+            content.append_text(self._build_quality_gate_note())
         # A --quality flag beats the saved value for this run without changing it
         if self._quality_name != self.config.get("quality"):
             content.append(
@@ -1886,7 +2402,47 @@ class HeadlessTidalPlayer:
         content.append(self._user_display_name or "—", style="bold")
         content.append("   [o]", style="bold")
         content.append(" log out", style="dim")
+        content.append_text(self._build_pkce_line())
         return content
+
+    def _build_quality_gate_note(self) -> Text:
+        """Why the dimmed tiers in the ladder above are dimmed — and, if the
+        tier actually in effect is one of them, where the fix is. Empty
+        whenever nothing is gated, which is the normal case."""
+        line = Text()
+        gated = [c for c in QUALITY_CHOICES if self._quality_unavailable(c)]
+        if not gated:
+            return line
+        line.append(
+            f"\n   {' and '.join(gated)} — this login isn't served them; "
+            f"TIDAL sends {self._quality_ceiling} instead",
+            style="dim yellow",
+        )
+        # _quality_name, not the saved value: --quality can be overriding it,
+        # and what he is hearing right now is the thing worth explaining
+        if self._quality_name in gated:
+            line.append("   [u] fixes it", style="dim")
+        return line
+
+    def _build_pkce_line(self) -> Text:
+        """Either the offer to sign in for higher quality, or — once that is
+        done — the quiet confirmation that it was. Same idiom as the [o] logout
+        and [x] clear-cache actions above: something the page lets you do, which
+        SETTINGS_SPEC (a table of values) has no way to express."""
+        line = Text()
+        if self.session.is_pkce:
+            line.append("\n   PKCE login ")
+            line.append("✓", style="green")
+            line.append("   Max quality available", style="dim")
+            return line
+        line.append("\n   [u]", style="bold")
+        line.append(" sign in for higher quality", style="dim")
+        line.append(
+            "\n   A clunkier sign-in — you paste back the address your browser lands on —"
+            "\n   and in exchange LOSSLESS and HI-RES stream as real FLAC instead of AAC.",
+            style="dim",
+        )
+        return line
 
     def _build_quit_confirm(self) -> Text:
         content = Text()
@@ -3052,6 +3608,11 @@ class HeadlessTidalPlayer:
         if key in ("x", "X"):
             self._clear_cache_pending = True
             return
+        # Deliberately not "p" — that already opens playlists on the player
+        # screen, and one letter meaning two things is how muscle memory breaks
+        if key in ("u", "U"):
+            self._upgrade_to_pkce()
+            return
         if key == KEY_UP:
             self._settings_cursor = max(0, self._settings_cursor - 1)
         elif key == KEY_DOWN:
@@ -3169,6 +3730,9 @@ class HeadlessTidalPlayer:
             self._wake_r = self._wake_w = None
 
         old_settings = termios.tcgetattr(sys.stdin)
+        # Kept on self so a PKCE sign-in from the settings page can hand the
+        # terminal back for the length of a paste and then take it again
+        self._tty_settings = old_settings
         try:
             tty.setcbreak(sys.stdin.fileno())
             self.console.clear()
@@ -3181,6 +3745,7 @@ class HeadlessTidalPlayer:
                 auto_refresh=False,
                 screen=False,
             ) as live:
+                self._live = live
                 self._repaint(live, force=True)
                 while self.running:
                     keys = self._read_keys(select)
@@ -3190,7 +3755,9 @@ class HeadlessTidalPlayer:
                             break
                     self._repaint(live, force=bool(keys))
         finally:
+            self._live = None
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            self._tty_settings = None
             self._shutdown()
             for fd in (self._wake_r, self._wake_w):
                 try:
@@ -3208,9 +3775,10 @@ def main():
 
     @click.command()
     @click.option("--quality", default=None, type=click.Choice(["LOW", "HIGH", "LOSSLESS", "HIRES"], case_sensitive=False), help="Audio quality for this run (overrides the saved setting)")
-    def headless(quality):
+    @click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in when there is no saved session")
+    def headless(quality, login_flow):
         """Launch Ticli terminal player."""
-        HeadlessTidalPlayer(quality=quality).run()
+        HeadlessTidalPlayer(quality=quality, login_flow=login_flow).run()
 
     headless()
 

@@ -19,6 +19,7 @@ def _fake_track(tid, duration=200):
 class _FakeSession:
     def __init__(self, tracks):
         self._tracks = {t.id: t for t in tracks}
+        self.is_pkce = False
 
     def track(self, tid):
         return self._tracks[tid]

@@ -498,7 +498,10 @@ class MetadataCache:
             if total <= budget:
                 break
             try:
-                path.unlink()
+                # missing_ok, because a sweep racing another one (two
+                # downloads landing together) must not read "already gone" as
+                # "still costing us" and go on to evict a file that fits
+                path.unlink(missing_ok=True)
             except OSError:
                 continue
             total -= size

@@ -3,6 +3,15 @@
 Prefers the OS keychain (macOS Keychain, GNOME Keyring, Windows Credential Manager)
 via the `keyring` library. Falls back to a chmod-600 JSON file if keyring is
 unavailable.
+
+The stored record also says *which* login flow issued the tokens (`is_pkce`).
+That is not decoration: tidalapi refreshes a PKCE token against a different
+TIDAL client id and secret than a device-flow one (session.py token_refresh),
+so a record that has lost the flag refreshes against the wrong client and the
+session dies — hours later, looking like a random logout. Records written
+before the flag existed are device-flow by construction (Ticli had no other
+flow), so the migration is a defaulted read: nobody is asked to log in again,
+and nothing on disk is rewritten until the next save.
 """
 
 import json
@@ -14,6 +23,9 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 SERVICE_NAME = "ticli"
+
+# 1 (implicit): device-flow tokens, no is_pkce field. 2: is_pkce always present.
+TOKEN_VERSION = 2
 FALLBACK_DIR = Path.home() / ".config" / SERVICE_NAME
 FALLBACK_FILE = FALLBACK_DIR / "session.json"
 
@@ -33,9 +45,22 @@ def _ensure_fallback_dir() -> None:
     FALLBACK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
+def _migrate(data: dict) -> dict:
+    """Bring a stored record up to TOKEN_VERSION.
+
+    Value-preserving by design: a record from before the flag was written is a
+    device-flow record, which is exactly what the default says. Nothing here
+    can invalidate a session that was working a moment ago.
+    """
+    record = dict(data)
+    record["is_pkce"] = bool(record.get("is_pkce", False))
+    record["version"] = TOKEN_VERSION
+    return record
+
+
 def save_tokens(data: dict) -> None:
     """Persist OAuth tokens securely."""
-    payload = json.dumps(data)
+    payload = json.dumps(_migrate(data))
 
     if keyring is not None:
         try:
@@ -53,24 +78,38 @@ def save_tokens(data: dict) -> None:
 
 
 def load_tokens() -> Optional[dict]:
-    """Load stored OAuth tokens. Returns None if nothing is stored."""
+    """Load stored OAuth tokens, migrated. Returns None if nothing is stored.
+
+    Callers can rely on `is_pkce` being present and a bool, so no use site has
+    to guess which TIDAL client should refresh the token it just loaded.
+    """
     # Try keychain first
     if keyring is not None:
         try:
             raw = keyring.get_password(SERVICE_NAME, "oauth_session")
             if raw:
-                return json.loads(raw)
+                return _load_record(raw)
         except Exception as e:
             logger.debug("keyring.get_password failed: %s", e)
 
     # Fallback: read from file
     if FALLBACK_FILE.exists():
         try:
-            return json.loads(FALLBACK_FILE.read_text())
+            return _load_record(FALLBACK_FILE.read_text())
         except (json.JSONDecodeError, OSError) as e:
             logger.debug("Failed to read fallback token file: %s", e)
 
     return None
+
+
+def _load_record(raw: str) -> Optional[dict]:
+    """Parse one stored payload. Anything that isn't a JSON object carrying an
+    access token counts as nothing stored — better a fresh login than a half
+    record that fails somewhere further in."""
+    data = json.loads(raw)
+    if not isinstance(data, dict) or not data.get("access_token"):
+        return None
+    return _migrate(data)
 
 
 def delete_tokens() -> None:
