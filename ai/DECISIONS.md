@@ -245,6 +245,33 @@ file is missing is a fact to absorb — drop the entry, correct the totals — n
 an error and not something to ignore. Verify at the moment of use; never walk
 the directory on the UI thread to find out.
 
+## A downloaded copy always wins (Garrett, 2026-07-27 — locked)
+
+> "Check that a downloaded song (not cached song) is never unconsentually
+> upgraded in quality when it is streamed at a higher quality. It should just
+> stream from download and not stream data."
+
+**A download is played whatever the quality setting says.** No tier
+comparison on the download tier at all: raising the setting to HI-RES is not
+a request to re-fetch songs already in `~/Music/Ticli`, and streaming them
+spends the user's data on audio he deliberately keeps on his own disk.
+Quality changes for a download **only** when he asks — `[R]`, re-fetch
+everything at the current quality. That is the consent, and nothing else may
+borrow it.
+
+**The cache is the opposite tier and keeps the opposite rule.** A cached copy
+below the current setting is still passed over and re-fetched. The cache is
+machine-owned, disposable and evictable; the download is the user's file. The
+two tiers differ in ownership, so they differ in who gets to replace them.
+
+Consequence, accepted deliberately: the player's quality badge shows what is
+**really playing** rather than what is selected whenever a download is the
+source (`LOSSLESS · downloaded`; a bare `downloaded` when the tier was never
+recorded). Under "never display a value that isn't real", a badge reading
+HI-RES over a LOSSLESS download is the same class of lie as a quality menu
+offering tiers TIDAL never served. Status line only — no toast, because it is
+true for every track of a downloaded album — and no setting.
+
 ## Settings page at small sizes (Garrett, 2026-07-26 — locked)
 
 > "Accept that settings will not work well in very small windows. That's fine.

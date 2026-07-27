@@ -1722,6 +1722,227 @@ class TestReFetchingEverything:
         assert "nothing retried" in rendered
 
 
+class _RecordingAudio:
+    """Stands in for AudioPlayer, recording what it was asked to play."""
+
+    def __init__(self):
+        self.plays = []
+        self.is_paused = False
+
+    def play_url(self, url, seek=0, title="", cache_key=None, local=None,
+                 quality=None):
+        self.plays.append({"url": url, "local": local, "quality": quality})
+
+
+def _downloaded(track_id=42, granted="LOSSLESS", body=b"downloaded bytes"):
+    """A real file in the download folder plus the index row pointing at it."""
+    root = downloads.download_dir()
+    path = root / "Daft Punk" / "Random Access Memories" / "08 Get Lucky.m4a"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    downloads.record(track_id, path.relative_to(root), "LOSSLESS", len(body),
+                     granted=granted)
+    return path
+
+
+class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
+    """Garrett: "a downloaded song … should just stream from download and not
+    stream data."
+
+    The cache and the downloads used to share one rule — a copy stored below
+    the tier now selected is passed over and re-fetched — and for the cache
+    that is right: it is ours, disposable, and re-fetching it costs only a
+    request. A download is the user's own file. Turning the quality setting up
+    is not a request to re-download a song already sitting in ~/Music/Ticli,
+    and doing it anyway spends his data on audio he chose to keep. Quality
+    changes for a download when he asks, with `[R]`, and never otherwise.
+
+    Everything here is asserted the way the suite asserts things: what was
+    handed to the audio backend, and how many times the network was touched —
+    which is zero, enforced by making every network entry point fail the test.
+    """
+
+    def _player_offline(self, quality, monkeypatch):
+        p = _player(quality=quality)
+        p._cache = MetadataCache(songs=True)
+        p.audio = _RecordingAudio()
+        # Three doors to the network, all of them nailed shut
+        p._stream_description = lambda *a, **k: pytest.fail(
+            "a downloaded track asked TIDAL to describe a stream")
+        p._stream_url = lambda *a, **k: pytest.fail(
+            "a downloaded track asked TIDAL for a stream URL")
+        patch_get(monkeypatch, player_mod,
+                  lambda *a, **k: pytest.fail("a downloaded track hit the CDN"))
+        return p
+
+    def _streaming_track(self, calls, tid=42, quality="LOSSLESS"):
+        track = _track(tid)
+
+        def get_stream():
+            calls.append(tid)
+            return types.SimpleNamespace(
+                audio_quality=quality,
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["https://cdn/x.mp4"]))
+
+        track.get_stream = get_stream
+        return track
+
+    def _play(self, p, track):
+        p._play_track(track)
+        assert _wait_for(lambda: p.audio.plays or not p._track_changing)
+        time.sleep(0.05)
+
+    def test_a_download_below_the_setting_plays_from_disk_for_free(self, monkeypatch):
+        """The bug, in one case: downloaded at LOSSLESS, app set to HI-RES."""
+        p = self._player_offline("HIRES", monkeypatch)
+        path = _downloaded(granted="LOSSLESS")
+        calls = []
+
+        self._play(p, self._streaming_track(calls))
+
+        assert calls == [], "the downloaded song was re-fetched at the new tier"
+        assert p.audio.plays[0]["local"] == str(path)
+        assert p.audio.plays[0]["url"] == ""
+
+    def test_every_stored_tier_against_every_setting_plays_from_disk(self, monkeypatch):
+        """Above, below, equal and unrecorded — the download always wins, so
+        there is no combination in which the file is passed over."""
+        for setting in QUALITY_CHOICES:
+            for stored in ("LOW", "HIGH", "LOSSLESS", "HI_RES_LOSSLESS", None):
+                p = self._player_offline(setting, monkeypatch)
+                path = _downloaded(granted=stored)
+                calls = []
+
+                self._play(p, self._streaming_track(calls))
+
+                assert calls == [], f"{stored} download re-fetched at {setting}"
+                assert p.audio.plays[0]["local"] == str(path), (setting, stored)
+
+    def test_the_bytes_played_are_the_downloaded_bytes(self, monkeypatch):
+        """The path is only a claim; the file behind it is the audio."""
+        p = self._player_offline("HIRES", monkeypatch)
+        _downloaded(granted="LOW", body=b"the file he downloaded")
+
+        self._play(p, self._streaming_track([]))
+
+        played = p.audio.plays[0]["local"]
+        with open(played, "rb") as fh:
+            assert fh.read() == b"the file he downloaded"
+
+    def test_the_prefetch_does_not_spend_a_request_either(self, monkeypatch):
+        """The URL would be fetched moments before `_play_track` threw it
+        away — the same wasted request, one track earlier."""
+        p = self._player_offline("HIRES", monkeypatch)
+        _downloaded(track_id=43, granted="HIGH")
+        calls = []
+        upcoming = self._streaming_track(calls, tid=43)
+        p._queue = [_track(42), upcoming]
+        p._queue_index = 0
+        p._current_track = p._queue[0]
+        p._current_track.duration = 100
+        p._playing = True
+        p._play_offset = 95   # inside PREFETCH_LEAD of the end
+
+        p._maybe_prefetch_next()
+        time.sleep(0.05)
+
+        assert calls == []
+
+    def test_a_download_deleted_by_hand_falls_through_to_the_network(self):
+        """The index still claims it; the disk decides. Unchanged by the new
+        rule, and the reason `path_for` stats the file every time."""
+        p = _player(quality="LOSSLESS")
+        p._cache = MetadataCache(songs=True)
+        p.audio = _RecordingAudio()
+        _downloaded(granted="LOSSLESS").unlink()
+        calls = []
+
+        self._play(p, self._streaming_track(calls))
+
+        assert calls == [42], "a file that is gone was played anyway"
+        assert p.audio.plays[0]["local"] is None
+        assert p.audio.plays[0]["url"] == "https://cdn/x.mp4"
+
+    def test_a_cached_copy_below_the_setting_is_still_re_fetched(self):
+        """The other half of the rule, and the one that did not change. The
+        cache is machine-owned and disposable, so a stale tier there is worth
+        one request; a download is the user's file and is not ours to replace.
+        Same player, same tier, opposite answers."""
+        p = _player(quality="HIRES")
+        p._cache = MetadataCache(songs=True)
+        p.audio = _RecordingAudio()
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "42.m4a").write_bytes(b"cached bytes")
+        p._cache.note_cached(42, ".m4a", 12, quality="LOSSLESS")
+        calls = []
+
+        self._play(p, self._streaming_track(calls))
+
+        assert calls == [42], "the cache rule was loosened along with downloads"
+        assert p.audio.plays[0]["local"] is None
+
+    def test_nothing_on_these_paths_writes_to_the_music_folder(self, monkeypatch):
+        """Playing is reading. The one file in the folder is the one the test
+        put there, before and after."""
+        p = self._player_offline("HIRES", monkeypatch)
+        _downloaded(granted="LOW")
+        root = downloads.download_dir()
+        before = sorted(str(f.relative_to(root)) for f in root.rglob("*")
+                        if f.is_file())
+
+        self._play(p, self._streaming_track([]))
+
+        after = sorted(str(f.relative_to(root)) for f in root.rglob("*")
+                       if f.is_file())
+        assert after == before == ["Daft Punk/Random Access Memories/"
+                                   "08 Get Lucky.m4a"]
+
+    def test_the_player_says_what_it_is_really_playing(self, monkeypatch):
+        """Honesty in the interface. A badge reading HI-RES over a LOSSLESS
+        download is the same kind of claim as a quality menu offering tiers
+        TIDAL never served. It says the tier the file holds and where the
+        file came from — on the status line it was already drawing, so
+        nothing is toasted once per track of a downloaded album."""
+        p = self._player_offline("HIRES", monkeypatch)
+        _downloaded(granted="LOSSLESS")
+
+        self._play(p, self._streaming_track([]))
+        text = _rendered(p)
+
+        assert "LOSSLESS · downloaded" in text
+        assert "HI-RES" not in text, "it claimed the tier of the setting"
+
+    def test_an_unrecorded_tier_claims_nothing(self, monkeypatch):
+        """A download adopted before the index recorded tiers. "We do not
+        know" is an honest badge; the setting's label would not be."""
+        p = self._player_offline("HIRES", monkeypatch)
+        _downloaded(granted=None)
+
+        self._play(p, self._streaming_track([]))
+        text = _rendered(p)
+
+        assert "downloaded" in text
+        assert "HI-RES" not in text
+
+    def test_a_streamed_track_still_shows_the_setting(self):
+        """The badge is not a permanent takeover — the setting is the truth
+        again the moment the bytes come off the network."""
+        p = _player(quality="LOSSLESS")
+        p._cache = MetadataCache(songs=False)
+        p.audio = _RecordingAudio()
+        _downloaded(granted="HIGH")
+        self._play(p, self._streaming_track([]))
+        assert "downloaded" in _rendered(p)
+
+        self._play(p, self._streaming_track([], tid=99))
+
+        text = _rendered(p)
+        assert "downloaded" not in text
+        assert "LOSSLESS" in text
+
+
 class TestSettingsShowsTheFolder:
     def test_the_folder_is_shown_as_a_full_absolute_path(self):
         """Garrett asked for the absolute path rather than `~/Music/Ticli` —
