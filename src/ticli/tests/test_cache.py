@@ -1132,6 +1132,271 @@ class TestTheCacheTracker:
         assert cache.cached_usage() == (0, 0)
 
 
+def _run_together(jobs, timeout=30.0):
+    """Start every job on its own thread, wait for all of them, re-raise.
+
+    A failure inside a thread is otherwise a printed traceback and a green
+    test, which for a concurrency test is the worst possible outcome — it
+    would pass exactly as loudly with no lock at all.
+    """
+    errors = []
+
+    def wrap(job):
+        def run():
+            try:
+                job()
+            except BaseException as e:  # noqa: BLE001 - re-raised below
+                errors.append(e)
+        return run
+
+    threads = [threading.Thread(target=wrap(job), daemon=True) for job in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout)
+    alive = [t for t in threads if t.is_alive()]
+    assert not alive, \
+        f"{len(alive)} tracker writer(s) never finished — a deadlock, not a race"
+    if errors:
+        raise errors[0]
+
+
+def _widen_the_window(cache, pause=0.002):
+    """Hold every tracker read open for a moment, so the race is certain.
+
+    The losing interleave is a thread switch between reading `self._tracker`
+    and replacing it — a handful of bytecodes with no I/O in them, because
+    `_save_tracker` reassigns the memo *before* it touches the disk. That is
+    a real window (the interpreter preempts on its own switch interval, and
+    a listening session runs these calls for hours), but it is far too narrow
+    for a test to land on by throwing threads at it: with the lock taken out
+    entirely, a million unsynchronised increments still came back correct.
+
+    A test that only fails one run in a thousand is not a test, so this makes
+    the scheduler's worst case happen every single time instead: sleeping
+    inside the window guarantees a second writer gets in. With the lock, the
+    second writer is stopped at the door and waits — the sleep only makes the
+    test slower. Without it, every overlap loses an update and the assertions
+    below fail flat.
+    """
+    original = cache._load_tracker
+
+    def slow_load():
+        tracks = original()
+        time.sleep(pause)
+        return tracks
+
+    cache._load_tracker = slow_load
+    return cache
+
+
+class TestTrackerWritesAreSerialized:
+    """One MetadataCache, many threads, and every write is read-modify-write.
+
+    `note_played` runs on the playback monitor, `note_cached` on the download
+    daemon and again on the refetch job, `forget_cached` on the bulk-download
+    writer and inside `enforce_budget`, `reconcile` on a startup daemon. They
+    all copy `self._tracker`, edit the copy and replace the whole thing, so
+    unsynchronised they lose each other's edits wholesale.
+
+    The old comment in cache.py priced that at "one play count". It is worse
+    than that: a `note_played` straddling a `forget_cached` puts back a row
+    for a file that has just been deleted, and a `forget_cached` straddling a
+    `note_cached` deletes a row for a file that is really there. Both are the
+    settings page and eviction believing the cache holds something it does
+    not, which is exactly what the tracker exists to prevent.
+
+    These are timing tests, so they are written to fail rather than to flake:
+    the assertions are on exact final state, the work per thread is fixed, and
+    every key belongs to exactly one thread except where the point is that it
+    does not.
+    """
+
+    def test_two_threads_counting_plays_lose_none_of_them(self):
+        """The purest form of a lost update: `plays` is read, incremented and
+        written back, so an unlocked overlap silently makes two plays one."""
+        cache = _widen_the_window(MetadataCache())
+        rounds = 25
+
+        def count():
+            for _ in range(rounds):
+                cache.note_played(12)
+
+        _run_together([count, count])
+
+        assert cache.audio_record(12)["plays"] == 2 * rounds, \
+            "a play counted on one thread was overwritten by the other"
+
+    def test_the_file_agrees_with_the_memo_when_the_threads_stop(self):
+        """The tracker is only useful because it survives a restart, so the
+        last writer must have written *its own* result, not a stale copy."""
+        cache = _widen_the_window(MetadataCache())
+
+        def count():
+            for _ in range(15):
+                cache.note_played(12)
+
+        _run_together([count, count])
+
+        assert MetadataCache().audio_record(12)["plays"] == 30
+
+    def test_a_hammer_of_mixed_writers_loses_nothing(self):
+        """Four writers doing four different jobs at once, on keys nobody else
+        touches, so the whole final state is stated exactly.
+
+        Distinct keys are the point: with no shared key there is no ambiguity
+        about what the answer should be, and *every* difference from it is an
+        edit some thread dropped on the floor.
+        """
+        cache = MetadataCache()
+        rounds = 15
+
+        # Pre-seeded rows for the deleting thread to take away. Separate ids
+        # so that "was it removed" and "was it kept" are different questions.
+        doomed = [str(900_000 + n) for n in range(rounds)]
+        for key in doomed:
+            _stamp(cache, key, plays=1, last=1.0, size=7)
+        _widen_the_window(cache)  # after the seeding, which is single-threaded
+
+        cached = [str(100_000 + n) for n in range(rounds)]
+        played = [str(200_000 + n) for n in range(rounds)]
+        both = [str(300_000 + n) for n in range(rounds)]
+
+        def note_cached():
+            for n, key in enumerate(cached):
+                cache.note_cached(key, ".m4a", n, quality="LOSSLESS")
+
+        def note_played():
+            for key in played:
+                cache.note_played(key)
+                cache.note_played(key)
+
+        def refetch():
+            for key in both:
+                cache.note_cached(key, ".flac", 11)
+                cache.note_played(key)
+
+        def forget():
+            for key in doomed:
+                cache.forget_cached([key])
+
+        _run_together([note_cached, note_played, refetch, forget])
+
+        tracker = MetadataCache()._load_tracker()
+        assert set(tracker) == set(cached) | set(played) | set(both), \
+            "a row was lost, or a deleted one came back"
+        for n, key in enumerate(cached):
+            assert tracker[key]["bytes"] == n
+            assert tracker[key]["quality"] == "LOSSLESS"
+            assert tracker[key]["plays"] == 0
+        for key in played:
+            assert tracker[key]["plays"] == 2
+        for key in both:
+            assert tracker[key]["plays"] == 1
+            assert tracker[key]["ext"] == ".flac"
+
+    def test_a_delete_beside_a_download_does_not_undo_it(self):
+        """`forget_cached` decides what to remove inside the lock, so a row
+        that arrived after the caller drew up its list is not swept up with
+        it — the file is on disk and the tracker has to say so."""
+        cache = MetadataCache()
+        arrivals = [str(500_000 + n) for n in range(20)]
+        for key in arrivals:
+            _stamp(cache, key, size=3)
+        _widen_the_window(cache)
+        survivors = [str(600_000 + n) for n in range(20)]
+
+        def download():
+            for key in survivors:
+                cache.note_cached(key, ".m4a", 3)
+
+        def evict():
+            for key in arrivals:
+                cache.forget_cached([key])
+
+        _run_together([download, evict])
+
+        tracker = cache._load_tracker()
+        assert not set(tracker) & set(arrivals), "an evicted row survived"
+        assert set(survivors) <= set(tracker), \
+            "a track that really landed was deleted by a concurrent eviction"
+
+    def test_reconcile_beside_a_play_keeps_both(self):
+        """`reconcile`'s directory walk is outside the lock and its
+        load-modify-save is inside it, so a play counted while the disk was
+        being read is edited rather than overwritten."""
+        cache = MetadataCache()
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "77.m4a").write_bytes(b"x" * 64)
+        _widen_the_window(cache)
+
+        def reconcile():
+            for _ in range(15):
+                cache.reconcile()
+
+        def count():
+            for _ in range(15):
+                cache.note_played(77)
+
+        _run_together([reconcile, count])
+
+        record = cache.audio_record(77)
+        assert record is not None, "reconcile dropped a file that is on disk"
+        assert record["plays"] == 15, "reconcile overwrote counted plays"
+        assert record["bytes"] == 64
+
+    # ── the lock is at the leaves ──
+
+    def test_evicting_and_clearing_do_not_take_the_lock_twice(self):
+        """Both delete files and then hand the casualties to `forget_cached`,
+        which is where the lock lives. A plain Lock is not reentrant, so a
+        second acquire on the same path is a hang, not a failed assertion —
+        hence the timeout rather than a bare call."""
+        cache = MetadataCache(budget_gb=0)
+        directory = cache_mod.audio_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        for tid in (12, 13):
+            (directory / f"{tid}.m4a").write_bytes(b"x" * 64)
+            _stamp(cache, tid, size=64)
+
+        _run_together([cache.enforce_budget, cache.clear_audio], timeout=10.0)
+
+        assert cache.cached_usage() == (0, 0)
+
+    def test_reads_never_wait_on_a_writer(self):
+        """The settings page reads `cached_usage` on every paint and playback
+        reads `audio_record` before every track. Whole-dict replacement is
+        what makes those safe without a lock, and they must stay that way —
+        a read behind a disk write is a stutter on the UI thread.
+
+        Read from another thread while this one pins the lock, so a read that
+        did start taking it shows up as the deadlock it would be rather than
+        wedging the suite.
+        """
+        cache = MetadataCache()
+        cache.note_cached(12, ".m4a", 4096, quality="LOSSLESS")
+
+        def read():
+            assert cache.audio_record(12)["quality"] == "LOSSLESS"
+            assert cache.cached_usage() == (1, 4096)
+            assert cache.cheapest_resident() == (0, cache.audio_value(12)[1])
+
+        with cache._tracker_lock:  # a writer is mid-cycle
+            _run_together([read], timeout=5.0)
+
+    def test_every_tracker_write_goes_through_one_place(self):
+        """The lock is only worth anything if nothing writes around it, so
+        `_mutate_tracker` is the sole caller of `_save_tracker`."""
+        import inspect
+        for name in ("note_cached", "note_played", "forget_cached", "reconcile"):
+            source = inspect.getsource(getattr(MetadataCache, name))
+            assert "_mutate_tracker" in source, f"{name} writes off the leash"
+            assert "_save_tracker" not in source, \
+                f"{name} saves the tracker without the lock"
+        assert "_tracker_lock" in inspect.getsource(MetadataCache._mutate_tracker)
+
+
 class TestPlayCountEviction:
     """Garrett's rule: a point per play, and the oldest among the tracks with
     the fewest plays goes first.

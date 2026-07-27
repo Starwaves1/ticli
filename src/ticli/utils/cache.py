@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -302,9 +303,21 @@ def _dir_size(path: Path) -> int:
 class MetadataCache:
     """The cache the player talks to.
 
-    No locks: the index is only ever replaced as a whole object, never
-    mutated in place, so a background revalidation and a foreground read
-    can never see a half-written dict.
+    Whole-object replacement everywhere: neither the index nor the tracker
+    is ever mutated in place, so **every read is lock-free and correct** —
+    `get`, `audio_record`, `audio_value`, `cheapest_resident` and
+    `cached_usage` see one consistent generation of a dict, never a
+    half-written one. That is what the old "no locks" note was actually
+    right about, and it has not changed.
+
+    What it does not buy is *lost updates*, and that is a different
+    question with a different answer per store. The **index** is written
+    from one place at a time and can stay unlocked. The **tracker** cannot:
+    several threads write it concurrently through one shared MetadataCache
+    (see the tracker section below), so `_tracker_lock` serializes the
+    load-modify-save cycle of every tracker write. It is held only inside
+    `_mutate_tracker` — never across a disk walk, never by a caller — so
+    there is nothing to acquire twice.
     """
 
     def __init__(self, metadata: bool = True, songs: bool = True, budget_gb: int = 2):
@@ -318,8 +331,11 @@ class MetadataCache:
         # see audio_count / disk_bytes and invalidate_audio_count
         self._audio_count = None
         self._disk_bytes = None
-        # The tracker (see tracker_file). Loaded once, replaced whole.
+        # The tracker (see tracker_file). Loaded once, replaced whole, and
+        # written only under _tracker_lock — one MetadataCache is shared by
+        # every thread in the player, so the memo below is shared state
         self._tracker = None
+        self._tracker_lock = threading.Lock()
 
     # ── plumbing ──
 
@@ -540,10 +556,37 @@ class MetadataCache:
     # file is dropped; a file with no entry is adopted at zero plays, which is
     # also how a cache from before the tracker existed is picked up.
     #
-    # Two ticli instances share one tracker and there are no locks, by the
-    # project's rule. Each write is a whole-dict replace of a file read
-    # moments earlier, so the loser of a race loses *one play count*, which
-    # is the cheapest possible thing to lose here.
+    # Inside one process the tracker has several writers and they are all on
+    # different threads: `note_played` on the playback monitor, `note_cached`
+    # and `enforce_budget`'s `forget_cached` on the download daemon, another
+    # `note_cached` on the refetch job, `reconcile` on a startup daemon, and
+    # `forget_cached` again on the bulk-download writer. They share one
+    # MetadataCache and therefore one `self._tracker` memo, so every one of
+    # them is a copy-modify-replace over the same object.
+    #
+    # Unlocked, two overlapping cycles keep only the later one's change, and
+    # the old note here called that acceptable: "the loser of a race loses
+    # one play count". That stopped being true the moment `forget_cached`
+    # joined the writers. A `note_played` that reads the memo before a delete
+    # and saves after it **resurrects** a row for a file that has just been
+    # unlinked — the settings page then counts a song that is not there and
+    # eviction weighs it — and a `forget_cached` landing beside a
+    # `note_cached` erases a file the cache really does hold. Neither is a
+    # play count.
+    #
+    # So every write goes through `_mutate_tracker`, which holds
+    # `_tracker_lock` across the *whole* load-modify-save: it is the load
+    # half that makes a concurrent writer's change vanish, so a lock around
+    # the save alone would fix nothing. The lock lives at the leaves only —
+    # `enforce_budget` and `clear_audio` reach the tracker through
+    # `forget_cached` and never hold it themselves, and `reconcile`'s
+    # directory listing and per-file stat happen outside it.
+    #
+    # Reads are still lock-free, and still right: the dict is only ever
+    # replaced whole, so a reader gets some generation of it, never a torn
+    # one. Two ticli *instances* still race for the file with no lock between
+    # them, by the project's rule — the loser loses that process's recent
+    # bookkeeping, and `reconcile()` corrects existence on the next start.
 
     def _load_tracker(self) -> dict:
         """Track id (as a string) → record. Missing or corrupt reads as empty."""
@@ -573,6 +616,26 @@ class MetadataCache:
         except OSError as e:
             logger.debug("Could not write the cache tracker: %s", e)
 
+    def _mutate_tracker(self, change) -> None:
+        """Read the tracker, let `change` edit a private copy, save it.
+
+        The one read-modify-write cycle in this module, and the only thing
+        that takes `_tracker_lock` — every tracker writer funnels through it
+        so that "load" and "save" cannot be prised apart by another thread.
+        `change` mutates the dict it is handed and may return False for
+        "nothing moved", which skips the write entirely.
+
+        A leaf by construction: nothing reachable from `change` may touch
+        the tracker again, which is why the callers that delete files
+        (`enforce_budget`, `clear_audio`) hand their casualties to
+        `forget_cached` instead of removing rows themselves.
+        """
+        with self._tracker_lock:
+            tracks = dict(self._load_tracker())
+            if change(tracks) is False:
+                return
+            self._save_tracker(tracks)
+
     def audio_record(self, track_id):
         """What the tracker knows about this track, or None."""
         if track_id is None:
@@ -593,17 +656,19 @@ class MetadataCache:
         if track_id is None or not self.keeps_audio:
             return
         key = str(track_id)
-        tracks = dict(self._load_tracker())
-        previous = tracks.get(key) if isinstance(tracks.get(key), dict) else {}
-        record = dict(previous)
-        record.update({"ext": ext, "bytes": int(size or 0), "at": time.time()})
-        if quality is not None:
-            record["quality"] = quality
-        record.setdefault("quality", None)
-        record.setdefault("plays", 0)
-        record.setdefault("last", time.time())
-        tracks[key] = record
-        self._save_tracker(tracks)
+
+        def change(tracks):
+            previous = tracks.get(key) if isinstance(tracks.get(key), dict) else {}
+            record = dict(previous)
+            record.update({"ext": ext, "bytes": int(size or 0), "at": time.time()})
+            if quality is not None:
+                record["quality"] = quality
+            record.setdefault("quality", None)
+            record.setdefault("plays", 0)
+            record.setdefault("last", time.time())
+            tracks[key] = record
+
+        self._mutate_tracker(change)
 
     def note_played(self, track_id) -> None:
         """One more point for this track, and the time it earned it.
@@ -611,30 +676,45 @@ class MetadataCache:
         `time.time()` stamped here rather than the filesystem's `atime`:
         `relatime` makes that roughly daily-granular, which is useless for
         ordering a listening session, and this is a write we control.
+
+        The increment is a read-modify-write and this runs on the monitor
+        thread, so it is one of the reasons `_mutate_tracker` exists: two
+        plays counted at once used to make one.
         """
         if track_id is None or not self.keeps_audio:
             return
         key = str(track_id)
-        tracks = dict(self._load_tracker())
-        record = dict(tracks.get(key) or {})
-        record["plays"] = int(record.get("plays") or 0) + 1
-        record["last"] = time.time()
-        record.setdefault("quality", None)
-        record.setdefault("ext", "")
-        record.setdefault("bytes", 0)
-        tracks[key] = record
-        self._save_tracker(tracks)
+
+        def change(tracks):
+            record = dict(tracks.get(key) or {})
+            record["plays"] = int(record.get("plays") or 0) + 1
+            record["last"] = time.time()
+            record.setdefault("quality", None)
+            record.setdefault("ext", "")
+            record.setdefault("bytes", 0)
+            tracks[key] = record
+
+        self._mutate_tracker(change)
 
     def forget_cached(self, track_ids) -> None:
         """Drop entries for files that are no longer there. Whole-dict
-        replacement, and a no-op when nothing actually changed."""
+        replacement, and a no-op when nothing actually changed.
+
+        The removal is decided *inside* the lock rather than from a dict
+        read before it, because between the two a `note_cached` can add a
+        row this call never meant to take.
+        """
         keys = {str(t) for t in track_ids if t is not None}
         if not keys:
             return
-        tracks = self._load_tracker()
-        remaining = {k: v for k, v in tracks.items() if k not in keys}
-        if len(remaining) != len(tracks):
-            self._save_tracker(remaining)
+
+        def change(tracks):
+            gone = [k for k in tracks if k in keys]
+            for key in gone:
+                tracks.pop(key, None)
+            return bool(gone)
+
+        self._mutate_tracker(change)
 
     def audio_value(self, track_id, playing: bool = False) -> tuple:
         """How much this track is worth keeping: `(plays, last played)`.
@@ -736,7 +816,13 @@ class MetadataCache:
 
         Not cheap (one directory listing plus a stat per file), so it is never
         called from a paint — the player runs it once at startup on a daemon
-        thread, and again after anything that deletes files.
+        thread, and again after anything that deletes files. That expense is
+        also why the scan stays *outside* `_tracker_lock`: holding a lock
+        across a directory walk would stall the monitor thread's play counts
+        behind the filesystem for no benefit, and the scan reads the disk,
+        which the lock does not protect anyway. Only the load-modify-save is
+        serialized, and it re-reads the tracker under the lock, so a
+        `note_cached` that landed during the walk is edited, not overwritten.
         """
         if not self.keeps_audio:
             return 0, 0
@@ -748,30 +834,35 @@ class MetadataCache:
                 on_disk[path.stem] = path.stat().st_size
             except OSError:
                 continue
-        tracks = dict(self._load_tracker())
-        dropped = [key for key in tracks if key not in on_disk]
-        for key in dropped:
-            tracks.pop(key, None)
-        adopted = 0
-        now = time.time()
-        for key, size in on_disk.items():
-            record = tracks.get(key)
-            if not isinstance(record, dict):
-                # Zero plays and no known tier: unknown is not the same as
-                # "the tier you have set now", and must never be mistaken for
-                # it (that would silently hand someone the wrong quality)
-                tracks[key] = {"ext": "", "quality": None, "bytes": size,
-                               "plays": 0, "last": now, "at": now}
-                adopted += 1
-            elif int(record.get("bytes") or 0) != size:
-                record = dict(record)
-                record["bytes"] = size
-                tracks[key] = record
-        if dropped or adopted or tracks != self._load_tracker():
-            self._save_tracker(tracks)
-        if dropped:
+        counts = {"dropped": 0, "adopted": 0}
+
+        def change(tracks):
+            before = dict(tracks)
+            for key in [k for k in tracks if k not in on_disk]:
+                tracks.pop(key, None)
+                counts["dropped"] += 1
+            now = time.time()
+            for key, size in on_disk.items():
+                record = tracks.get(key)
+                if not isinstance(record, dict):
+                    # Zero plays and no known tier: unknown is not the same as
+                    # "the tier you have set now", and must never be mistaken
+                    # for it (that would silently hand someone the wrong
+                    # quality)
+                    tracks[key] = {"ext": "", "quality": None, "bytes": size,
+                                   "plays": 0, "last": now, "at": now}
+                    counts["adopted"] += 1
+                elif int(record.get("bytes") or 0) != size:
+                    record = dict(record)
+                    record["bytes"] = size
+                    tracks[key] = record
+            return bool(counts["dropped"] or counts["adopted"]
+                        or tracks != before)
+
+        self._mutate_tracker(change)
+        if counts["dropped"]:
             self.invalidate_audio_count()
-        return len(dropped), adopted
+        return counts["dropped"], counts["adopted"]
 
     # ── budget ──
 
