@@ -25,6 +25,7 @@ import pytest
 from rich.cells import cell_len
 from rich.console import Console
 
+from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
 from ticli.tests.vt import Screen
 from ticli.utils import artwork as art_mod
@@ -357,15 +358,21 @@ class TestThePaneFits:
             for height in (24, 30):
                 for mode in MODES:
                     for more in (False, True):
-                        harness = Harness(width=width, height=height,
-                                          artwork=_art(width, height))
-                        p = harness.player
-                        p._mode = mode
-                        p._show_more = more
-                        _fill_lists(p)
-                        rows = len(p.console.render_lines(
-                            p._build_display(), p.console.options, pad=False))
-                        assert rows <= height, (width, height, mode, more, rows)
+                        # And with the footer put away by `[h]`, which frees
+                        # rows the body then spends — a pane that overflows
+                        # after taking them is the same bug
+                        for hidden in (False, True):
+                            harness = Harness(width=width, height=height,
+                                              artwork=_art(width, height))
+                            p = harness.player
+                            p._mode = mode
+                            p._show_more = more
+                            p._footer_hidden = hidden
+                            _fill_lists(p)
+                            rows = len(p.console.render_lines(
+                                p._build_display(), p.console.options, pad=False))
+                            assert rows <= height, (width, height, mode, more,
+                                                    hidden, rows)
 
 
 # ── the footer, at every width ──
@@ -598,6 +605,318 @@ class TestTheVolumeOverlayOnScreen:
             h.live.stop()
 
 
+class _StubAudio:
+    """Enough of AudioPlayer for the play/pause key, and nothing that runs."""
+
+    player_cmd = "mpv"
+
+    def __init__(self):
+        self.is_paused = False
+
+    def pause(self):
+        self.is_paused = True
+
+    def resume(self):
+        self.is_paused = False
+
+    def get_time_pos(self):
+        return None
+
+
+def _hints_on_screen(h):
+    """The footer as rows of the screen: a row that starts with a bracket and
+    is one of the lines the player laid out as its footer.
+
+    Asked of the screen rather than of the player, because "the controls are
+    gone" is a claim about what the eye can see — and the settings page draws
+    its own `[x]`/`[o]` action lines in the body, which are not the footer.
+    """
+    laid = {line.plain.strip() for line in h.player._compose(h.player._fit)[1]}
+    return [r.strip() for r in _body(h) if r.strip() in laid and r.strip()]
+
+
+class TestHidingTheFooter:
+    """`[h]` puts the controls away for as long as you are only listening.
+
+    Arrows and space keep it away — skip, navigate, play/pause — and the first
+    thing you do that isn't one of those brings it back *and does its job*,
+    because a key you have to press twice is worse than a footer that returned
+    a moment early.
+    """
+
+    def _harness(self, width=100, height=30, mode=None, **attrs):
+        h = Harness(width=width, height=height, artwork=_art(width, height))
+        if mode is not None:
+            h.player._mode = mode
+        _fill_lists(h.player)
+        for name, value in attrs.items():
+            setattr(h.player, name, value)
+        h.start()
+        h.repaint()
+        return h
+
+    def _press(self, h, key):
+        h.player._handle_key(key)
+        h.repaint()
+
+    # ── it goes away, and it says how ──
+
+    def test_the_footer_says_the_key(self):
+        h = self._harness()
+        try:
+            assert any("[h] hide" in r for r in _body(h)), _body(h)
+        finally:
+            h.live.stop()
+
+    def test_h_takes_the_controls_off_the_screen(self):
+        h = self._harness()
+        try:
+            assert _hints_on_screen(h), "no footer to start with"
+            self._press(h, "h")
+            assert _hints_on_screen(h) == [], _body(h)
+            # and the song is still there — this hides instructions, not identity
+            assert any("Satisfied" in r for r in _body(h)), _body(h)
+            h.assert_one_frame("hidden")
+            assert h.stranded() == []
+        finally:
+            h.live.stop()
+
+    def test_a_second_h_brings_it_back(self):
+        """Falls straight out of the rule — h is not an arrow and not the
+        spacebar — rather than being a toggle written separately."""
+        h = self._harness()
+        try:
+            self._press(h, "h")
+            assert _hints_on_screen(h) == []
+            self._press(h, "h")
+            assert any("[h] hide" in r for r in _body(h)), _body(h)
+            h.assert_one_frame("back")
+        finally:
+            h.live.stop()
+
+    @pytest.mark.parametrize("mode", [m for m in MODES
+                                      if m != HeadlessTidalPlayer.MODE_SEARCH])
+    def test_every_screen_with_a_footer_can_put_it_away(self, mode):
+        h = self._harness(mode=mode)
+        try:
+            assert _hints_on_screen(h), (mode, "no footer to start with")
+            self._press(h, "h")
+            assert _hints_on_screen(h) == [], (mode, _body(h))
+            h.assert_one_frame(f"hidden on {mode}")
+        finally:
+            h.live.stop()
+
+    # ── what keeps it hidden ──
+
+    def test_the_arrows_still_navigate_and_it_stays_hidden(self):
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_QUEUE)
+        try:
+            self._press(h, "h")
+            cursor = lambda: [r for r in _body(h) if "▸" in r][0]
+            first = cursor()
+            self._press(h, "\x1b[B")            # ↓
+            assert cursor() != first, "the arrow did nothing"
+            assert _hints_on_screen(h) == [], _body(h)
+            self._press(h, "\x1b[A")            # ↑
+            assert cursor() == first
+            assert _hints_on_screen(h) == [], _body(h)
+            h.assert_one_frame("still hidden")
+        finally:
+            h.live.stop()
+
+    def test_space_still_pauses_and_it_stays_hidden(self):
+        h = self._harness()
+        try:
+            h.player.audio = _StubAudio()
+            assert any("▶" in r for r in _body(h))
+            self._press(h, "h")
+            self._press(h, " ")
+            assert any("⏸" in r for r in _body(h)), _body(h)
+            assert h.player.audio.is_paused, "the spacebar did nothing"
+            assert _hints_on_screen(h) == [], _body(h)
+            h.assert_one_frame("paused and hidden")
+        finally:
+            h.live.stop()
+
+    def test_scrubbing_keeps_it_hidden_too(self):
+        """←/→ under scrub focus are still arrows, and `_handle_focus_key` runs
+        after the hide check rather than around it."""
+        h = self._harness()
+        try:
+            h.player._focus_player()
+            self._press(h, "h")
+            assert _hints_on_screen(h) == []
+            h.player._play_offset = 60.0
+            self._press(h, "\x1b[D")            # ← seeks back
+            assert h.player._get_position() == 50.0
+            assert _hints_on_screen(h) == [], _body(h)
+            h.assert_one_frame("scrubbing hidden")
+        finally:
+            h.live.stop()
+
+    # ── what brings it back ──
+
+    def test_another_key_restores_it_and_still_does_its_job(self):
+        """`q` opens the queue *and* puts the footer back, in that order."""
+        h = self._harness()
+        try:
+            self._press(h, "h")
+            assert _hints_on_screen(h) == []
+            self._press(h, "q")
+            assert h.player._mode == HeadlessTidalPlayer.MODE_QUEUE
+            assert any("Queue" in r for r in _body(h)), _body(h)
+            assert _hints_on_screen(h), _body(h)
+            h.assert_one_frame("queue with its footer")
+        finally:
+            h.live.stop()
+
+    def test_s_opens_search_as_well_as_restoring(self):
+        h = self._harness()
+        try:
+            self._press(h, "h")
+            self._press(h, "s")
+            assert h.player._mode == HeadlessTidalPlayer.MODE_SEARCH
+            assert h.player._search_query == "", "the s was swallowed into the query"
+            assert _hints_on_screen(h), _body(h)
+        finally:
+            h.live.stop()
+
+    def test_a_key_that_does_nothing_brings_it_back_too(self):
+        """The decision, stated as a test: `z` is bound to nothing on the
+        player screen and it still un-hides. Un-hiding only on a *bound* key
+        would need a second copy of the mode dispatch to say which those are,
+        and a key that did nothing is exactly when the controls are worth
+        reading."""
+        h = self._harness()
+        try:
+            self._press(h, "h")
+            assert _hints_on_screen(h) == []
+            self._press(h, "z")
+            assert _hints_on_screen(h), _body(h)
+        finally:
+            h.live.stop()
+
+    # ── where h is the letter h ──
+
+    def test_search_types_an_h(self):
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_SEARCH)
+        try:
+            before = h.player._search_query
+            self._press(h, "h")
+            assert h.player._search_query == before + "h"
+            assert h.player._footer_hidden is False
+            assert _hints_on_screen(h), _body(h)
+            assert not any("[h] hide" in r for r in _body(h)), "offered where it types"
+        finally:
+            h.live.stop()
+
+    def test_the_new_playlist_name_types_an_h(self):
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
+                          _picker_new_name="")
+        try:
+            self._press(h, "h")
+            assert h.player._picker_new_name == "h"
+            assert h.player._footer_hidden is False
+            assert not any("[h] hide" in r for r in _body(h)), "offered where it types"
+        finally:
+            h.live.stop()
+
+    def test_a_settings_row_being_typed_into_types_nothing_but_digits(self):
+        """`h` is not a digit, so it commits the edit like every other key —
+        what it must not do is hide the footer out from under a textbox."""
+        numeric = [i for i, spec in enumerate(config_mod.SETTINGS_ROWS)
+                   if spec["kind"] == "int"]
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_SETTINGS,
+                          _settings_cursor=numeric[0], _settings_edit="12")
+        try:
+            self._press(h, "h")
+            assert h.player._footer_hidden is False
+            assert _hints_on_screen(h), _body(h)
+        finally:
+            h.live.stop()
+
+    def test_the_volume_overlay_is_not_a_cheat_sheet(self):
+        """It has taken the footer's rows and its `←/→ adjust` is a control.
+        `h` there is ignored, the same as every other key the overlay does not
+        use — and closing it must not reveal a footer that went away unseen."""
+        h = self._harness()
+        try:
+            self._press(h, "v")
+            assert any("Volume" in r for r in _body(h))
+            self._press(h, "h")
+            assert any("Volume" in r for r in _body(h)), "the overlay went away"
+            assert h.player._footer_hidden is False
+            self._press(h, "\r")
+            assert any("[h] hide" in r for r in _body(h)), _body(h)
+        finally:
+            h.live.stop()
+
+    def test_the_mini_player_has_no_footer_to_hide(self):
+        h = self._harness(_mini_player=True)
+        try:
+            assert _hints_on_screen(h) == [], "the tiny player has a footer?"
+            self._press(h, "h")
+            assert h.player._footer_hidden is False
+            h.player._mini_player = False
+            h.repaint()
+            assert _hints_on_screen(h), _body(h)
+        finally:
+            h.live.stop()
+
+    # ── the rows it frees, and the ones it doesn't cost ──
+
+    def test_the_body_gets_the_rows_back(self):
+        """A short window shrinks the page to make room for the footer. With
+        the footer put away the rows go back to the list, which is the only
+        sane thing to spend them on."""
+        h = self._harness(width=80, height=20, mode=HeadlessTidalPlayer.MODE_QUEUE)
+        try:
+            rows = lambda: len([r for r in _body(h) if "Track number" in r])
+            before = rows()
+            assert before, _body(h)
+            self._press(h, "h")
+            assert rows() > before, (before, rows())
+            h.assert_one_frame("more rows, no footer")
+        finally:
+            h.live.stop()
+
+    def test_it_is_the_first_hint_a_narrow_window_drops(self):
+        """Rank 9, above everything else in every mode: a footer with room for
+        five keys spends them on what the screen does."""
+        rows = _rows(40, 9, mode=HeadlessTidalPlayer.MODE_PLAYER)
+        hints = " ".join(_hint_rows(rows))
+        assert "[space]" in hints, rows
+        assert "[h]" not in hints, hints
+
+    # ── it is a moment, not a setting ──
+
+    def test_it_does_not_survive_a_restart(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(player_mod, "STATE_DIR", tmp_path / "state")
+        monkeypatch.setattr(player_mod, "STATE_FILE",
+                            tmp_path / "state" / "player_state.json")
+        h = self._harness()
+        try:
+            self._press(h, "h")
+            assert _hints_on_screen(h) == []
+            h.player._save_state()
+        finally:
+            h.live.stop()
+        saved = (tmp_path / "state" / "player_state.json").read_text()
+        assert "hidden" not in saved and "footer" not in saved, saved
+
+        fresh = self._harness()
+        try:
+            assert fresh.player._footer_hidden is False
+            assert _hints_on_screen(fresh), _body(fresh)
+        finally:
+            fresh.live.stop()
+
+    def test_it_is_not_a_setting(self):
+        keys = [spec["key"] for spec in config_mod.SETTINGS_SPEC]
+        assert keys, "the spec is empty — this test would pass on nothing"
+        assert not [k for k in keys if "hid" in k or "footer" in k], keys
+
+
 def _tab_rows(h):
     """The [Tab] row that names the section or scope — not the footer's own
     [Tab] hint, which says the key rather than where it has landed."""
@@ -789,21 +1108,26 @@ class TestAFrameNeverOutgrowsTheWindow:
     cause is width or merely length.
     """
 
+    @pytest.mark.parametrize("hidden", [False, True], ids=["footer", "hidden"])
     @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
     @pytest.mark.parametrize("mode", MODES)
     @pytest.mark.parametrize("width", OVERFLOW_WIDTHS)
-    def test_every_mode_at_every_width(self, title, mode, width):
+    def test_every_mode_at_every_width(self, title, mode, width, hidden):
         for height in OVERFLOW_HEIGHTS:
             h = Harness(width=width, height=height,
                         artwork=_art(width, height))
             p = _loaded(h.player, title, _art(width, height))
             p._mode = mode
+            p._footer_hidden = hidden
             lines, widths = _frame(p)
-            assert len(lines) <= height, (title[:12], mode, width, height, len(lines))
-            assert max(widths) <= width, (title[:12], mode, width, height, max(widths))
+            assert len(lines) <= height, (title[:12], mode, width, height,
+                                          hidden, len(lines))
+            assert max(widths) <= width, (title[:12], mode, width, height,
+                                          hidden, max(widths))
 
+    @pytest.mark.parametrize("hidden", [False, True], ids=["footer", "hidden"])
     @pytest.mark.parametrize("title", [WIDE_TITLE, ASCII_TWIN], ids=["wide", "ascii"])
-    def test_every_size_a_window_can_be_dragged_through(self, title):
+    def test_every_size_a_window_can_be_dragged_through(self, title, hidden):
         """The matrix above at its named sizes, and then every size between
         them: a layout that answers to a threshold has an off-by-one at the
         threshold, and 83 columns is a column nobody would have listed."""
@@ -811,9 +1135,10 @@ class TestAFrameNeverOutgrowsTheWindow:
             for height in range(6, 44, 2):
                 h = Harness(width=width, height=height)
                 p = _loaded(h.player, title, _art(width, height))
+                p._footer_hidden = hidden
                 lines, widths = _frame(p)
-                assert len(lines) <= height, (width, height, len(lines))
-                assert max(widths, default=0) <= width, (width, height)
+                assert len(lines) <= height, (width, height, hidden, len(lines))
+                assert max(widths, default=0) <= width, (width, height, hidden)
 
     def test_the_mini_player_too(self):
         for width in WIDTHS + (40,):

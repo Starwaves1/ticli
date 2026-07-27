@@ -295,6 +295,23 @@ KEY_BACKSPACE2 = "\x08"
 KEY_TAB = "\t"
 KEY_SHIFT_TAB = "\x1b[Z"
 
+# The keys that leave a hidden footer hidden: the ones you press while you are
+# only listening. Skip, navigate, play/pause and nothing else — so `[h]` buys
+# a clear screen for exactly as long as you are doing those, and the first
+# thing you do that isn't puts the controls back.
+#
+# Deliberately not `k`, the other play/pause key. The rule the user is told is
+# "arrows and space"; an alias that behaves differently from every other letter
+# is a rule nobody can read off the screen, and `k` is not what the footer
+# advertises.
+HIDE_HOLD_KEYS = frozenset({KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, " "})
+
+# `[h] hide` ranks above every other hint in every mode (the highest here is
+# 8), so it is the first thing a narrow window drops. A footer with room for
+# four keys should spend them on what the screen does, not on how to put the
+# footer away.
+HIDE_HINT_RANK = 9
+
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
     QUALITY_CHOICES,
@@ -1777,6 +1794,11 @@ class HeadlessTidalPlayer:
         self._artwork_request = None
         # Mini player mode
         self._mini_player = False
+        # `[h]`: the footer is put away until something other than an arrow or
+        # the spacebar happens. Transient on purpose — not a setting, not in
+        # SETTINGS_SPEC and not in the saved state, because it is a thing you
+        # do to this moment rather than a preference about the app.
+        self._footer_hidden = False
         # Show more controls
         self._show_more = False
         # The [v] volume overlay, which takes the footer's rows while it is up,
@@ -3980,6 +4002,26 @@ class HeadlessTidalPlayer:
     # ── The pane ──
 
     def _mode_hints(self) -> list:
+        """The footer's hints: what the screen offers, plus `[h] hide`.
+
+        Two things live here rather than in the eight branches below, because
+        both are true of every screen at once and a copy per screen is how the
+        two of them would drift apart. Hidden is simply a footer with no hints
+        in it — the same answer the mini player gives — so everything
+        downstream (the blank row, the rows the body gets back, the crop)
+        follows from one empty list instead of from a flag threaded through
+        the layout.
+        """
+        if self._footer_hidden:
+            return []
+        hints = self._screen_hints()
+        if hints and self._can_hide_footer():
+            # Last, after `back`: the footer reads as what this screen does,
+            # then how to put the footer away
+            hints.append(Hint("h", "hide", None, HIDE_HINT_RANK))
+        return hints
+
+    def _screen_hints(self) -> list:
         """What this mode's footer offers, in the order it is shown.
 
         `short` is the same thing in fewer columns and `rank` decides what is
@@ -6022,6 +6064,32 @@ class HeadlessTidalPlayer:
     # ── Key handlers ──
 
     def _handle_key(self, key: str):
+        # `[h]`, before everything — including the confirmations, which return
+        # early, and the volume overlay, which would otherwise swallow the key
+        # that puts the footer back.
+        #
+        # Un-hiding does *not* consume the key: `s` restores the footer and
+        # opens search, in that order, because a key that has to be pressed
+        # twice is worse than a footer that came back a moment early. That is
+        # the opposite of scrub focus, which consumes ←/→ deliberately — there
+        # the two meanings are in competition and only one of them can win;
+        # here nothing is competing, since `h` is the only key this feature
+        # binds and no screen binds it for anything else.
+        #
+        # Any key that is not an arrow or the spacebar un-hides, including one
+        # this mode does nothing with. The alternative — un-hide only on a key
+        # that is bound here — needs a second copy of the mode dispatch to say
+        # which those are, and that copy is exactly what 609e423 deleted from
+        # the footer; it would go stale the first time a binding was added. It
+        # is also the better behaviour: a key that did nothing is precisely the
+        # moment the cheat-sheet is worth having back.
+        if self._footer_hidden:
+            if key not in HIDE_HOLD_KEYS:
+                self._footer_hidden = False
+        elif key == "h" and self._can_hide_footer():
+            self._footer_hidden = True
+            return
+
         # Handle quit confirmation first
         if self._quit_pending:
             if key == KEY_ESC:
@@ -6155,6 +6223,24 @@ class HeadlessTidalPlayer:
         return (self._mode != self.MODE_SEARCH
                 and self._settings_edit is None
                 and self._picker_new_name is None)
+
+    def _can_hide_footer(self) -> bool:
+        """Whether `h` means "put the controls away" right now.
+
+        The same three typing screens `v` stands down for — a search query, a
+        settings row, the picker's new-playlist name — because there `h` is the
+        letter h and typing it must type it. Plus two screens with no footer of
+        their own to hide: the mini player, which is one line by design, and
+        the volume overlay, which has taken the footer's rows and whose own
+        `←/→ adjust` is a control rather than a cheat-sheet. Hiding under the
+        overlay would be a change nobody can see until they close it.
+
+        Only hiding is gated. Un-hiding is not: whatever screen you end up on,
+        the next thing that isn't an arrow or the spacebar brings it back.
+        """
+        return (not self._mini_player
+                and not self._volume_open
+                and self._can_open_volume())
 
     def _open_volume(self, from_focus: bool = False):
         """Open the overlay, recording whether the player had the arrows.

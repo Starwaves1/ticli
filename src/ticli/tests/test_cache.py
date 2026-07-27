@@ -1664,17 +1664,30 @@ class TestClearCacheAction:
 
     def test_the_footer_still_fits_eighty_columns(self):
         """The settings footer is already exactly as wide as the panel allows,
-        which is why the clear action is a line rather than another hint."""
+        which is why the clear action is a line rather than another hint.
+
+        It runs to a second line at 80 columns now that `[h] hide` is on it,
+        which is what the fit's two hint rows are for. What must still be true
+        is that nothing overflows the panel and that every hint arrives whole —
+        `[Esc] back` above all, since it is the way off the page.
+        """
         from rich.console import Console
 
         p = self._settings()
         console = Console(width=80)
         with console.capture() as cap:
             console.print(p._build_display())
-        lines = [line for line in cap.get().splitlines() if "[↑/↓] select" in line]
-        assert lines, "footer not found"
-        assert all(len(line) <= 80 for line in cap.get().splitlines())
-        assert "[Esc] back" in lines[0], "the footer must not wrap at 80 columns"
+        out = cap.get().splitlines()
+        assert [line for line in out if "[↑/↓] select" in line], "footer not found"
+        assert all(len(line) <= 80 for line in out)
+        # The hint rows the player laid out for this window, every one of them
+        # on the screen verbatim: two at most, and none of them clipped
+        hints = [line.plain.strip() for line in p._build_hints(p._fit)]
+        assert 1 <= len(hints) <= 2, hints
+        for line in hints:
+            assert "…" not in line, line
+            assert any(line in row for row in out), (line, out)
+        assert any("[Esc] back" in line for line in hints), "no way off the page"
 
     def test_x_asks_before_deleting(self):
         p = self._settings()

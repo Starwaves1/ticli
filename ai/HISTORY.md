@@ -708,6 +708,69 @@ is degraded and that is explicitly fine.
 The settings readouts are cheap by construction now: the cache's from the
 tracker, the downloads' from one memoised index read.
 
+### `[h]` puts the controls away until you do something other than listen
+
+The owner's ask, verbatim: *"add little h to hide button which only hides
+instructions until any valid key is pressed except for arrows or space"*. He
+wants to look at the player without the cheat-sheet under it, keep skipping and
+navigating without it coming back, and have it return the moment he does
+anything else — because that is when he might want to read it.
+
+**One rule, checked once, before everything else in `_handle_key`.** Hidden,
+any key that is not an arrow or the spacebar un-hides. Not hidden, `h` hides.
+A second `h` therefore un-hides, which is a toggle that falls out of the rule
+rather than a second rule.
+
+**Un-hiding does not consume the key.** `s` restores the footer *and* opens
+search, in that order. This is deliberately unlike scrub focus, which consumes
+`←`/`→`: there the two meanings compete for one key and only one can win, while
+here nothing competes — `h` is the only key this feature binds and no screen
+bound it before. A key you have to press twice is worse than a footer that came
+back a moment early.
+
+**A key that does nothing un-hides too**, and this is the one place the
+decision went against the brief's leaning. Un-hiding only on a *bound* key
+needs a second copy of the mode dispatch to say which keys those are, and that
+copy is exactly the hand-maintained duplicate `609e423` deleted from the
+footer — it would go stale the first time anyone added a binding. It is also
+the better behaviour: you pressed something, nothing happened, and the answer
+to why is the row that just came back. `[z]` on the player screen is a test.
+
+`k` — the other play/pause key — is deliberately *not* in the hold set. The
+rule the user is told is `[h] hide` plus "arrows and space"; an alias that
+behaves differently from every other letter is a rule nobody can read off the
+screen.
+
+**Hidden is a footer with no hints in it**, which is the same answer the mini
+player already gives, so nothing downstream needed a flag: the blank row above
+the footer, the rows the body gets back, `_Fit.relax` and the identity crop all
+follow from one empty list. In an 80x20 queue the freed rows go straight to the
+list, which is measured rather than asserted (`test_the_body_gets_the_rows_back`
+counts rows on the screen before and after).
+
+**`[h] hide` is a `Hint` like any other**, appended in `_mode_hints` rather than
+into eight branches, at rank 9 — above every other hint in every mode, so it is
+the first thing a narrow window drops. At 40x9 the footer is `[space] [←/→] [s]
+[v] [m]` and `[h]` has already gone. The one cost: the settings footer now runs
+to two rows at 80 columns instead of one, which is what the fit's two hint rows
+are for and which the 80x24 test was updated to state.
+
+Everywhere the footer is drawn, so: player, browse, artist, queue, playlists,
+the picker's list, download, settings. **Not** the three screens where `h` is
+the letter h — a search query, a settings row being typed into, the picker's
+new-playlist name — which is `_can_open_volume()` reused rather than restated;
+not the mini player, which has no footer; and not under the volume overlay,
+whose `←/→ adjust` is a control rather than a cheat-sheet, and hiding beneath
+it would be a change nobody can see until they close it.
+
+Transient by construction: an instance attribute, not in `SETTINGS_SPEC`, not
+in the saved state, gone on restart. No new threads, timers or requests — it is
+a bool read by the renderer.
+
+136 new tests, all through `vt.py`: what is on the screen before and after each
+keypress, plus the no-overflow matrix re-run with the footer hidden (every mode
+× 6 widths × 4 heights × 2 titles, and every size from 30x6 to 140x44).
+
 ---
 
 ## In flight at time of writing
