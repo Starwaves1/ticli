@@ -6607,12 +6607,20 @@ class HeadlessTidalPlayer:
             size = final.stat().st_size
             relative = final.relative_to(downloads.download_dir())
             tier, granted = plan["tier"], plan["granted"]
-            if record:
+            def _commit():
                 downloads.record(track_id, relative, tier, size,
                                  granted=granted)
+                self._drop_superseded_cache_copy(track_id)
+
+            # Both halves of _commit write a whole JSON file back after
+            # reading it, so both belong on the runner's single thread — see
+            # the `record=False` note above. Bundled rather than handed back
+            # separately, because a download that recorded itself and left the
+            # cache copy behind is the state this exists to avoid.
+            if record:
+                _commit()
             else:
-                plan["record"] = lambda: downloads.record(
-                    track_id, relative, tier, size, granted=granted)
+                plan["record"] = _commit
             # The folder changed, and so did the one exact size the box could
             # show for this track
             self._downloads_usage = None
@@ -6623,6 +6631,49 @@ class HeadlessTidalPlayer:
             if final is not None:
                 downloads.discard_scratch(final)
             raise
+
+    def _drop_superseded_cache_copy(self, track_id) -> None:
+        """Delete the cached copy of a track that has just been downloaded.
+
+        `_local_copy` looks in the downloads tier *first*, so from the moment
+        a download lands the cached copy of the same track can never be
+        played again. It is not a spare: it is a second copy of identical
+        audio, counted against the cache budget and competing in eviction
+        against songs that can still be used. Keeping it means a deliberate
+        download quietly evicts somebody else's staple.
+
+        Deliberately one-directional. The cache never touches a download —
+        that is the whole point of the two tiers — but a download is entitled
+        to reclaim the machine-owned copy it has replaced, because the cache
+        is disposable by definition and this deletes nothing the user cannot
+        get back by playing the track.
+
+        **Never the track playing right now.** On POSIX unlinking an open
+        file is safe and mpv plays on, but if the backend has not opened it
+        yet it exits and `source_vanished` restarts from the network — an
+        audible hiccup, paid for a bookkeeping tidy-up. The copy stays until
+        the song is over; `reconcile()` and eviction both handle it from
+        there, and one duplicate for the length of one track is nothing.
+
+        Runs on the runner's single writer thread (see `_download_deliver`),
+        because `forget_cached` rewrites the whole tracker file.
+        """
+        if track_id is None or not self._cache.keeps_audio:
+            return
+        if str(getattr(self._current_track, "id", None)) == str(track_id):
+            return
+        path = cached_audio_path(track_id)
+        if not path:
+            self._cache.forget_cached([track_id])  # entry with no file
+            return
+        try:
+            os.unlink(path)
+        except OSError as e:
+            # A cache copy that will not go is not a failed download
+            logger.debug("Could not drop the superseded cached copy: %s", e)
+            return
+        self._cache.forget_cached([track_id])
+        self._cache.invalidate_audio_count()
 
     # ── Re-fetch everything at the current quality ──
     #

@@ -730,11 +730,55 @@ class TestDownloadingSomethingAlreadyCached:
         # Tagged in place, so it is not byte-identical — but the audio is
         assert AUDIO in landed.read_bytes()
 
-    def test_the_cached_copy_is_left_where_it_was(self, monkeypatch):
+    def test_promotion_reads_the_cached_copy_rather_than_consuming_it(self, monkeypatch):
+        """The promotion itself must `copy`, never `move`.
+
+        The cached file can be open in the backend at that very moment, and
+        the download has to be able to fail and leave the cache exactly as it
+        found it. Checked *during* the operation, because the copy is deleted
+        afterwards on purpose — see the next test — and an end-state
+        assertion could no longer tell a copy from a move.
+        """
         p = self._player_expecting_no_network(monkeypatch)
         cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        seen = []
+        real_write = player_mod.tags.write_tags
+        # Tagging is the last step before the index row, so the cache copy is
+        # still expected to be on disk here
+        monkeypatch.setattr(player_mod.tags, "write_tags",
+                            lambda *a, **k: (seen.append(cached.exists()),
+                                             real_write(*a, **k))[1])
         _download(p, "LOSSLESS")
-        assert cached.exists(), "promoting moved the cache's own copy"
+        assert seen == [True], "promoting moved the cache's own copy"
+
+    def test_the_superseded_cached_copy_is_reclaimed(self, monkeypatch):
+        """Once the download exists, `_local_copy` prefers it for ever, so the
+        cached copy can never be played again. It is not a spare — it is a
+        second copy of identical audio holding cache budget and competing in
+        eviction against songs that can still be used."""
+        p = self._player_expecting_no_network(monkeypatch)
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        assert _download(p, "LOSSLESS")["state"] == "done"
+
+        assert not cached.exists(), "two copies of the same audio survived"
+        assert p._cache.audio_record(42) is None, \
+            "the tracker still claims a song that is gone"
+        assert p._cache.cached_usage() == (0, 0)
+        # The download itself is untouched — this only ever reclaims the
+        # machine-owned side
+        assert downloads.path_for(42) is not None
+
+    def test_the_track_playing_right_now_keeps_its_cached_copy(self, monkeypatch):
+        """Unlinking it is safe on POSIX once the backend has the file open —
+        but if it has not opened it yet it exits and restarts from the
+        network, which is an audible hiccup paid for a bookkeeping tidy-up.
+        One duplicate for the length of one track is nothing."""
+        p = self._player_expecting_no_network(monkeypatch)
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        p._current_track = _track()          # id 42, the one being downloaded
+        assert _download(p, "LOSSLESS")["state"] == "done"
+        assert cached.exists(), "it deleted the file under the playing track"
+        assert p._cache.audio_record(42) is not None
 
     def test_the_recorded_tier_is_the_one_that_was_granted(self, monkeypatch):
         p = self._player_expecting_no_network(monkeypatch)
