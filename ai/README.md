@@ -5,6 +5,44 @@ covers that better — but of **why it is the way it is**: what was tried, what
 was rejected, what broke, and which constraints are load-bearing rather than
 incidental.
 
+## If you are an agent: you are expected to update this folder
+
+Reading `ai/` is half the job. **Writing back to it is the other half**, and it
+is not optional — this folder only works because every agent before you left it
+truer than they found it. Do it *in the same commit as the code*, never as a
+retrofit later: a note written from memory two hours after the fact loses the
+measurement, the rejected alternative, and the reason — which is the only part
+worth keeping.
+
+What goes where, when you finish a piece of work:
+
+- **[HISTORY.md](HISTORY.md)** — always. A dated entry per change, in the style
+  of the ones already there: what changed, *why*, what you measured, and what
+  you rejected and why you rejected it.
+- **[INCIDENTS.md](INCIDENTS.md)** — when something was broken in a way that
+  teaches a rule. Not every bug; the ones where the *reason it survived* is
+  instructive. Every rule in WORKING-RULES.md came from one of these.
+- **[DECISIONS.md](DECISIONS.md)** — when the owner decides something, when a
+  spec moves from proposed to built, or when you defer something. Quote him
+  where the wording matters; record what is still open as clearly as what is
+  settled.
+- **[WORKING-RULES.md](WORKING-RULES.md)** — only when you learn a constraint
+  that will bind future work. Rare, and it should hurt to add one.
+- **`reference/`** — research and audits. Mark superseded material with a dated
+  header rather than deleting it; a wrong answer with its date attached is more
+  useful than a gap.
+
+Two habits that matter more than the file list. **Correct what is now wrong** —
+if you make a documented statement untrue, fix the statement in the same commit;
+stale confidence is worse than silence. And **write down what you did not do**:
+scope you dropped, a fix you judged too risky, a hypothesis you refuted. The
+refutations have repeatedly been the most valuable entries here.
+
+If you are the main thread rather than a subagent, this is your job to enforce:
+say it in the brief, and check it in the diff.
+
+## Reading order
+
 If you are an agent picking this project up, read in this order:
 
 | File | What it gives you |
@@ -30,9 +68,14 @@ duplicate them.
 audio, Rich for the TUI. This is Garrett's fork (`Starwaves1/ticli`) of
 `odonald/ticli`.
 
-Work ran 2026-07-24 to 2026-07-26. Starting point: a player that worked but
-was, in the owner's words, clunky. Twenty commits later: 605 tests, real
-lossless audio, sub-2ms input latency, and a UI that survives being resized.
+Work began 2026-07-24. Starting point: a player that worked but was, in the
+owner's words, clunky. Since then: real lossless audio, sub-2ms input latency,
+a UI that survives being resized, an on-disk cache with a tracker that decides
+what is worth keeping, and downloads to the user's own music folder. The test
+suite was 5 tests at the start and 1,222 as of 2026-07-26.
+
+(Counts like that one go stale. If you notice a number here that no longer
+matches reality, correct it — see the section above.)
 
 ## The one-paragraph version of the philosophy
 
