@@ -123,6 +123,28 @@ Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate a
 └─────────┘    metadata     └───────────┘                  └───────────┘
 ```
 
+## Contributing, and a note for AI agents
+
+**Start with [`ai/README.md`](ai/README.md).** Much of this project was built
+with AI assistance, and `ai/` is where the reasoning lives: the constraints that
+are load-bearing, what was measured, what was tried and rejected, and the
+incidents that produced the rules. It is short, and reading it first will save
+you from re-deriving things the hard way — several of its rules exist because
+violating them broke something real.
+
+Two constraints are worth knowing before you touch anything:
+
+- **Be frugal with TIDAL's API.** Rate-limiting an account is easy to do by
+  accident and it stops the owner's music. `ai/WORKING-RULES.md` has the
+  specifics.
+- **Tests assert observable reality** — bytes on disk, escape sequences on the
+  terminal, request counts — not internal bookkeeping. A feature here once
+  passed its whole suite for two days without writing a single byte.
+
+If you are an AI agent working on this repository, **updating `ai/` is part of
+the work, in the same commit as the code.** `ai/README.md` says what belongs
+where.
+
 ## Requirements
 
 - macOS or Linux
