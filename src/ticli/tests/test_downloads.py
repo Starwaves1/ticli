@@ -1365,11 +1365,12 @@ class TestTheTwoTiersReadAsTwoTiers:
     def test_the_downloads_carry_no_budget_and_say_so(self):
         gb = cache_mod.BYTES_PER_GB
         text = self._page(0, 0, 3, 3 * gb)
-        assert "Downloads     3 songs · 3.000 GB · not counted against" in text
-        # No [x] on the downloads row: nothing in ticli deletes a track
-        # somebody asked for
+        assert "Downloads     3 songs · 3.000 GB · exempt from the budget" in text
+        # No [x] on the downloads row: the cache is cleared wholesale and the
+        # downloads are gone through one at a time, behind [d]
         rows = [line for line in text.splitlines() if "Downloads" in line]
         assert rows and "[x]" not in rows[0]
+        assert "[d] list" in rows[0]
 
     def test_the_two_numbers_line_up(self):
         """The point of the redesign: they are meant to be compared."""
@@ -1747,4 +1748,309 @@ class TestSettingsShowsTheFolder:
         # Exemption from the budget is a fact about the number beside it, not
         # prose about the feature, so it is on the row and survives a short
         # window the way the count and the path do
-        assert "not counted against the budget" in text
+        assert "exempt from the budget" in text
+
+
+class TestSeeingAndRemovingWhatYouHave:
+    """The downloads list and its delete.
+
+    Garrett: downloads were "really incomplete and pretty janky" — the only
+    evidence of one was a count on the settings page — and, on a delete,
+    "yes, with a confirmation".
+
+    Deleting is a policy change and this class is written as one. The rules
+    that did *not* change are the ones asserted hardest: the exact recorded
+    path and nothing else, no directory ever, nothing touched before the
+    answer comes back, and a file ticli did not write is not reachable at all.
+    Every assertion here is about bytes on disk or about the grid a real
+    terminal would show — never about a function's return value alone.
+    """
+
+    def _download(self, tid, artist="Daft Punk", album="RAM", name="Get Lucky",
+                  ext=".flac", data=b"music", granted=None):
+        root = downloads.download_dir()
+        path = root / artist / album / f"{tid:02d} {name}{ext}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        downloads.record(tid, path.relative_to(root), "LOSSLESS", len(data),
+                         granted=granted)
+        return path
+
+    def _open(self, player):
+        player._mode = player.MODE_SETTINGS
+        player._handle_key("d")
+        return player
+
+    def _list(self, player) -> str:
+        return player._build_downloads_display().plain
+
+    # ── the list ──
+
+    def test_the_downloads_row_opens_the_list(self):
+        self._download(1)
+        p = _player()
+        p._user_display_name = "Garrett"
+        assert "[d] list" in p._build_settings_display().plain
+        self._open(p)
+        assert p._mode == p.MODE_DOWNLOADS
+        # ← comes back to the settings row you pressed [d] on, not the player
+        p._handle_key("\x1b")
+        assert p._mode == p.MODE_SETTINGS
+
+    def test_the_list_shows_title_artist_tier_and_size(self):
+        self._download(7, artist="Fleetwood Mac", album="Rumours",
+                       name="Dreams", ext=".m4a", data=b"x" * 4096,
+                       granted=HeadlessTidalPlayer.QUALITY_MAP["HIGH"])
+        text = self._list(self._open(_player()))
+        assert "Dreams" in text
+        assert "Fleetwood Mac" in text
+        # The tier TIDAL *granted*, not the one that was asked for — the
+        # record above asked LOSSLESS and was handed 320k AAC
+        assert "HIGH" in text and "LOSSLESS" not in text
+        # Bytes on this disk, so no `~`
+        assert "4.0 KB" in text
+        assert "~" not in text
+
+    def test_an_empty_folder_says_so_rather_than_showing_nothing(self):
+        text = self._list(self._open(_player()))
+        assert "Nothing downloaded yet" in text
+        assert str(downloads.download_dir()) in text
+
+    def test_a_file_deleted_by_hand_is_not_listed(self):
+        kept = self._download(1, name="Get Lucky")
+        gone = self._download(2, name="Doin It Right")
+        gone.unlink()          # the user, in Finder
+        p = self._open(_player())
+        text = self._list(p)
+        assert "Get Lucky" in text
+        assert "Doin It Right" not in text
+        # And the index row it left behind is not a crash waiting for a
+        # keypress: paging and [x] both still work over what is really there
+        p._handle_key("\x1b[B")
+        p._handle_key("x")
+        assert p._downloads_delete["title"] == "Get Lucky"
+        assert kept.exists()
+
+    # ── the delete ──
+
+    def test_a_delete_removes_that_exact_file_and_nothing_else(self):
+        doomed = self._download(1, name="Dreams", data=b"a" * 100)
+        spared = self._download(2, name="Get Lucky", data=b"b" * 100)
+        sibling = self._download(3, artist="Sufjan Stevens", album="Illinois",
+                                 name="Chicago", data=b"c" * 100)
+        p = self._open(_player())
+        titles = [r["title"] for r in p._download_rows()]
+        p._downloads_cursor = titles.index("Dreams")
+
+        p._handle_key("x")
+        assert doomed.exists(), "nothing may be touched before the answer"
+        p._handle_key("y")
+
+        assert not doomed.exists()
+        assert spared.read_bytes() == b"b" * 100
+        assert sibling.read_bytes() == b"c" * 100
+        # The folder the file was in stays, empty or not — ~/Music is the
+        # user's and ticli removes no directory at all
+        assert doomed.parent.is_dir()
+        assert doomed.parent.parent.is_dir()
+        assert downloads.download_dir().is_dir()
+        # And the index row went with the file
+        assert set(downloads.load_index()) == {"2", "3"}
+
+    def test_cancelling_leaves_the_file_and_the_index_row_alone(self):
+        path = self._download(1, name="Dreams", data=b"a" * 100)
+        before = json.loads(downloads.index_file().read_text())
+        p = self._open(_player())
+
+        p._handle_key("x")
+        p._handle_key("n")      # anything that is not y
+
+        assert p._downloads_delete is None
+        assert path.read_bytes() == b"a" * 100
+        assert json.loads(downloads.index_file().read_text()) == before
+        assert "Dreams" in self._list(p)
+
+    def test_esc_also_cancels_and_deletes_nothing(self):
+        path = self._download(1, name="Dreams")
+        p = self._open(_player())
+        p._handle_key("x")
+        p._handle_key("\x1b")
+        assert path.exists()
+        assert downloads.load_index()
+
+    def test_a_decoy_file_in_the_music_folder_survives_everything(self):
+        """The download tier's `important.txt`.
+
+        Mirrors test_cache's decoy tests exactly: somebody's own files live
+        in ~/Music, and a delete that reached one would be unforgivable.
+        `remove()` starts from an index row, so a file ticli did not write
+        has no path into it — asserted rather than trusted.
+        """
+        root = downloads.download_dir()
+        song = self._download(1, name="Dreams")
+        decoy = root / "important.txt"
+        decoy.write_text("tax return")
+        mixtape = song.parent / "mixtape.flac"
+        mixtape.write_bytes(b"not ours")
+        stray_dir = root / "Bootlegs"
+        stray_dir.mkdir()
+
+        p = self._open(_player())
+        p._handle_key("x")
+        p._handle_key("y")
+        # And an id that is in no index row at all
+        assert downloads.remove(999) is False
+
+        assert not song.exists()
+        assert decoy.read_text() == "tax return"
+        assert mixtape.read_bytes() == b"not ours"
+        assert stray_dir.is_dir()
+
+    def test_deleting_the_last_row_leaves_a_list_that_still_draws(self):
+        self._download(1, name="Dreams")
+        p = self._open(_player())
+        p._handle_key("x")
+        p._handle_key("y")
+        assert "Nothing downloaded yet" in self._list(p)
+        p._handle_key("x")      # nothing to ask about
+        assert p._downloads_delete is None
+
+    # ── the marker ──
+
+    def test_a_downloaded_track_is_marked_in_browse_queue_and_search(self):
+        self._download(1, name="Get Lucky")
+        p = _player()
+        p._forget_downloads()
+        have, missing = _track(1), _track(2)
+        missing.name = "Doin It Right"
+
+        p._browse_tracks = [have, missing]
+        browse = p._build_browse_display().plain
+        p._queue = [have, missing]
+        queue = p._build_queue_display().plain
+        p._search_results = [{"type": "track", "name": t.name, "artist": "",
+                              "obj": t} for t in (have, missing)]
+        search = p._build_search_display().plain
+
+        for text in (browse, queue, search):
+            marked = [line for line in text.splitlines() if "↓" in line]
+            assert len(marked) == 1, text
+            assert "Get Lucky" in marked[0]
+            assert "Doin It Right" not in marked[0]
+
+    def test_the_marker_follows_a_delete_without_a_restart(self):
+        self._download(1, name="Get Lucky")
+        p = _player()
+        p._browse_tracks = [_track(1)]
+        assert "↓" in p._build_browse_display().plain
+        self._open(p)
+        p._handle_key("x")
+        p._handle_key("y")
+        p._mode = p.MODE_BROWSE
+        assert "↓" not in p._build_browse_display().plain
+
+    # ── what it costs ──
+
+    def test_painting_two_hundred_marked_rows_costs_one_index_read(self, monkeypatch):
+        """Finding F6 of ai/reference/data-path-audit-2026-07-26.md, which is
+        what a `path_for` per row would be: 229 ms of UI-thread JSON at 500
+        entries, twice a second. Assert the reads, not the milliseconds."""
+        for tid in range(200):
+            self._download(tid, name=f"Song {tid}")
+        p = _player()
+        p._page_size = 200
+        p._browse_tracks = [_track(tid) for tid in range(200)]
+        p._forget_downloads()
+
+        reads = []
+        real = downloads.load_index
+
+        def _load():
+            reads.append(1)
+            return real()
+
+        monkeypatch.setattr(downloads, "load_index", _load)
+
+        text = p._build_browse_display().plain
+        assert text.count("↓") == 200
+        assert len(reads) == 1, f"{len(reads)} index reads for one page"
+
+        # And the next nine frames re-measure nothing at all
+        for _ in range(9):
+            p._build_browse_display()
+        assert len(reads) == 1
+
+    def test_the_list_costs_one_index_read_however_long_it_is(self, monkeypatch):
+        for tid in range(200):
+            self._download(tid, name=f"Song {tid}")
+        p = self._open(_player())
+        p._page_size = 200
+        reads = []
+        real = downloads.load_index
+
+        def _load():
+            reads.append(1)
+            return real()
+
+        monkeypatch.setattr(downloads, "load_index", _load)
+        assert self._list(p).count("↓") == 200
+        assert len(reads) == 1
+
+    def test_the_list_and_the_markers_make_no_request_at_all(self, monkeypatch):
+        """ai/INCIDENTS #1. Nothing on this screen needs the network: every
+        field comes off the path the downloader wrote or the index row beside
+        it, which is why there is no [Enter] to play a row."""
+        def _refuse(*a, **k):
+            raise AssertionError("the downloads screen made a request")
+
+        for tid in range(5):
+            self._download(tid, name=f"Song {tid}")
+        p = _player()
+        p.session = types.SimpleNamespace(
+            audio_quality=None, is_pkce=False, track=_refuse, request=_refuse)
+        # Patched after the player is built, so what is being pinned is the
+        # screen rather than the constructor
+        for name in ("get", "post", "put", "delete", "request", "Session"):
+            monkeypatch.setattr(player_mod.requests, name, _refuse)
+        self._open(p)
+        self._list(p)
+        p._handle_key("\x1b[B")
+        p._handle_key("x")
+        p._handle_key("y")
+        p._browse_tracks = [_track(1)]
+        p._build_browse_display()
+        assert len(downloads.load_index()) == 4
+
+    # ── the whole grid ──
+
+    def test_the_list_fits_eighty_by_twentyfour(self):
+        from rich.console import Console
+
+        for tid in range(40):
+            self._download(tid, name=f"A Reasonably Long Song Title {tid}",
+                           data=b"x" * 300_000)
+        p = self._open(_player())
+        console = Console(width=80, height=24)
+        p.console = console
+        with console.capture() as cap:
+            console.print(p._build_display())
+        lines = cap.get().splitlines()
+        assert len(lines) <= 24, f"the pane is {len(lines)} rows in 24"
+        body = "\n".join(lines)
+        assert "Downloads" in body
+        assert "[←/Esc]" in body
+
+    def test_the_confirmation_is_on_screen_whole_at_eighty_columns(self):
+        from rich.console import Console
+
+        self._download(1, name="Come On! Feel the Illinoise!")
+        p = self._open(_player())
+        p._handle_key("x")
+        console = Console(width=80, height=24)
+        p.console = console
+        with console.capture() as cap:
+            console.print(p._build_display())
+        text = cap.get()
+        assert "Delete Come On! Feel the Illinoise! from your music folder?" in text
+        # The part that says how to answer must never be the part that is cut
+        assert "y to confirm, any other key to cancel" in text

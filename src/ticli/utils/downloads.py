@@ -2,10 +2,28 @@
 
 The cache (utils/cache.py) is machine-owned and disposable — deleting it at
 any moment is safe, and a budget evicts from it without asking. Downloads are
-the opposite of all three. They live in the user's own music folder, they are
-never evicted, they are never counted against the cache budget, and nothing in
-ticli ever deletes a finished one. A track someone deliberately downloaded must
-not lose a fight to a track that happened to play twice.
+the opposite. They live in the user's own music folder, they are never
+evicted, they are never counted against the cache budget, and **nothing ever
+removes one except the user, one track at a time, having been asked**. A track
+someone deliberately downloaded must not lose a fight to a track that happened
+to play twice.
+
+That last clause changed on 2026-07-27. This file used to promise that
+*"nothing in ticli ever deletes a finished one"*, and it was true: the only
+way to remove a download was Finder. The owner asked for a delete — "yes,
+with a confirmation" — so the promise is now narrower, and what is left of it
+is the part that was actually protecting anything:
+
+- Only `remove()` deletes a finished download, and only the one track it was
+  given, by the **exact path recorded in the index**. Never a glob, never a
+  pattern, never a sweep, never a budget, never a background thread.
+- **No directory is ever removed.** An album folder this leaves empty stays
+  empty. `~/Music` belongs to somebody.
+- Nothing is unlinked before the confirmation is answered, and cancelling is
+  a no-op rather than a delete-and-restore.
+- A file ticli did not write and record is not reachable from here at all —
+  `remove()` starts from an index row, so a stray file in the music folder
+  has no path into it.
 
 That separation is structural rather than a policy flag: `cache.enforce_budget`
 and `cache.clear_audio` both work from `owned_audio_files()`, which lists
@@ -83,7 +101,8 @@ NOMINAL_BITRATE = {
 }
 
 # Only ever unlinked by name, and only ever ones this module wrote. A finished
-# download is never deleted by ticli at all.
+# download goes only through `remove()`, one track and one confirmation at a
+# time; these two go whenever the download they belong to is abandoned.
 PART_SUFFIX = ".part"
 TAGGING_SUFFIX = ".tagging"
 
@@ -309,13 +328,19 @@ def path_for(track_id):
     return _entry_path(load_index().get(str(track_id)))
 
 
-def usage() -> tuple:
-    """`(how many downloads are really on disk, what they cost)`.
+def present() -> list:
+    """Every recorded download that is really on disk, newest first.
 
-    **One** index read for both numbers, and one `stat` per entry. The two
-    readouts used to call `path_for` per track, and `path_for` re-read and
-    re-parsed the whole JSON file every call — so a settings-page repaint was
-    2(N+1) reads and 2(N+1) parses of an O(N)-sized file:
+    The one walk of the index there is. Everything the interface knows about
+    the downloads tier — the count and the size on the settings page, the
+    marker beside a track row, the rows of the downloads list — is derived
+    from this list, so all of them are one index read and one `stat` per
+    entry and they can never disagree with each other.
+
+    That mattered enough to measure. The two settings readouts used to call
+    `path_for` per track, and `path_for` re-read and re-parsed the whole JSON
+    file every call — so a repaint was 2(N+1) reads and 2(N+1) parses of an
+    O(N)-sized file:
 
         50 downloads     4.54 ms per repaint
         200 downloads   42.70 ms
@@ -326,23 +351,34 @@ def usage() -> tuple:
     order as the 231 ms keypress latency `auto_refresh=False` existed to
     remove (bd4f95f), on the UI thread, in a new place.
 
-    The semantics are unchanged and deliberately so: every file is still
-    stat-ed, and the index is still only a hint about where to look. Kept
-    pure — the remembering is the caller's, on the player instance, because
-    module-level memo state would outlive a test and leak into the next one.
+    Every file is still stat-ed and the index is still only a hint about where
+    to look, so a track the user dragged to the trash is simply not here.
+    Kept pure — the remembering is the caller's, on the player instance,
+    because module-level memo state would outlive a test and leak into the
+    next one.
+
+    Each row is `{"id", "path", "entry", "bytes"}`. `bytes` is the size on
+    disk, not the size the index recorded: the disk is the answer.
     """
-    count = 0
-    total = 0
-    for entry in load_index().values():
+    rows = []
+    for track_id, entry in load_index().items():
         path = _entry_path(entry)
         if path is None:
             continue
-        count += 1
         try:
-            total += path.stat().st_size
+            size = path.stat().st_size
         except OSError:
             continue
-    return count, total
+        rows.append({"id": str(track_id), "path": path, "entry": entry,
+                     "bytes": size})
+    rows.sort(key=lambda row: row["entry"].get("at") or 0, reverse=True)
+    return rows
+
+
+def usage() -> tuple:
+    """`(how many downloads are really on disk, what they cost)`."""
+    rows = present()
+    return len(rows), sum(row["bytes"] for row in rows)
 
 
 def downloaded_count() -> int:
@@ -353,6 +389,62 @@ def downloaded_count() -> int:
 def total_bytes() -> int:
     """What the download folder is costing, from the files that are there."""
     return usage()[1]
+
+
+def describe(relpath) -> tuple:
+    """`(title, artist, album)` read back out of the path this module wrote.
+
+    No second index and no request: `relative_path` lays a download out as
+    `<Album artist>/<Album>/<NN> <Title><ext>` precisely because without an
+    embedded-tag dependency the path *is* a large fraction of the metadata
+    (see the module docstring). The downloads list is that sentence taken at
+    its word.
+
+    Lossy in the way the layout is lossy — a title `safe_component` had to
+    rewrite comes back rewritten — and that is the honest answer, because it
+    is also what every other music player on this machine will show.
+    """
+    parts = Path(relpath).parts
+    stem = Path(relpath).stem
+    # The zero-padded track number is ours, and only ours: it is written as
+    # exactly two digits and a space, so stripping it cannot eat a title that
+    # begins with a number unless that title begins with our own prefix.
+    match = re.match(r"^\d{2} (.+)$", stem)
+    title = match.group(1) if match else stem
+    artist = parts[0] if len(parts) >= 3 else ""
+    album = parts[1] if len(parts) >= 3 else ""
+    return title, artist, album
+
+
+def remove(track_id) -> bool:
+    """Delete one downloaded file and forget it. True if the row is gone.
+
+    The exact path out of the index and nothing else — see the module
+    docstring for the four rules this is the whole implementation of. The
+    directory the file was in is deliberately left behind even when it is now
+    empty; `~/Music` is the user's, and an empty folder costs nothing next to
+    a folder ticli removed by mistake.
+
+    A row whose file the user already deleted by hand is not an error: the
+    row goes and the answer is still True, because "this track is no longer
+    downloaded" is exactly what the caller asked for. A file that is really
+    there and cannot be unlinked leaves the row alone, so the interface keeps
+    saying the true thing.
+    """
+    key = str(track_id)
+    tracks = dict(load_index())
+    entry = tracks.pop(key, None)
+    if entry is None:
+        return False
+    path = _entry_path(entry)
+    if path is not None:
+        try:
+            path.unlink()
+        except OSError as e:
+            logger.debug("Could not delete the download %s: %s", path, e)
+            return False
+    _save_index(tracks)
+    return True
 
 
 # ── estimates ──
@@ -391,9 +483,10 @@ def format_bytes(num: int) -> str:
 def scratch_files(final: Path) -> list:
     """The half-written companions of a destination, by exact name.
 
-    The only files ticli ever deletes under the music folder. A finished
-    download is never removed by anything here, and no directory ever is —
-    `~/Music` belongs to somebody.
+    The files ticli deletes on its own initiative under the music folder, and
+    the whole of that list. A finished download goes only through `remove()`,
+    which the user has to ask for and confirm, and no directory ever goes at
+    all — `~/Music` belongs to somebody.
     """
     return [final.with_name(final.name + PART_SUFFIX),
             final.with_name(final.name + TAGGING_SUFFIX)]

@@ -1878,6 +1878,7 @@ class HeadlessTidalPlayer:
     MODE_ADD_TO_PLAYLIST = "add_to_playlist"
     MODE_SETTINGS = "settings"
     MODE_ARTIST = "artist"
+    MODE_DOWNLOADS = "downloads"
 
     # The artist page's tabs, in the order Tab walks them. Each one is a
     # different TIDAL endpoint and each is fetched the first time you land on
@@ -2111,12 +2112,25 @@ class HeadlessTidalPlayer:
         # ever replaced wholesale, never appended to in place
         self._settings_cursor = 0
         self._settings_edit: Optional[str] = None
-        # `(count, bytes)` for the downloads tier, measured on demand and kept
-        # until something moves it — the same bargain MetadataCache makes for
-        # audio_count / disk_bytes, and for the same reason: the page repaints
-        # twice a second and the folder changes about once a song. On the
-        # instance rather than in the module, so nothing outlives a test.
-        self._downloads_usage: Optional[tuple] = None
+        # What is really in the music folder: `downloads.present()`, measured
+        # on demand and kept until something moves it — the same bargain
+        # MetadataCache makes for audio_count / disk_bytes, and for the same
+        # reason: the page repaints twice a second and the folder changes
+        # about once a song. On the instance rather than in the module, so
+        # nothing outlives a test.
+        #
+        # One measurement, three readers: the settings page's count and size,
+        # the ↓ beside a downloaded track row, and the downloads list. The set
+        # of ids is derived from the same list and memoised beside it, because
+        # a marker is asked for once per row and rebuilding a set per row is
+        # how a memo becomes an O(N²) loop. `_forget_downloads` drops all of
+        # it, and is called by everything that can move the folder.
+        self._downloads_present: Optional[list] = None
+        self._downloads_ids: Optional[set] = None
+        # The downloads list screen: where the cursor is, and the row [x] is
+        # asking about. Nothing is unlinked until that answer comes back.
+        self._downloads_cursor = 0
+        self._downloads_delete: Optional[dict] = None
         # The _play_gen whose play has already been counted, so one
         # listen is one point however many ticks go past (see
         # _maybe_count_play). -1 is "none yet", which no gen ever is.
@@ -3603,6 +3617,9 @@ class HeadlessTidalPlayer:
                     content.append("  \u25b8 ", style="bold cyan")
                 else:
                     content.append("    ", style="")
+                self._download_mark(
+                    content, getattr(item.get("obj"), "id", None)
+                    if item["type"] == "track" else None)
                 type_styles = {"track": "bold green", "album": "bold magenta",
                                "artist": "bold yellow", "playlist": "bold blue"}
                 badge = item["type"].upper()
@@ -3672,10 +3689,10 @@ class HeadlessTidalPlayer:
                 content.append("\n")
                 if self._browse_cursor == -1:
                     content.append("  \u25b8 ", style="bold cyan")
-                    content.append("\u25b6 Play All", style="bold cyan")
+                    content.append("  \u25b6 Play All", style="bold cyan")
                 else:
                     content.append("    ", style="")
-                    content.append("\u25b6 Play All", style="dim green")
+                    content.append("  \u25b6 Play All", style="dim green")
 
             for i in range(page_start, page_end):
                 track = self._browse_tracks[i]
@@ -3684,6 +3701,7 @@ class HeadlessTidalPlayer:
                     content.append("  \u25b8 ", style="bold cyan")
                 else:
                     content.append("    ", style="")
+                self._download_mark(content, getattr(track, "id", None))
                 content.append(f"{i+1:>2}. ", style="dim")
                 content.append(track.name, style="bold white" if i == self._browse_cursor else "white")
                 if track.artists:
@@ -3810,6 +3828,7 @@ class HeadlessTidalPlayer:
                     content.append("  \u266b ", style="bold cyan")
                 else:
                     content.append("    ", style="")
+                self._download_mark(content, getattr(track, "id", None))
                 t_name = track.name if hasattr(track, "name") else "?"
                 t_artist = track.artists[0].name if hasattr(track, "artists") and track.artists else ""
                 t_dur = format_time(track.duration) if hasattr(track, "duration") else ""
@@ -3957,19 +3976,63 @@ class HeadlessTidalPlayer:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _download_usage(self) -> tuple:
-        """`(downloads on disk, what they cost)`, measured once and kept.
+    def _downloads(self) -> list:
+        """What is really in the music folder, measured once and kept.
 
-        `downloads.usage()` is one index read and one stat per entry, which is
-        already 229x cheaper than the two calls this replaced — but it is
-        still disk work, and `_repaint` builds the settings display on every
-        idle tick before deciding whether the frame changed. So it is
-        remembered, and dropped by the two things that move it: opening the
-        page, and a download landing.
+        `downloads.present()` is one index read and one stat per entry, which
+        is already 229x cheaper than the calls it replaced — but it is still
+        disk work, and `_repaint` builds the display on every idle tick before
+        deciding whether the frame changed. So it is remembered, and dropped
+        by the things that move it: opening the settings page or the list, a
+        download landing, and a delete.
         """
-        if self._downloads_usage is None:
-            self._downloads_usage = downloads.usage()
-        return self._downloads_usage
+        if self._downloads_present is None:
+            self._downloads_present = downloads.present()
+        return self._downloads_present
+
+    def _downloaded(self, track_id) -> bool:
+        """Is this track already in the music folder?
+
+        Answered out of the one memoised measurement, so a 200-row page costs
+        the same single index read a 1-row page does — the alternative is a
+        `path_for` per row per repaint, which is finding F6 of
+        ai/reference/data-path-audit-2026-07-26.md: 229 ms of UI-thread JSON,
+        twice a second.
+        """
+        if track_id is None:
+            return False
+        if self._downloads_ids is None:
+            self._downloads_ids = {row["id"] for row in self._downloads()}
+        return str(track_id) in self._downloads_ids
+
+    def _forget_downloads(self) -> None:
+        """Re-measure the music folder next time anything asks."""
+        self._downloads_present = None
+        self._downloads_ids = None
+        self._download_known = None
+
+    def _download_usage(self) -> tuple:
+        """`(downloads on disk, what they cost)`."""
+        rows = self._downloads()
+        return len(rows), sum(row["bytes"] for row in rows)
+
+    def _download_mark(self, content: Text, track_id) -> None:
+        """The two columns every track row starts with.
+
+        A dim `↓` says the file is already on this disk. Reserved rather than
+        inserted, so the titles under it stay in one column whether or not
+        anything on the page is downloaded — and drawn at the *left*, before
+        the number, because it is the one new thing on the row and the right
+        edge is what a narrow window clips.
+
+        `↓` and not a dot or a diamond: those read as bullets, and the two
+        marks this app already draws in that gutter are `▸` (the cursor) and
+        `▶` (Play All).
+        """
+        if self._downloaded(track_id):
+            content.append("↓ ", style="dim cyan")
+        else:
+            content.append("  ", style="")
 
     def _build_settings_display(self) -> Text:
         content = Text()
@@ -4086,8 +4149,20 @@ class HeadlessTidalPlayer:
             content.append(" clear", style="dim")
         content.append("\n   Downloads  ", style="dim")
         content.append(f"{kept:>4} song{' ' if kept == 1 else 's'}", style="dim")
-        content.append(f" · {format_gb(kept_bytes)} · not counted against"
-                       " the budget", style="dim")
+        # "exempt from the budget" rather than the longer "not counted
+        # against the budget" it used to say: the same fact in six fewer
+        # columns, which is what bought the `[d]` beside it inside 80. The
+        # fact stays on the row rather than moving to the list screen,
+        # because it is a fact about the number next to it and the whole
+        # point of these two rows is reading one number against the other.
+        content.append(f" · {format_gb(kept_bytes)} · exempt from the budget",
+                       style="dim")
+        # The way in to the list. The two rows now offer the same shape of
+        # thing in the same place — the cache can be cleared wholesale, the
+        # downloads are gone through one at a time — and until this existed
+        # the only evidence of a download was this count.
+        content.append("   [d]", style="bold")
+        content.append(" list", style="dim")
         # A path you can paste into Finder or a terminal, with the one action
         # that spans both tiers beside it — this page has no rows to spare
         # (80x24 shows three settings rows as it is), so a line of its own for
@@ -4131,6 +4206,124 @@ class HeadlessTidalPlayer:
         content.append(" log out", style="dim")
         content.append_text(self._build_pkce_line())
         return content
+
+    def _download_rows(self) -> list:
+        """The downloads list, as rows a screen can draw.
+
+        Derived from the same one measurement everything else in this tier
+        reads (`_downloads`), so opening the list costs no extra index read
+        and **no network at all** — every field comes off the path the
+        downloader wrote or out of the index row beside it.
+
+        The disk is the answer and the index is a hint: `downloads.present()`
+        stats every file, so a track dragged to the trash in Finder is simply
+        not a row here. The tier is the one TIDAL **granted**, not the one
+        that was asked for — a device-flow session asks for hi-res and is
+        handed 320k AAC, and a list that said HIRES over an AAC file would be
+        lying about bytes the user can go and look at.
+        """
+        granted_names = {quality: name for name, quality
+                         in self.QUALITY_MAP.items()}
+        rows = []
+        for row in self._downloads():
+            entry = row["entry"]
+            title, artist, _album = downloads.describe(entry.get("path") or "")
+            tier = granted_names.get(entry.get("granted")) or entry.get("quality")
+            rows.append({
+                "id": row["id"], "path": row["path"], "bytes": row["bytes"],
+                "title": title, "artist": artist,
+                "tier": str(tier or "").upper(),
+            })
+        return rows
+
+    def _build_downloads_display(self) -> Text:
+        """What is actually in the music folder, newest first.
+
+        Deliberately not a player: Enter does nothing here and there is no
+        `[a] play all`. Playing a row means resolving a track id through the
+        session, and this screen's whole claim is that it makes no request —
+        the songs are all reachable from search and the queue anyway, marked
+        with the same `↓`.
+        """
+        content = Text()
+        content.append("   Downloads", style="bold magenta")
+        rows = self._download_rows()
+        if not rows:
+            content.append("\n\n   Nothing downloaded yet", style="dim green")
+            content.append(f"\n   {downloads.display_dir()}", style="dim")
+            return content
+
+        total = len(rows)
+        self._downloads_cursor = min(max(self._downloads_cursor, 0), total - 1)
+        page = self._page_rows()
+        page_start = (self._downloads_cursor // page) * page
+        page_end = min(page_start + page, total)
+        # Bytes, not the settings page's gigabytes: there is no budget on this
+        # screen to read the number against, and a real library of forty songs
+        # is "1.2 GB" there and an honest "1.2 GB" here but "0.073 GB" is not
+        # a number anybody reads
+        content.append(
+            f"  ({total} · "
+            f"{downloads.format_bytes(sum(r['bytes'] for r in rows))})",
+            style="dim")
+        content.append("\n", style="")
+        for i in range(page_start, page_end):
+            row = rows[i]
+            selected = (i == self._downloads_cursor)
+            content.append("\n")
+            content.append("  ▸ " if selected else "    ",
+                           style="bold cyan" if selected else "")
+            # The same `↓` the browse and queue rows carry, for the same
+            # reason: every row on this screen is downloaded, and a column
+            # that appears and disappears between screens is a column you
+            # have to re-learn
+            content.append("↓ ", style="dim cyan")
+            content.append(row["title"],
+                           style="bold white" if selected else "white")
+            if row["artist"]:
+                content.append(f"  {row['artist']}", style="dim")
+            if row["tier"]:
+                content.append(f"  {row['tier']}", style="dim")
+            # No `~`: these are bytes on this disk, counted, not estimated
+            content.append(f"  {downloads.format_bytes(row['bytes'])}",
+                           style="dim cyan")
+        if total > page:
+            page_num = (self._downloads_cursor // page) + 1
+            total_pages = (total + page - 1) // page
+            content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+        return content
+
+    def _build_delete_download_confirm(self) -> Text:
+        row = self._downloads_delete or {}
+        content = Text()
+        # Two lines, like the re-fetch prompt and unlike the cache one: the
+        # title is the whole point of asking and it is the part that can be
+        # any length, so it must not be what pushes `y to confirm` off the end
+        content.append(f"\n   Delete {row.get('title') or 'this download'}"
+                       " from your music folder?", style="bold yellow")
+        content.append("\n   ", style="")
+        content.append("y", style="bold")
+        content.append(" to confirm, any other key to cancel", style="dim")
+        return content
+
+    def _delete_download(self) -> None:
+        """Unlink the one file [x] asked about, and forget it.
+
+        Everything destructive about this feature is these four lines, and
+        all of it is `downloads.remove` — one exact path out of the index, no
+        directory, nothing that was not written and recorded here. The memos
+        go with it, so the count, the size and every `↓` on every other
+        screen agree on the next frame rather than at the next restart.
+        """
+        row = self._downloads_delete
+        self._downloads_delete = None
+        if not row:
+            return
+        if downloads.remove(row["id"]):
+            self._forget_downloads()
+            self._set_toast(f"Deleted {row['title']}")
+        else:
+            self._set_toast("Could not delete that file")
 
     def _build_quality_gate_note(self) -> Text:
         """Why the dimmed tiers in the ladder above are dimmed — and, if the
@@ -4462,6 +4655,20 @@ class HeadlessTidalPlayer:
                 Hint("v", "volume", "vol", 3),
                 Hint("\u2190/Esc", "cancel", None, 1),
             ]
+        if self._mode == self.MODE_DOWNLOADS:
+            # No Enter and no [a]: this screen makes no request, and playing a
+            # row would be one. [x] is "remove" here for the same reason it is
+            # on the browse screen and on the settings page.
+            hints = [Hint("\u2191/\u2193", "navigate", "move", 1)]
+            if self._downloads():
+                # Not offered over an empty folder: a key that can only
+                # refuse is the "hidden option looks like a missing feature"
+                # rule read the other way round
+                hints.append(Hint("x", "delete", "del", 0))
+            hints.append(Hint("Space", "pause/play", "pause", 4))
+            hints.append(Hint("v", "volume", "vol", 3))
+            hints.append(Hint("\u2190/Esc", "back", None, 2))
+            return hints
         if self._mode == self.MODE_SETTINGS:
             return [
                 Hint("\u2191/\u2193", "select", None, 1),
@@ -4888,6 +5095,8 @@ class HeadlessTidalPlayer:
                 content.append_text(self._build_add_to_playlist_display())
             elif self._mode == self.MODE_SETTINGS:
                 content.append_text(self._build_settings_display())
+            elif self._mode == self.MODE_DOWNLOADS:
+                content.append_text(self._build_downloads_display())
 
         if self._quit_pending:
             content.append_text(self._build_quit_confirm())
@@ -4899,6 +5108,8 @@ class HeadlessTidalPlayer:
             content.append_text(self._build_clear_cache_confirm())
         elif self._refetch_pending:
             content.append_text(self._build_refetch_confirm())
+        elif self._downloads_delete is not None:
+            content.append_text(self._build_delete_download_confirm())
 
         return self._with_footer(content, fit)
 
@@ -5082,6 +5293,14 @@ class HeadlessTidalPlayer:
                 "mode": self.MODE_PLAYLISTS,
                 "cursor": self._playlists_cursor,
             })
+        elif self._mode == self.MODE_SETTINGS:
+            # Only reachable since the downloads list, which is the one screen
+            # you can open *from* settings — ← out of it has to land back on
+            # the row you pressed [d] on rather than on the player
+            self._nav_history.append({
+                "mode": self.MODE_SETTINGS,
+                "cursor": self._settings_cursor,
+            })
         else:
             self._nav_history.append({"mode": self.MODE_PLAYER})
 
@@ -5124,6 +5343,10 @@ class HeadlessTidalPlayer:
         elif mode == self.MODE_PLAYLISTS:
             self._mode = self.MODE_PLAYLISTS
             self._playlists_cursor = state.get("cursor", 0)
+        elif mode == self.MODE_SETTINGS:
+            self._mode = self.MODE_SETTINGS
+            self._settings_cursor = min(state.get("cursor", 0),
+                                        len(SETTINGS_ROWS) - 1)
         else:
             self._mode = self.MODE_PLAYER
 
@@ -6623,8 +6846,7 @@ class HeadlessTidalPlayer:
                 plan["record"] = _commit
             # The folder changed, and so did the one exact size the box could
             # show for this track
-            self._downloads_usage = None
-            self._download_known = None
+            self._forget_downloads()
             return final, written, size, tier
         except Exception:
             self._discard_staging(track_id)
@@ -7374,6 +7596,16 @@ class HeadlessTidalPlayer:
                 self._clear_cached_songs()
             return
 
+        # Nothing is unlinked until this is answered, and cancel is a true
+        # no-op: the row is dropped and neither the file nor the index has
+        # been touched, rather than a delete that gets put back.
+        if self._downloads_delete is not None:
+            if key in ("y", "Y", KEY_ENTER, KEY_ENTER2):
+                self._delete_download()
+            else:
+                self._downloads_delete = None
+            return
+
         # Nothing is fetched until this is answered, and cancel is a true
         # no-op — the same shape as every other confirmation here
         if self._refetch_pending:
@@ -7429,6 +7661,8 @@ class HeadlessTidalPlayer:
             self._handle_add_to_playlist_key(key)
         elif self._mode == self.MODE_SETTINGS:
             self._handle_settings_key(key)
+        elif self._mode == self.MODE_DOWNLOADS:
+            self._handle_downloads_key(key)
         else:
             self._handle_player_key(key)
 
@@ -7595,7 +7829,7 @@ class HeadlessTidalPlayer:
             # open — including by a deletion made outside ticli, which is the
             # only way that is ever noticed
             self._cache.invalidate_audio_count()
-            self._downloads_usage = None
+            self._forget_downloads()
             self._nav_history.clear()
         elif key == KEY_ESC:
             self._quit_pending = True
@@ -7914,6 +8148,13 @@ class HeadlessTidalPlayer:
         if key in ("u", "U"):
             self._upgrade_to_pkce()
             return
+        # The Downloads row's own action, beside the count it explains. `d`
+        # rather than a new letter: it is the key that means "downloads"
+        # everywhere else in the app, and there is nothing on this page to
+        # download so the two cannot be confused.
+        if key in ("d", "D"):
+            self._open_downloads()
+            return
         # Re-fetch everything at the current quality. An action, so it lives
         # outside SETTINGS_SPEC like [x] and [o]; and it asks first, because
         # it is the one thing here that deliberately makes hundreds of
@@ -7932,6 +8173,44 @@ class HeadlessTidalPlayer:
             self._change_setting(-1)
         elif key in (KEY_RIGHT, KEY_ENTER, KEY_ENTER2):
             self._change_setting(1)
+
+    def _open_downloads(self):
+        """Show what is in the music folder. One re-measurement, no network.
+
+        The folder is the one thing on this page that changes without ticli
+        (a file dragged to the trash in Finder), so opening the list is one of
+        the moments the memo is dropped — the same rule opening the settings
+        page follows.
+        """
+        self._push_nav()
+        self._mode = self.MODE_DOWNLOADS
+        self._downloads_cursor = 0
+        self._forget_downloads()
+
+    def _handle_downloads_key(self, key: str):
+        if key == KEY_ESC or key == KEY_LEFT:
+            self._go_back()
+            return
+        if key == " ":
+            self._toggle_play_key()
+            return
+        rows = self._download_rows()
+        if key == KEY_UP:
+            if self._downloads_cursor <= 0:
+                # The top of a list is where ↑ hands the arrows to the player
+                # for scrubbing, on this screen as on every other one
+                self._focus_player()
+            else:
+                self._downloads_cursor -= 1
+            return
+        if key == KEY_DOWN:
+            self._downloads_cursor = min(len(rows) - 1, self._downloads_cursor + 1)
+            return
+        if key in ("x", "X") and rows:
+            # Only remembered here. Nothing is unlinked until _handle_key sees
+            # the answer.
+            self._downloads_delete = rows[min(self._downloads_cursor,
+                                              len(rows) - 1)]
 
     # ── Main loop ──
 
