@@ -476,6 +476,105 @@ class TestASingleFileDownload:
             server.close()
 
 
+class TestATierThatCannotBeServedStepsDown:
+    """A tier this login cannot have is usually not an error — TIDAL grants
+    something lower and says so. But it can fail outright, and giving up then
+    leaves the user with nothing when a good copy was one rung down."""
+
+    def _track_failing_above(self, server, ceiling):
+        """A track whose `get_stream` raises for every tier above `ceiling`,
+        recording which tiers were asked for."""
+        asked = []
+        track = _track()
+
+        def _stream():
+            tier = str(track._session.audio_quality)
+            asked.append(tier)
+            if player_mod.QUALITY_RANK.get(tier, 0) > \
+                    player_mod.QUALITY_RANK[ceiling]:
+                raise RuntimeError(f"{tier} is not available for this track")
+            return types.SimpleNamespace(
+                audio_quality=tier,
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: [server.url("/track.mp4")]))
+
+        track.get_stream = _stream
+        return track, asked
+
+    def test_it_walks_down_until_one_works(self):
+        server = _Server({"/track.mp4": _mp4()})
+        try:
+            p = _player(quality="HIRES")
+            track, asked = self._track_failing_above(server, "LOSSLESS")
+            track._session = p.session
+            p._download_track = track
+            job = _download(p, "HIRES")
+
+            assert job["state"] == "done", job.get("error")
+            assert asked == ["HI_RES_LOSSLESS", "LOSSLESS"], \
+                "it did not step down exactly one rung at a time"
+            # The file is real and it is on the disk
+            assert downloads.path_for(track.id) is not None
+
+            # And the box says which rung it stopped on, rather than letting a
+            # HIRES request that came back LOSSLESS read as a hi-res file
+            assert job["landed"] == "LOSSLESS"
+            p._download_open = True
+            assert "LOSSLESS" in _rendered(p)
+        finally:
+            server.close()
+
+    def test_the_recorded_tier_is_the_one_that_was_served(self):
+        server = _Server({"/track.mp4": _mp4()})
+        try:
+            p = _player(quality="HIRES")
+            track, _ = self._track_failing_above(server, "HIGH")
+            track._session = p.session
+            p._download_track = track
+            assert _download(p, "HIRES")["state"] == "done"
+            entry = downloads.load_index()[str(track.id)]
+            assert entry["granted"] == "HIGH", \
+                "a HIGH file recorded as hi-res would mislead [R] for ever"
+        finally:
+            server.close()
+
+    def test_a_rate_limit_is_never_stepped_past(self):
+        """Retrying is what turned a rate limit into an edge block
+        (ai/INCIDENTS #1). Three more requests at lower tiers is the worst
+        possible response to a limiter already saying no."""
+        p = _player(quality="HIRES")
+        asked = []
+        track = _track()
+
+        def _stream():
+            asked.append(str(p.session.audio_quality))
+            raise RuntimeError("429 Too Many Requests")
+
+        track.get_stream = _stream
+        p._download_track = track
+        job = _download(p, "HIRES")
+        assert job["state"] == "failed"
+        assert len(asked) == 1, f"it retried a rate limit {len(asked)} times"
+
+    def test_the_common_case_is_still_one_request(self):
+        server = _Server({"/track.mp4": _mp4()})
+        try:
+            p = _player(quality="HIGH")
+            track, asked = self._track_failing_above(server, "HI_RES_LOSSLESS")
+            track._session = p.session
+            p._download_track = track
+            assert _download(p, "HIGH")["state"] == "done"
+            assert asked == ["HIGH"], "a tier that works costs one request"
+        finally:
+            server.close()
+
+    def test_the_ladder_is_the_tier_and_everything_under_it(self):
+        assert HeadlessTidalPlayer._tier_ladder("HIRES") == \
+            ["HIRES", "LOSSLESS", "HIGH", "LOW"]
+        assert HeadlessTidalPlayer._tier_ladder("HIGH") == ["HIGH", "LOW"]
+        assert HeadlessTidalPlayer._tier_ladder("LOW") == ["LOW"]
+
+
 class TestASegmentedDownload:
     """A lossless stream arrives as MPEG-DASH: an initialization segment and N
     media segments which, written end to end, *are* the file."""
@@ -1330,7 +1429,7 @@ class TestReFetchingEverything:
         assert started == [], "it started before it asked"
 
         rendered = _rendered(p)
-        assert "Re-fetch 1 song at HIRES?" in rendered
+        assert "Upgrade 1 song to HIRES?" in rendered
         assert "About" in rendered, "it did not say how much it would fetch"
 
     def test_any_other_key_is_a_true_no_op(self, monkeypatch):
@@ -1356,7 +1455,56 @@ class TestReFetchingEverything:
         p = self._library(downloaded=[(1, "HI_RES_LOSSLESS")])
         p._mode = p.MODE_SETTINGS
         p._handle_key("R")
-        assert "already at HIRES" in _rendered(p)
+        assert "Nothing is below HIRES" in _rendered(p)
+
+    # ── it only ever moves upwards ──
+    #
+    # Comparing `granted != wanted` made [R] a *downgrade* button: set the
+    # quality to HIGH with a lossless library and it re-fetched every song as
+    # AAC, one request each, and reported it as success.
+
+    def test_a_lower_setting_never_downgrades_what_is_on_disk(self):
+        p = self._library(downloaded=[(1, "HI_RES_LOSSLESS")],
+                          cached=[(2, "LOSSLESS")])
+        p._quality_name = "HIGH"
+        plan = p._refetch_candidates()
+        assert plan["downloads"] == [], "it would have re-fetched hi-res as AAC"
+        assert plan["cache"] == [], "it would have re-fetched lossless as AAC"
+        assert plan["skipped"] == 2
+
+    def test_an_equal_tier_is_not_an_upgrade(self):
+        p = self._library(downloaded=[(1, "LOSSLESS")])
+        p._quality_name = "LOSSLESS"
+        assert p._refetch_candidates()["downloads"] == []
+
+    def test_the_target_is_capped_by_what_tidal_will_serve(self):
+        """Asking for hi-res on a login that is only served HIGH does not make
+        hi-res available — and re-fetching the library to be handed back the
+        same AAC is one request per track for nothing."""
+        p = self._library(downloaded=[(1, "HIGH")])
+        p._quality_ceiling = "HIGH"          # observed downgrade, not a guess
+        assert p._upgrade_target() == "HIGH"
+        assert p._refetch_candidates()["downloads"] == []
+
+    def test_the_ceiling_still_allows_an_upgrade_below_it(self):
+        p = self._library(downloaded=[(1, "LOW")])
+        p._quality_ceiling = "HIGH"
+        plan = p._refetch_candidates()
+        assert plan["downloads"] == ["1"], "LOW -> HIGH is a real upgrade"
+
+    def test_an_unrecorded_tier_is_left_alone_and_counted(self):
+        """A copy from before the tracker, or one `reconcile()` adopted, has no
+        recorded tier. "Higher than unknown" is not something anyone can
+        honestly claim, so it is skipped — and said out loud rather than folded
+        into "already at this quality"."""
+        p = self._library(downloaded=[(1, None)], cached=[(2, None)])
+        plan = p._refetch_candidates()
+        assert plan["downloads"] == [] and plan["cache"] == []
+        assert plan["unknown"] == 2
+        assert plan["skipped"] == 0
+        p._mode = p.MODE_SETTINGS
+        p._handle_key("R")
+        assert "unrecorded quality" in _rendered(p)
 
     # ── the brakes ──
 

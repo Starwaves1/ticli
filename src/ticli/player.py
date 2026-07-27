@@ -3878,7 +3878,7 @@ class HeadlessTidalPlayer:
                 " done, nothing retried.", style="red")
             return content
         content.append("[R]", style="bold")
-        content.append(f" re-fetch all at {self._quality_name}", style="dim")
+        content.append(f" upgrade all to {self._quality_name}", style="dim")
         return content
 
     def _build_refetch_confirm(self) -> Text:
@@ -3894,20 +3894,38 @@ class HeadlessTidalPlayer:
         content = Text()
         plan = self._refetch_plan or {}
         total = len(plan.get("downloads", [])) + len(plan.get("cache", []))
+        # "Nothing to upgrade" and "nothing at all" are different answers, and
+        # so is "nothing this login can be served" — a ceiling below the
+        # setting means [R] would spend a request per track to be handed back
+        # the same file, so it says that instead of pretending there is
+        # nothing to do
+        target = self._upgrade_target()
         if not total:
-            content.append("\n   Everything is already at "
-                           f"{self._quality_name}. ", style="bold yellow")
+            if target and target != self.QUALITY_MAP.get(self._quality_name):
+                content.append(
+                    f"\n   This login isn't served {self._quality_name} —"
+                    " nothing to upgrade. ", style="bold yellow")
+            else:
+                content.append("\n   Nothing is below "
+                               f"{self._quality_name}. ", style="bold yellow")
+            if plan.get("unknown"):
+                content.append(
+                    f"{plan['unknown']} of unrecorded quality, left alone. ",
+                    style="dim")
             content.append("Any key to close", style="dim")
             return content
         content.append(
-            f"\n   Re-fetch {total} song{'' if total == 1 else 's'}"
-            f" at {self._quality_name}?", style="bold yellow")
+            f"\n   Upgrade {total} song{'' if total == 1 else 's'}"
+            f" to {self._quality_name}?", style="bold yellow")
         content.append(
             f" About {downloads.format_bytes(plan.get('bytes', 0))} over"
             f" {_rough_minutes(total)}, one at a time.", style="dim")
         if plan.get("skipped"):
-            content.append(f" {plan['skipped']} already at this quality.",
-                           style="dim")
+            content.append(f" {plan['skipped']} already at this quality"
+                           " or better.", style="dim")
+        if plan.get("unknown"):
+            content.append(f" {plan['unknown']} of unrecorded quality,"
+                           " left alone.", style="dim")
         content.append("\n   ", style="")
         content.append("y", style="bold")
         content.append(" to start, any other key to cancel", style="dim")
@@ -4225,6 +4243,13 @@ class HeadlessTidalPlayer:
             row.append(" cancel", style="dim")
         elif state == "done":
             row.append("Saved ✓", style="green")
+            # A tier that had to step down says which rung it stopped on.
+            # "Saved ✓" under a row reading `HIRES unavailable` was the one
+            # genuinely dishonest thing the box could show: the file is real,
+            # but it is not the tier the line above it names.
+            landed = job.get("landed")
+            if landed and landed != job.get("tier"):
+                row.append(f" {landed}", style="cyan")
             # Reported from what was written, never from intent
             if not job.get("tags"):
                 row.append(" untagged", style="dim")
@@ -5534,14 +5559,17 @@ class HeadlessTidalPlayer:
                 _update(done=done, total=total)
 
             try:
-                final, written, size = self._download_to_music(
+                final, written, size, landed = self._download_to_music(
                     track, tier,
                     abandoned=lambda: self._download_job_gen != gen,
                     progress=_progress)
                 if self._download_job_gen != gen:
                     return
+                # `landed` is what arrived, which is not always what was asked
+                # for — the box says so rather than letting a HIRES request
+                # that came back LOSSLESS read as a HIRES file
                 _update(state="done", path=str(final), tags=written,
-                        done=size, total=size)
+                        done=size, total=size, landed=landed)
                 self._set_toast(f"Downloaded to {final.parent}")
             except _DownloadSuperseded:
                 pass
@@ -5556,7 +5584,13 @@ class HeadlessTidalPlayer:
 
     def _download_to_music(self, track, tier: str, abandoned, progress=None):
         """Put one track in the music folder at `tier`. Returns
-        `(path, tags written, bytes)`; raises on anything that went wrong.
+        `(path, tags written, bytes, the tier it actually landed at)`; raises
+        on anything that went wrong.
+
+        The last of those is not always the one asked for — `tier` is a
+        starting rung and `_stream_at_best_tier` walks down from it — so it is
+        returned rather than assumed, and the box reports what arrived instead
+        of what was requested.
 
         The single place a download is performed, because there are now three
         callers — the download screen, and the two halves of "re-fetch
@@ -5579,11 +5613,11 @@ class HeadlessTidalPlayer:
             staging.parent.mkdir(parents=True, exist_ok=True)
             ext, granted = self._promote_cached_copy(track_id, tier, staging)
             if ext is None:
-                url, granted = self._download_stream_url(real, tier)
-                sources = stream_sources(url)
-                if not sources:
-                    raise RuntimeError("stream named nothing to fetch")
-                ext = fetch_to_file(sources, str(staging),
+                # Steps down a tier at a time rather than failing outright, so
+                # a track this login cannot have at HIRES still lands as
+                # LOSSLESS instead of not landing at all
+                url, granted, tier = self._stream_at_best_tier(real, tier)
+                ext = fetch_to_file(stream_sources(url), str(staging),
                                     abandoned=abandoned, progress=progress)
             final = downloads.destination(meta, ext)
             final.parent.mkdir(parents=True, exist_ok=True)
@@ -5605,7 +5639,7 @@ class HeadlessTidalPlayer:
             # show for this track
             self._downloads_usage = None
             self._download_known = None
-            return final, written, size
+            return final, written, size, tier
         except Exception:
             self._discard_staging(track_id)
             if final is not None:
@@ -5643,21 +5677,70 @@ class HeadlessTidalPlayer:
     # And it is opt-in twice: an explicit key, and a confirmation that says
     # how many tracks and roughly how many bytes before it will start.
 
+    def _upgrade_target(self) -> Optional[str]:
+        """The tier a re-fetch could actually land, or None if none could.
+
+        The **lower** of two things, because both have to be true before a
+        byte is worth moving: the tier you have asked for, and the tier TIDAL
+        has shown it will serve this login (`_quality_ceiling`, learned for
+        free from a granted downgrade). Asking for hi-res on a device-flow
+        session does not make hi-res available, and re-fetching a whole
+        library to be handed back the same AAC is a great many requests for
+        nothing — against the limiter that caused ai/INCIDENTS #1.
+        """
+        wanted = self.QUALITY_MAP.get(self._quality_name)
+        if wanted not in QUALITY_RANK:
+            return None
+        ceiling = self._quality_ceiling
+        if ceiling in QUALITY_RANK and QUALITY_RANK[ceiling] < QUALITY_RANK[wanted]:
+            return ceiling
+        return wanted
+
+    @staticmethod
+    def _is_upgrade(stored, target) -> bool:
+        """Whether replacing a copy stored at `stored` with `target` gains
+        anything.
+
+        **Strictly greater.** An equal tier is the file already on the disk,
+        and a *lower* one would quietly make the library worse — which is
+        exactly what this did when it compared `granted != wanted`: setting
+        the quality down to HIGH and pressing [R] re-fetched every lossless
+        song as AAC, spent a request per track to do it, and reported it as
+        success. A re-fetch only ever moves upwards now.
+
+        An unrecorded tier is not an upgrade either, because it cannot be
+        shown to be one. Those are counted and reported rather than silently
+        folded into "already at this quality" — see `_refetch_candidates`.
+        """
+        if target not in QUALITY_RANK or stored not in QUALITY_RANK:
+            return False
+        return QUALITY_RANK[target] > QUALITY_RANK[stored]
+
     def _refetch_candidates(self) -> dict:
         """What "re-fetch everything at the current quality" would actually do.
 
         Reads both trackers and no network. Returns `{"downloads": [...],
-        "cache": [...], "skipped": n, "bytes": n}` where each list is
-        `(track_id, tier)` and `skipped` counts the copies already at the
-        target tier — which are left alone, because spending a request to be
-        handed back the file you already have is the opposite of the point.
+        "cache": [...], "skipped": n, "unknown": n, "bytes": n}`.
+
+        A copy is a candidate only when the target tier is **strictly above**
+        the tier it was granted (`_is_upgrade`), and the target is itself
+        capped by what TIDAL will serve (`_upgrade_target`). `skipped` counts
+        copies already at or above the target; `unknown` counts copies whose
+        tier was never recorded — from before the tracker, or adopted by
+        `reconcile()` — which are left alone because "higher than unknown" is
+        not a thing anyone can honestly claim.
         """
-        wanted = self.QUALITY_MAP.get(self._quality_name)
-        plan = {"downloads": [], "cache": [], "skipped": 0, "bytes": 0}
+        target = self._upgrade_target()
+        plan = {"downloads": [], "cache": [], "skipped": 0, "unknown": 0,
+                "bytes": 0}
         for key, entry in downloads.load_index().items():
             if downloads._entry_path(entry) is None:
                 continue  # deleted by hand: the disk decides
-            if entry.get("granted") == wanted:
+            stored = entry.get("granted")
+            if stored not in QUALITY_RANK:
+                plan["unknown"] += 1
+                continue
+            if not self._is_upgrade(stored, target):
                 plan["skipped"] += 1
                 continue
             plan["downloads"].append(key)
@@ -5667,7 +5750,11 @@ class HeadlessTidalPlayer:
             for key, record in self._cache._load_tracker().items():
                 if key in downloaded:
                     continue  # the download tier covers it
-                if record.get("quality") == wanted:
+                stored = record.get("quality")
+                if stored not in QUALITY_RANK:
+                    plan["unknown"] += 1
+                    continue
+                if not self._is_upgrade(stored, target):
                     plan["skipped"] += 1
                     continue
                 plan["cache"].append(key)
@@ -5688,7 +5775,7 @@ class HeadlessTidalPlayer:
         plan = self._refetch_candidates()
         total = len(plan["downloads"]) + len(plan["cache"])
         if not total:
-            self._set_toast("Everything is already at this quality")
+            self._set_toast("Nothing to upgrade at this quality")
             return
         tier = self._quality_name
         self._refetch_gen = gen = self._refetch_gen + 1
@@ -5862,6 +5949,49 @@ class HeadlessTidalPlayer:
             logger.debug("Could not promote the cached copy: %s", e)
             return None, None
         return os.path.splitext(source)[1], granted
+
+    @staticmethod
+    def _tier_ladder(tier: str) -> list:
+        """`tier` and every tier below it, best first."""
+        try:
+            top = QUALITY_CHOICES.index(tier)
+        except ValueError:
+            return [tier]
+        return list(reversed(QUALITY_CHOICES[:top + 1]))
+
+    def _stream_at_best_tier(self, real, tier: str) -> tuple:
+        """`(url, granted, the tier that worked)`, stepping down until one does.
+
+        A tier this login cannot have is not usually an error — TIDAL accepts
+        the request and quietly grants something lower, which is why
+        `_note_granted_quality` exists at all. But it *can* fail outright: a
+        device-flow session asked for a hi-res stream, a region without the
+        master, a track pulled from a tier. A download that gives up there
+        leaves the user with nothing when a perfectly good LOSSLESS copy was
+        one step down, so this walks the ladder instead.
+
+        **A rate limit is never stepped past.** A 429, or a 401 with subStatus
+        4006, means stop — retrying at another tier is three more requests
+        into a limiter that is already saying no, and retrying is what turned
+        a rate limit into an edge block (ai/INCIDENTS #1). That one re-raises
+        immediately; everything else moves down a rung.
+
+        In the common case this is exactly one request, the same as before.
+        """
+        last = None
+        for candidate in self._tier_ladder(tier):
+            try:
+                url, granted = self._download_stream_url(real, candidate)
+            except Exception as e:
+                if _looks_rate_limited(str(e)):
+                    raise
+                logger.debug("No %s stream for this track: %s", candidate, e)
+                last = e
+                continue
+            if stream_sources(url):
+                return url, granted, candidate
+            last = RuntimeError(f"{candidate} named nothing to fetch")
+        raise last or RuntimeError("no tier could be streamed")
 
     def _download_stream_url(self, track, tier: str) -> tuple:
         """`(url, granted tier)` at a tier that may not be the one playing.
