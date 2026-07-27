@@ -864,7 +864,7 @@ class _PacedRun:
     """
 
     def __init__(self, items, resolve, fetch, alive, report,
-                 workers: int = 1, slots=()):
+                 workers: int = 1, slots=(), clock=None):
         self.items = list(items)
         self.resolve = resolve
         self.fetch = fetch
@@ -875,56 +875,124 @@ class _PacedRun:
         # A slot has exactly one writer at a time — the worker holding it —
         # so its fields need no lock either.
         self.slots = tuple(slots) if slots else (None,) * self.workers
+        # When the API was last asked anything, in a one-element list the
+        # caller owns and every run shares. The floor has to outlive a single
+        # run: a run that ends and another that starts a millisecond later
+        # are two requests a millisecond apart, which is exactly what the
+        # floor exists to prevent, and it does not care which run they were.
+        self.clock = [None] if clock is None else clock
         # (ok, message, record) per finished item. Appended by workers, read
         # only here; append is atomic under the GIL.
         self.results: list = []
         self._written = 0
+        # How far into `items` the resolver has got, and whether it has
+        # announced that it is finishing. Written only by the run's own
+        # thread; read by `add` and by the caller once the run is over.
+        self.consumed = 0
+        self.closed = False
 
     # ── what the caller asks for ──
 
     def run(self) -> tuple:
         """`(done, failed, blocked)`. Returns early and reports nothing when
-        the run was cancelled — the canceller owns the state at that point."""
+        the run was cancelled — the canceller owns the state at that point.
+
+        Indexed rather than `for item in self.items`, because `items` **grows
+        while this is running**: asking for a second playlist appends to the
+        list this loop is walking (`add`), and a run that has already reached
+        the end goes round again and picks the new work up. That is the whole
+        of the queueing, and it is why there is no second scheduler — one
+        paced resolver, one pool, so "is the floor still honoured across the
+        boundary between two batches" is not a new question. `clock`
+        deliberately outlives the run itself, which is what makes that true
+        of the boundary between two *runs* as well.
+        """
         threads: dict = {}
         blocked = ""
-        for item in self.items:
+        while True:
+            while self.consumed < len(self.items):
+                item = self.items[self.consumed]
+                self.consumed += 1
+                if not self.alive():
+                    return None
+                slot = self._free_slot(threads)
+                if slot is None:
+                    return None
+                blocked = self._blocked()
+                if blocked:
+                    break
+                # The floor goes *before* the next resolve rather than after
+                # the last one, so it is still a floor between starts and a
+                # run with nothing left to do finishes at once instead of
+                # sleeping through an interval it does not need. One track
+                # used to take two seconds to say "saved" for that reason.
+                if self.clock[0] is not None:
+                    self._pace(self.clock[0])
+                    if not self.alive():
+                        return None
+                self.clock[0] = time.monotonic()
+                self._flush()
+                try:
+                    handle = self.resolve(item)
+                except _DownloadSuperseded:
+                    return None
+                except Exception as e:
+                    message = str(e)
+                    if _looks_rate_limited(message):
+                        blocked = message[:PLAYER_ERROR_CHARS]
+                        break
+                    logger.debug("Could not resolve %s: %s", item, e)
+                    self.results.append((False, message, None))
+                    self._flush()
+                    continue
+                thread = threading.Thread(
+                    target=self._work, args=(item, handle, slot), daemon=True)
+                threads = {**threads, slot: thread}
+                thread.start()
+            for thread in threads.values():
+                thread.join()
+            threads = {}
             if not self.alive():
                 return None
-            index = self._free_slot(threads)
-            if index is None:
-                return None
-            blocked = self._blocked()
-            if blocked:
+            # Announce **first**, then look again. Anything `add` published
+            # before this flag was set is caught by the re-check below, so
+            # the window in which an append can miss a run that is ending is
+            # a couple of bytecodes rather than the whole of the join above
+            # it. It is not zero: closing it outright wants a
+            # compare-and-swap, and the rule here is no locks. So the caller
+            # re-queues `pending()` afterwards, and the completion toast
+            # counts anything that still never started.
+            self.closed = True
+            if blocked or self.consumed >= len(self.items):
                 break
-            started = time.monotonic()
-            self._flush()
-            try:
-                handle = self.resolve(item)
-            except _DownloadSuperseded:
-                return None
-            except Exception as e:
-                message = str(e)
-                if _looks_rate_limited(message):
-                    blocked = message[:PLAYER_ERROR_CHARS]
-                    break
-                logger.debug("Could not resolve %s: %s", item, e)
-                self.results.append((False, message, None))
-                self._flush()
-                self._pace(started)
-                continue
-            thread = threading.Thread(
-                target=self._work, args=(item, handle, index), daemon=True)
-            threads = {**threads, index: thread}
-            thread.start()
-            self._pace(started)
-        for thread in threads.values():
-            thread.join()
-        if not self.alive():
-            return None
+            self.closed = False
         blocked = blocked or self._blocked()
         self._flush()
         done = sum(1 for ok, _m, _r in self.results[:] if ok)
         return done, len(self.results) - done, blocked
+
+    def pending(self) -> list:
+        """Items published but never taken — empty except in the sliver of a
+        window above. Read by the caller once the run is no longer live, so
+        it can start them rather than lose them."""
+        return self.items[self.consumed:]
+
+    def add(self, items) -> bool:
+        """Put more work on the end of a run that is already going.
+
+        Whole-list replacement, never `append`, so `run()` can be part way
+        through `self.items` on another thread and still see a consistent
+        list — the same convention as everywhere else here. `items` is also
+        the record of everything this run has *ever* accepted, which is what
+        makes deduplicating against pending, in-flight and finished work one
+        question rather than three.
+        """
+        items = list(items)
+        if items:
+            self.items = self.items + items
+        # Published before this read, so a run that has not yet announced is
+        # guaranteed to see them: True means "this run will do them"
+        return not self.closed
 
     # ── the machinery ──
 
@@ -2021,6 +2089,17 @@ class HeadlessTidalPlayer:
         self._download_cursor = 0
         self._download_job = None
         self._download_job_gen = 0
+        # The live _PacedRun, while there is one. A second ask appends to it
+        # rather than starting a run beside it, so there is only ever one
+        # serial paced resolver — see _start_bulk_download_job.
+        self._download_run = None
+        # When the API was last asked for a stream, shared by every paced run
+        # (the bulk download and the re-fetch) so the floor holds between one
+        # run and the next as well as inside one — a run that ends and
+        # another that starts a millisecond later is two requests a
+        # millisecond apart, whoever made them. A list of one, written only
+        # by whichever resolver thread is going.
+        self._api_pace = [None]
         # `(track id, tier → exact bytes already on this disk, downloaded
         # path)`, read once per opening of the box. Two index reads answer it
         # for all four tiers at once, and the box must not pay them again on
@@ -4002,8 +4081,9 @@ class HeadlessTidalPlayer:
         content.append(
             f" · {format_gb(self._cache.disk_bytes())}"
             f" of {self.config.get('cache_budget_gb', 2)}.000 GB", style="dim")
-        content.append("   [x]", style="bold")
-        content.append(" clear", style="dim")
+        if (self._download_job or {}).get("state") != "running":
+            content.append("   [x]", style="bold")
+            content.append(" clear", style="dim")
         content.append("\n   Downloads  ", style="dim")
         content.append(f"{kept:>4} song{' ' if kept == 1 else 's'}", style="dim")
         content.append(f" · {format_gb(kept_bytes)} · not counted against"
@@ -4018,11 +4098,25 @@ class HeadlessTidalPlayer:
         # the end is a feature nobody can find. So when both do not fit, the
         # action goes first and the path is what gets cut.
         folder = downloads.display_dir()
-        action = self._build_refetch_line()
+        # A download outranks the [R] offer on this row, and costs no row of
+        # its own — the page shows three settings rows at 80x24 as it is, and
+        # a download is over in minutes while the offer is always there. It
+        # never outranks a re-fetch, because a re-fetch is *this page's* job
+        # and [Esc] here is what stops it. (The two cannot both be running:
+        # each refuses while the other is, so there is only ever one paced
+        # resolver.) Empty unless something is happening, so an idle page is
+        # exactly the page it was.
+        refetch = self._build_refetch_line()
+        action = (refetch
+                  if (self._refetch_job or {}).get("state") in ("running",
+                                                                "blocked")
+                  else self._build_download_line() or refetch)
         content.append("\n   ", style="")
         # A run in progress goes first for the same reason, only more so: it
         # is the only thing on the page that is changing
-        busy = (self._refetch_job or {}).get("state") in ("running", "blocked")
+        busy = ((self._refetch_job or {}).get("state") in ("running", "blocked")
+                or (self._download_job or {}).get("state")
+                in ("running", "blocked", "failed"))
         if busy or len(folder) + len(action.plain) + 3 > max(self._fit.inner - 3, 20):
             content.append_text(action)
             content.append(f"   {folder}", style="dim")
@@ -4108,6 +4202,56 @@ class HeadlessTidalPlayer:
         content.append("Esc", style="bold")
         content.append(" cancel", style="dim")
         return content
+
+    def _build_download_line(self) -> Optional["Text"]:
+        """What a download is doing, for the settings page. `None` when there
+        is nothing to say, and that is the normal case — this borrows the
+        `[R]` row rather than adding one, so an idle page is unchanged and
+        80x24 still fits.
+
+        The same three-states idiom `_build_refetch_line` uses, and the third
+        one is the point: **a failure used to be silent** the moment the box
+        was closed, which is ai/INCIDENTS #3 in miniature. A run that was
+        rate-limited, or a track that could not be fetched, says so here in
+        red until the next download replaces it. A clean finish says nothing
+        — the toast already did, and a permanent "Saved 12 ✓" on a settings
+        page is furniture.
+        """
+        job = self._download_job or {}
+        state = job.get("state")
+        if state == "blocked":
+            line = Text("Download stopped — TIDAL is rate-limiting. ",
+                        style="red")
+            line.append(f"{job.get('done', 0)} done, nothing retried.",
+                        style="red")
+            return line
+        if state == "failed":
+            # The single-track job's own failure, in the backend's words
+            line = Text(f"Download failed — {job.get('error') or 'unknown'}",
+                        style="red")
+            return line
+        if state != "running":
+            if state == "done" and job.get("failed"):
+                return Text(f"Download finished — {job['failed']} failed",
+                            style="red")
+            return None
+        # Bulk and single are one line: the counts are the run's when there
+        # is a run and 1 when there is not, and the rate is the same mean the
+        # monitor tick already put on the slots.
+        slots = job.get("slots") or ()
+        # `done/total`, the same reading as the re-fetch line right beside it:
+        # how many have landed, out of how many were asked for — including
+        # anything appended since, because that is what is being downloaded
+        line = Text(f"Downloading {job.get('done') or 0}"
+                    f"/{job.get('tracks') or 1}", style="yellow")
+        rate = _format_rate(sum(self._slot_rate(s) for s in slots))
+        if rate:
+            line.append(f" · {rate}", style="dim")
+        if job.get("failed"):
+            line.append(f" · {job['failed']} failed", style="dim")
+        line.append("   [x]", style="bold")
+        line.append(" cancel", style="dim")
+        return line
 
     def _build_refetch_line(self) -> Text:
         """The `[R]` action, or what it is doing right now.
@@ -4466,16 +4610,34 @@ class HeadlessTidalPlayer:
         return _boxed(rows, width, max((fit.inner - width - 4) // 2, 0), "magenta")
 
     def _download_box_rows(self) -> list:
-        """The three lines above the button: what, how big, at which tier."""
+        """The three lines above the button: what, how big, at which tier.
+
+        **A live run outranks the selection.** Once something is downloading,
+        those two lines describe the run — its labels, its count, its summed
+        estimate — because that is what is actually happening, and a box
+        still reading "6 tracks" while eighteen are in the run would be
+        wrong. What you are about to add moves onto the tier line as
+        `+ N to add`, which is also where "all of them are already queued"
+        can be read before pressing anything.
+        """
         track = self._download_track
         tier = self._download_tier()
         bulk = self._download_bulk()
+        running = self._download_job or {}
+        if running.get("state") != "running" or not running.get("bulk"):
+            running = {}
         # Deliberately not asked for in bulk: it is two index reads about the
         # *first* track, and "✓ on disk" under a count of thirteen would be a
         # claim about twelve songs nobody checked
-        sizes, owned = ({}, None) if bulk else self._download_facts()
+        sizes, owned = ({}, None) if bulk or running else self._download_facts()
 
-        if bulk:
+        if running:
+            labels = [label for label in (running.get("labels") or ()) if label]
+            head = Text(labels[0] if labels else "Downloading",
+                        style="bold white")
+            if len(labels) > 1:
+                head.append(f"  +{len(labels) - 1} more", style="dim")
+        elif bulk:
             head = Text(self._download_label or "These tracks",
                         style="bold white")
         else:
@@ -4488,10 +4650,12 @@ class HeadlessTidalPlayer:
 
         # The line he asked to be able to read at a glance. White, alone, and
         # exact whenever the bytes are already known here for free.
-        if bulk:
-            count = len(self._download_tracks)
+        if running or bulk:
+            count = ((running.get("tracks") or 0) if running
+                     else len(self._download_tracks))
+            total = ((running.get("estimate") or 0) if running
+                     else self._download_bulk_estimate(tier))
             size = Text(f"{count} tracks", style="bold white")
-            total = self._download_bulk_estimate(tier)
             size.append("   ~" + downloads.format_bytes(total) if total > 0
                         else "   —", style="bold white")
         else:
@@ -4502,9 +4666,25 @@ class HeadlessTidalPlayer:
         pick.append(tier, style="dim" if gated else "bold cyan")
         if gated:
             pick.append("  unavailable", style="yellow")
+        elif running:
+            fresh = self._download_unqueued()
+            if fresh:
+                pick.append(f"   + {fresh} to add", style="cyan")
+            else:
+                pick.append("   already queued", style="dim")
         elif owned is not None and tier in sizes:
             pick.append("  ✓ on disk", style="green")
         return [head, size, pick]
+
+    def _download_unqueued(self) -> int:
+        """How many of the tracks under the cursor the live run has not been
+        asked for yet. Set arithmetic over ids — no disk, no index, no
+        network, so a repaint can pay for it twice a second."""
+        queued = self._download_queued_ids()
+        if not queued:
+            return len(self._download_tracks)
+        return len({getattr(t, "id", None) for t in self._download_tracks}
+                   - queued)
 
     def _download_bar_rows(self, job: dict, avail: int) -> list:
         """One line per fetch that is under way, in the style the owner picked.
@@ -4568,8 +4748,12 @@ class HeadlessTidalPlayer:
         this track."""
         job = self._download_job or {}
         if job.get("bulk"):
-            # Only one run exists at a time, so a bulk job belongs to any bulk
-            # box — and a single-track box must not report on it
+            # A run that is *going* is shown on every box, because the box
+            # describes the run while there is one — otherwise a single-track
+            # box would hide the bars and the only [x] that stops them. A
+            # finished one is history and belongs to the bulk box alone.
+            if job.get("state") == "running":
+                return job
             return job if self._download_bulk() else {}
         if job.get("track_id") != getattr(self._download_track, "id", None):
             return {}
@@ -5998,11 +6182,18 @@ class HeadlessTidalPlayer:
         track = self._download_track
         if track is None:
             return
+        if (self._download_run is not None
+                and (self._download_job or {}).get("state") == "running"):
+            # One more track on the end of the run rather than a second
+            # resolver beside it: two paced resolvers is two API requests a
+            # second, which is not the rate this was measured at
+            self._start_bulk_download_job(
+                tier, tracks=[track], label=getattr(track, "name", "") or "")
+            return
         job = self._download_job
         if job and job.get("state") == "running":
-            # Single-flight, but not silent: from a single-track box a bulk
-            # run in the background is invisible, so a key that refuses has
-            # to say why rather than look dead
+            # Single-flight, but not silent: a key that refuses has to say
+            # why rather than look dead
             self._set_toast("A download is already running — [x] stops it")
             return
         self._download_job_gen = gen = self._download_job_gen + 1
@@ -6070,45 +6261,98 @@ class HeadlessTidalPlayer:
                       "samples": (), "mark": None}
                      for _ in range(DOWNLOAD_WORKERS))
 
-    def _start_bulk_download_job(self, tier: str):
-        """Download every track the box is about, at `tier`.
+    def _download_queued_ids(self) -> set:
+        """Every track id the live run has ever accepted — pending, in flight
+        and finished. One set, because `_PacedRun.items` is never consumed."""
+        run = self._download_run
+        if run is None:
+            return set()
+        return {tid for _t, _tier, tid in run.items[:] if tid is not None}
 
-        Resolving is serial and paced and fetching is three-wide — see
-        `_PacedRun`, which is the same engine the re-fetch runs at one worker.
-        The peak API request rate is therefore exactly a serial run's; what
-        got three times faster is the part TIDAL's limiter never sees.
+    def _start_bulk_download_job(self, tier: str, tracks=None,
+                                 label: Optional[str] = None):
+        """Download every track the box is about, at `tier` — **or add them to
+        the run already going.**
 
-        One run at a time, by the same single-flight rule everything else
-        here uses, so a held-down Enter cannot fan out.
+        Asking for a second playlist while the first is downloading used to
+        be refused. It is now the same run with more work on the end of it:
+        `_PacedRun.add`. Deliberately *not* a queue of runs, which would need
+        a scheduler of its own and would make "is the pacing floor still
+        honoured between one batch and the next" a new question — appending
+        keeps it the question it already is, because there is still exactly
+        one serial paced resolver and one pool of three fetchers.
+
+        Each batch carries **its own tier**, so a HIRES ask appended to a
+        LOSSLESS run downloads at HIRES: the tier is already per-track inside
+        the plan, and quietly fetching somebody's hi-res request as lossless
+        because a different batch got there first is the kind of dishonesty
+        this box exists to avoid.
+
+        Anything already queued, in flight or finished is dropped by track id
+        — appending a playlist that overlaps one already running must not
+        fetch a song twice.
         """
-        tracks = list(self._download_tracks)
+        tracks = list(self._download_tracks if tracks is None else tracks)
+        tracks = [t for t in tracks if t is not None]
         if not tracks:
             return
-        job = self._download_job
-        if job and job.get("state") == "running":
+        if (self._refetch_job or {}).get("state") == "running":
+            # Two paced resolvers at once is two API requests a second, which
+            # is not the rate this run's tests measured. One at a time.
+            self._set_toast("Re-fetching — [Esc] on the settings page stops it")
             return
+        label = self._download_label if label is None else label
+
+        queued = self._download_queued_ids()
+        items, seen = [], set()
+        for track in tracks:
+            tid = getattr(track, "id", None)
+            if tid is not None and (tid in queued or tid in seen):
+                continue
+            seen.add(tid)
+            items.append((track, tier, tid))
+
+        run = self._download_run
+        if run is not None and (self._download_job or {}).get("state") == "running":
+            self._add_to_download_run(run, items, len(tracks), label)
+            return
+        if (self._download_job or {}).get("state") == "running":
+            # A single-track job holds the resolver; it is one request and it
+            # is nearly over, so this is the one ask that still waits
+            self._set_toast("A download is already running — [x] stops it")
+            return
+        if not items:
+            return
+
         self._download_job_gen = gen = self._download_job_gen + 1
         slots = self._new_download_slots()
         self._download_job = {
             "state": "running", "bulk": True, "tier": tier, "track_id": None,
-            "tracks": len(tracks), "done": 0, "failed": 0, "slots": slots,
-            "error": "",
+            "tracks": len(items), "done": 0, "failed": 0, "slots": slots,
+            "error": "", "labels": (label,) if label else (),
+            "estimate": sum(downloads.estimate_bytes(
+                getattr(t, "duration", 0), tr) for t, tr, _i in items),
         }
 
         def _alive():
             return self._download_job_gen == gen
 
         def _update(**changes):
+            # A superseded run's workers can still be finishing; their tally
+            # must not land on the job that replaced this one
+            if not _alive():
+                return
             current = dict(self._download_job or {})
             current.update(changes)
             self._download_job = current
             self._wake()
 
-        def _fetch(track, plan, slot):
+        def _fetch(item, plan, slot):
+            track, item_tier, _tid = item
             slot.update(title=plan["title"] or str(plan["track_id"]),
                         done=0, total=0, size=0, samples=(), mark=None,
                         estimate=downloads.estimate_bytes(
-                            getattr(track, "duration", 0), tier),
+                            getattr(track, "duration", 0), item_tier),
                         state="running")
             last = [0.0]
 
@@ -6130,20 +6374,47 @@ class HeadlessTidalPlayer:
                         banked=slot["banked"] + size, state="done")
             return plan.get("record")
 
-        def _run():
-            outcome = _PacedRun(
-                items=tracks,
-                resolve=lambda track: self._download_plan(track, tier),
-                fetch=_fetch,
-                alive=_alive,
-                report=_update,
-                workers=DOWNLOAD_WORKERS,
-                slots=slots,
-            ).run()
+        run = _PacedRun(
+            items=items,
+            resolve=lambda item: self._download_plan(item[0], item[1]),
+            fetch=_fetch,
+            alive=_alive,
+            report=_update,
+            workers=DOWNLOAD_WORKERS,
+            slots=slots,
+            clock=self._api_pace,
+        )
+        self._download_run = run
+
+        def _go():
+            outcome = leftover = None
+            try:
+                outcome = run.run()
+            finally:
+                # Whole-object assignment, and only by the thread that owns
+                # the run: after this a new ask starts a new run rather than
+                # appending to a finished one. Cleared **before** `pending()`
+                # is read, so a batch that arrived while this was winding up
+                # is either still in the run's hands or in `leftover` here.
+                if self._download_run is run:
+                    self._download_run = None
+                leftover = run.pending()
             if outcome is None:
                 self._wake()
                 return
             done, failed, blocked = outcome
+            if leftover and not blocked and _alive():
+                # A batch that landed in the sliver of a window where the run
+                # had stopped looking. Start it rather than lose it.
+                labels = [l for l in ((self._download_job or {}).get("labels")
+                                      or ()) if l]
+                self._download_job = dict(self._download_job or {},
+                                          state="done")
+                self._start_bulk_download_job(
+                    leftover[0][1], tracks=[t for t, _q, _i in leftover],
+                    label=labels[-1] if labels else "")
+                self._wake()
+                return
             if blocked:
                 _update(state="blocked", error=blocked)
                 self._set_toast(
@@ -6152,13 +6423,51 @@ class HeadlessTidalPlayer:
                     seconds=PLAYER_ERROR_SECONDS)
             else:
                 _update(state="done")
+                # Anything asked for that never started is said out loud
+                # rather than left to be inferred from a count that does not
+                # add up — see the window `_PacedRun.run` documents.
+                short = max((self._download_job or {}).get("tracks", 0)
+                            - done - failed, 0)
                 self._set_toast(
                     f"Downloaded {done} song{'' if done == 1 else 's'}"
                     f" to {downloads.display_dir()}"
-                    + (f" · {failed} failed" if failed else ""))
+                    + (f" · {failed} failed" if failed else "")
+                    + (f" · {short} not started" if short else ""))
             self._wake()
 
-        threading.Thread(target=_run, daemon=True).start()
+        threading.Thread(target=_go, daemon=True).start()
+
+    def _add_to_download_run(self, run, items, asked: int,
+                             label: Optional[str]) -> None:
+        """Put a second batch on the end of a run, and say what happened.
+
+        The count and the estimate on the box are the *run's* from here on,
+        because that is what is being downloaded. Nothing is refused and
+        nothing is silent: an ask that was entirely duplicates says so rather
+        than looking like a key that did nothing.
+        """
+        job = dict(self._download_job or {})
+        if not items:
+            self._set_toast(f"Already queued — all {asked} of them"
+                            if asked > 1 else "Already queued")
+            return
+        run.add(items)
+        labels = tuple(job.get("labels") or ())
+        if label and label not in labels:
+            labels = labels + (label,)
+        job.update(
+            tracks=(job.get("tracks") or 0) + len(items),
+            estimate=(job.get("estimate") or 0) + sum(
+                downloads.estimate_bytes(getattr(t, "duration", 0), tr)
+                for t, tr, _i in items),
+            labels=labels,
+        )
+        self._download_job = job
+        skipped = asked - len(items)
+        self._set_toast(
+            f"Queued {len(items)} more"
+            + (f" · {skipped} already queued" if skipped else ""))
+        self._wake()
 
     def _sample_download_rates(self) -> None:
         """Move every active download's byte counter into its rate window.
@@ -6446,6 +6755,12 @@ class HeadlessTidalPlayer:
         job = self._refetch_job
         if job and job.get("state") == "running":
             return
+        if (self._download_job or {}).get("state") == "running":
+            # One paced resolver, ever. Two of them is two API requests a
+            # second between them, which is not the rate either was measured
+            # at and not a rate anybody chose.
+            self._set_toast("A download is running — [x] on the box stops it")
+            return
         plan = self._refetch_candidates()
         total = len(plan["downloads"]) + len(plan["cache"])
         if not total:
@@ -6459,6 +6774,8 @@ class HeadlessTidalPlayer:
         }
 
         def _update(**changes):
+            if self._refetch_gen != gen:
+                return
             current = dict(self._refetch_job or {})
             current.update(changes)
             self._refetch_job = current
@@ -6477,6 +6794,7 @@ class HeadlessTidalPlayer:
                 alive=lambda: self._refetch_gen == gen,
                 report=_update,
                 workers=1,
+                clock=self._api_pace,
             ).run()
             if outcome is None:
                 self._wake()
@@ -7485,7 +7803,10 @@ class HeadlessTidalPlayer:
                 self._start_bulk_download_job(self._download_tier())
             else:
                 self._start_download_job(self._download_tier())
-                self._download_open = False
+                # ...and it stays up when one track joined a run, for the
+                # same reason: the bars are the answer to what just happened
+                if self._download_run is None:
+                    self._download_open = False
 
     def _handle_settings_key(self, key: str):
         # Typing a number into a row: digits extend it, Backspace shortens it,
@@ -7525,8 +7846,16 @@ class HeadlessTidalPlayer:
             self._logout_pending = True
             return
         # Clearing the cache is an action, not a value, so it lives outside
-        # SETTINGS_SPEC as a keybinding — the same reason logout does
+        # SETTINGS_SPEC as a keybinding — the same reason logout does. While a
+        # download is running [x] stops it instead, which is what [x] means on
+        # every other screen: the Cache row drops its own `[x] clear` for the
+        # duration rather than advertising a key it is not getting, and
+        # clearing the cache out from under a download is not a thing anybody
+        # should do by accident.
         if key in ("x", "X"):
+            if (self._download_job or {}).get("state") == "running":
+                self._cancel_download()
+                return
             self._clear_cache_pending = True
             return
         # Deliberately not "p" — that already opens playlists on the player
