@@ -1038,3 +1038,121 @@ class TestOpeningACommunityPlaylist:
         assert [r["name"] for r in p._search_results] == rows_before
         assert p._search_cursor == 1
         assert len(p.session.calls) == before  # TIDAL asked for nothing
+
+
+class TestSearchHistoryRecall:
+    """The blank search pane shows recent queries, ↓ walks into them, and the
+    first printable key replaces them with a live query."""
+
+    def _blank(self, history=("miles davis", "coltrane", "monk"), page_size=10):
+        """A player sitting on the empty search screen with history in hand."""
+        p = HeadlessTidalPlayer()
+        p._page_size = page_size
+        p.session = _FakeSession()
+        p._search_history = list(history)
+        p._mode = p.MODE_SEARCH
+        return p
+
+    def test_empty_query_shows_recent_searches(self, config_file):
+        p = self._blank()
+        text = p._build_search_display().plain
+        assert "Recent searches" in text
+        assert "miles davis" in text
+        assert "coltrane" in text
+
+    def test_no_history_leaves_the_pane_blank(self, config_file):
+        p = self._blank(history=())
+        assert "Recent searches" not in p._build_search_display().plain
+
+    def test_a_live_query_hides_the_list(self, config_file):
+        p = self._blank()
+        p._handle_search_key("x")
+        text = p._build_search_display().plain
+        assert "Recent searches" not in text
+        assert "Press Enter to search" in text
+        # ...and backspacing back to empty brings it back, focus in the box
+        p._handle_search_key(player_mod.KEY_BACKSPACE)
+        assert "Recent searches" in p._build_search_display().plain
+        assert p._search_history_cursor is None
+
+    def test_the_list_is_capped_at_the_page_size(self, config_file):
+        p = self._blank(history=[f"query {i}" for i in range(15)], page_size=10)
+        text = p._build_search_display().plain
+        assert "query 9" in text
+        assert "query 10" not in text
+        for _ in range(20):
+            p._handle_search_key(player_mod.KEY_DOWN)
+        assert p._search_history_cursor == 9  # the cursor stops where the list does
+
+    def test_down_enters_the_list_and_clamps_at_the_end(self, config_file):
+        p = self._blank()
+        assert p._search_history_cursor is None
+        p._handle_search_key(player_mod.KEY_DOWN)
+        assert p._search_history_cursor == 0
+        for _ in range(5):
+            p._handle_search_key(player_mod.KEY_DOWN)
+        assert p._search_history_cursor == 2
+
+    def test_up_from_row_zero_returns_to_the_query_box_then_the_player(self, config_file):
+        p = self._blank()
+        p._current_track = _fake_track(1)  # _focus_player is a no-op without one
+        p._handle_search_key(player_mod.KEY_DOWN)
+        p._handle_search_key(player_mod.KEY_DOWN)
+        p._handle_search_key(player_mod.KEY_UP)
+        assert p._search_history_cursor == 0
+        p._handle_search_key(player_mod.KEY_UP)
+        assert p._search_history_cursor is None
+        assert not p._player_focus  # the box, not the player, gets this press
+        p._handle_search_key(player_mod.KEY_UP)
+        assert p._player_focus  # the existing hand-off, one press later
+
+    def test_enter_on_a_row_runs_the_search(self, config_file):
+        p = self._blank()
+        p._handle_search_key(player_mod.KEY_DOWN)
+        p._handle_search_key(player_mod.KEY_DOWN)  # coltrane
+        p._handle_search_key(player_mod.KEY_ENTER)
+        assert p._search_query == "coltrane"
+        assert p._search_history_cursor is None
+        assert _wait_for(lambda: not p._search_loading)
+        assert p.session.calls[0]["query"] == "coltrane"
+        assert p._search_results
+        assert p._search_history[0] == "coltrane"  # re-running bumps it up
+
+    def test_enter_with_an_empty_query_still_does_nothing(self, config_file):
+        p = self._blank()
+        p._handle_search_key(player_mod.KEY_ENTER)  # cursor unset: query box
+        assert p.session.calls == []
+        assert p._search_history == ["miles davis", "coltrane", "monk"]
+
+    def test_backspace_deletes_the_row_under_the_cursor(self, config_file):
+        p = self._blank()
+        p._handle_search_key(player_mod.KEY_DOWN)
+        p._handle_search_key(player_mod.KEY_DOWN)  # coltrane
+        p._handle_search_key(player_mod.KEY_BACKSPACE)
+        assert p._search_history == ["miles davis", "monk"]
+        assert p._search_history_cursor == 1  # the row that slid up
+        p._handle_search_key(player_mod.KEY_BACKSPACE)  # monk, the last row
+        assert p._search_history == ["miles davis"]
+        assert p._search_history_cursor == 0  # clamped, not past the end
+
+    def test_deleting_the_last_entry_returns_focus_to_the_query_box(self, config_file):
+        p = self._blank(history=("miles davis",))
+        p._handle_search_key(player_mod.KEY_DOWN)
+        p._handle_search_key(player_mod.KEY_BACKSPACE)
+        assert p._search_history == []
+        assert p._search_history_cursor is None
+        assert "Recent searches" not in p._build_search_display().plain
+        # ...and with focus back in the box, Backspace edits the query again
+        p._handle_search_key("x")
+        p._handle_search_key(player_mod.KEY_BACKSPACE)
+        assert p._search_query == ""
+
+    def test_typing_dismisses_the_list_and_starts_a_live_query(self, config_file):
+        p = self._blank()
+        p._handle_search_key(player_mod.KEY_DOWN)
+        assert p._search_history_cursor == 0
+        p._handle_search_key("m")
+        assert p._search_history_cursor is None
+        assert p._search_query == "m"
+        assert "Recent searches" not in p._build_search_display().plain
+        assert p.session.calls == []  # typing never searches
