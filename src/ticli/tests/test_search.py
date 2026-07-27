@@ -1075,14 +1075,28 @@ class TestSearchHistoryRecall:
         assert "Recent searches" in p._build_search_display().plain
         assert p._search_history_cursor is None
 
-    def test_the_list_is_capped_at_the_page_size(self, config_file):
+    def test_the_window_follows_the_cursor_through_a_long_history(self, config_file):
         p = self._blank(history=[f"query {i}" for i in range(15)], page_size=10)
         text = p._build_search_display().plain
         assert "query 9" in text
-        assert "query 10" not in text
+        assert "query 10" not in text  # the first page, until the cursor leaves it
+        for _ in range(11):
+            p._handle_search_key(player_mod.KEY_DOWN)
+        assert p._search_history_cursor == 10  # past the page: the display turns it
+        text = p._build_search_display().plain
+        assert "query 10" in text
+        assert "query 9" not in text
         for _ in range(20):
             p._handle_search_key(player_mod.KEY_DOWN)
-        assert p._search_history_cursor == 9  # the cursor stops where the list does
+        assert p._search_history_cursor == 14  # the cursor stops where the list does
+
+    def test_history_keeps_two_hundred_searches(self, config_file):
+        p = self._blank(history=())
+        for i in range(205):
+            p._add_to_history(f"query {i}")
+        assert len(p._search_history) == 200
+        assert p._search_history[0] == "query 204"  # newest first, oldest aged out
+        assert "query 4" not in p._search_history
 
     def test_down_enters_the_list_and_clamps_at_the_end(self, config_file):
         p = self._blank()
