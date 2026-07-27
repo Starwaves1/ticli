@@ -1714,6 +1714,13 @@ class HeadlessTidalPlayer:
         # change of which view is being read and nothing has to be copied.
         self._search_query = ""
         self._search_history: list = []  # recent searches, newest first
+        # The recall list's cursor. None means focus is in the query box —
+        # the state search always starts in — and an index means ↓ has
+        # entered the list of recent searches the blank pane shows. Every
+        # path that dismisses that list (typing, running a search, entering
+        # search mode afresh) puts this back to None, so it can never point
+        # into a list that is gone or past one that shrank.
+        self._search_history_cursor: Optional[int] = None
         # Which scope the query runs in, and what the session has in hand for
         # it: one reservoir of rows per query, and one view per scope drawing
         # on it. Both are dropped the moment the query changes.
@@ -3310,6 +3317,20 @@ class HeadlessTidalPlayer:
                     content.append("  end of results", style="dim")
         elif self._search_query:
             content.append("\n\n   Press Enter to search", style="dim")
+        elif self._history_rows():
+            # The blank pane remembers. These are memories, not answers — dim,
+            # no type badges — and the first printable key replaces them with
+            # the live query exactly as if they had never been there.
+            content.append("\n\n   Recent searches", style="dim")
+            content.append("\n")
+            for i, entry in enumerate(self._history_rows()):
+                content.append("\n")
+                if i == self._search_history_cursor:
+                    content.append("  ▸ ", style="bold cyan")
+                    content.append(entry, style="bold white")
+                else:
+                    content.append("    ", style="")
+                    content.append(entry, style="dim")
 
         return content
 
@@ -4549,6 +4570,17 @@ class HeadlessTidalPlayer:
         self._search_history = [h for h in self._search_history if h.lower() != q.lower()]
         self._search_history.insert(0, q)
         self._search_history = self._search_history[:20]
+
+    def _history_rows(self) -> list:
+        """The recent searches the blank pane is showing right now — empty
+        whenever anything else has a claim on that pane (a query being typed,
+        rows, a message, a fetch in flight). The keys and the display both ask
+        this one question, and both cap at the page size, so the cursor can
+        only ever land on a row that is actually on screen."""
+        if (self._search_query or self._search_results
+                or self._search_loading or self._search_message):
+            return []
+        return self._search_history[:self._page_rows()]
 
     @staticmethod
     def _search_split(page: int) -> tuple:
@@ -6530,7 +6562,9 @@ class HeadlessTidalPlayer:
             self._mode = self.MODE_SEARCH
             self._search_query = ""
             # A fresh search starts in the scope you'd expect, not in whatever
-            # one you last tabbed to half an hour ago
+            # one you last tabbed to half an hour ago — and with focus in the
+            # query box, not on a row some earlier visit left highlighted
+            self._search_history_cursor = None
             self._search_filter = "all"
             self._reset_search_results()
             self._nav_history.clear()
@@ -6586,9 +6620,16 @@ class HeadlessTidalPlayer:
         if key == KEY_SHIFT_TAB:
             self._cycle_search_filter(-1)
             return
+        history = self._history_rows()
         if key == KEY_UP:
             if self._search_results and self._search_cursor > 0:
                 self._search_cursor -= 1
+            elif history and self._search_history_cursor is not None:
+                # From row 0 ↑ leaves the list for the query box; only the
+                # press after that hands the arrows to the player
+                self._search_history_cursor = (
+                    self._search_history_cursor - 1
+                    if self._search_history_cursor > 0 else None)
             else:
                 self._focus_player()
         elif key == KEY_DOWN:
@@ -6600,16 +6641,44 @@ class HeadlessTidalPlayer:
                     # The cursor stays put: rows are appended below it, so it
                     # never jumps, and the next press walks into them.
                     self._search_more()
+            elif history:
+                # ↓ from the query box enters the recall list at the top;
+                # the bottom is the bottom — history has no next page
+                self._search_history_cursor = (
+                    0 if self._search_history_cursor is None
+                    else min(self._search_history_cursor + 1, len(history) - 1))
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
             if self._search_results:
                 self._select_search_result()
+            elif (history and self._search_history_cursor is not None
+                    and key != KEY_RIGHT):
+                # A remembered query runs exactly like a retyped one — through
+                # _do_search, which puts it back on top of the history
+                self._search_query = history[self._search_history_cursor]
+                self._search_history_cursor = None
+                self._do_search()
             elif key != KEY_RIGHT:
                 self._do_search()
         elif key in (KEY_BACKSPACE, KEY_BACKSPACE2):
-            self._search_query = self._search_query[:-1]
-            self._reset_search_results()
+            if history and self._search_history_cursor is not None:
+                # On a highlighted row Backspace deletes the memory, not the
+                # (empty) query. Reassigned, never mutated, like every list a
+                # paint might be walking. The cursor stays where the eye is —
+                # on the row that slid up — and an emptied list hands focus
+                # back to the query box.
+                idx = self._search_history_cursor
+                self._search_history = (
+                    self._search_history[:idx] + self._search_history[idx + 1:])
+                remaining = self._history_rows()
+                self._search_history_cursor = (
+                    min(idx, len(remaining) - 1) if remaining else None)
+            else:
+                self._search_query = self._search_query[:-1]
+                self._search_history_cursor = None
+                self._reset_search_results()
         elif len(key) == 1 and key.isprintable():
             self._search_query += key
+            self._search_history_cursor = None
             self._reset_search_results()
 
     def _handle_browse_key(self, key: str):
