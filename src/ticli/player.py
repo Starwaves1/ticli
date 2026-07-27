@@ -288,18 +288,19 @@ def _hints_text(rows, indent: int) -> "Text":
 class _Fit:
     """One attempt at the pane, and the order in which it gives ground.
 
-    Four things are elastic — the cover, the prose under the settings table,
-    how many rows a page shows and how many rows the footer gets — and which
-    of them goes first is per screen, because the cheapest thing to lose is
-    not the same on all of them. Each screen names its own order (`levers`),
-    and _build_display pulls them in turn until the pane fits. What is never
-    given up on any screen is the track and the progress line — IDENTITY_ROWS
-    — and when even this runs out it is the footer that gives way to them
-    rather than the other way round; see the crop in _build_display.
+    Five things are elastic — the cover, the prose under the settings table,
+    how many rows a page shows, the chrome between the player and a list, and
+    how many rows the footer gets — and which of them goes first is per
+    screen, because the cheapest thing to lose is not the same on all of
+    them. Each screen names its own order (`levers`), and _build_display
+    pulls them in turn until the pane fits. What is never given up on any
+    screen is the track and the progress line — IDENTITY_ROWS — and when even
+    this runs out it is the footer that gives way to them rather than the
+    other way round; see the crop in _build_display.
     """
 
     __slots__ = ("inner", "rows", "page_rows", "artwork", "hint_rows",
-                 "prose", "mini", "_levers")
+                 "prose", "chrome", "mini", "_levers")
 
     def __init__(self, inner, rows, page_rows, hint_rows, levers=(), mini=False):
         self.inner = inner
@@ -307,6 +308,11 @@ class _Fit:
         self.page_rows = page_rows
         self.artwork = True
         self.prose = True
+        # The rows between the player block and a list screen's own content
+        # that say nothing — the blank-ruled separator and the queue/quality
+        # status line. Worth three or four rows, and the difference between a
+        # short window showing the search scope row and eating it.
+        self.chrome = True
         # Which pane is being drawn, read by the composer rather than taken
         # from the player. Not a lever today — nothing relaxes into the tiny
         # player — but a lever is where it would go: `relax` walks an ordered
@@ -331,6 +337,9 @@ class _Fit:
                 return True
             if lever == "prose" and self.prose:
                 self.prose = False
+                return True
+            if lever == "chrome" and self.chrome:
+                self.chrome = False
                 return True
             if lever == "hint_rows" and self.hint_rows > 1:
                 self.hint_rows = 1
@@ -3565,7 +3574,14 @@ class HeadlessTidalPlayer:
             if t_artist:
                 up_next.append(f" \u2022 {t_artist}", style="dim")
 
-        lines = [track_line, album_line, progress_line, status_line]
+        lines = [track_line, album_line, progress_line]
+        if self._fit.chrome:
+            # Under pressure the queue position and the quality badge are the
+            # first player rows to go: both are summaries, and the screens
+            # this is given up on (the lists) show the queue itself. Never
+            # pulled on the player screen — chrome is not one of its levers —
+            # so the full player always says them.
+            lines.append(status_line)
         if up_next.plain:
             lines.append(up_next)
 
@@ -5173,9 +5189,15 @@ class HeadlessTidalPlayer:
             return self._with_footer(content, fit)
 
         if self._mode != self.MODE_PLAYER:
-            content.append("\n\n")
-            content.append("  " + "─" * max(fit.inner - 4, 4), style="dim")
-            content.append("\n\n")
+            if fit.chrome:
+                content.append("\n\n")
+                content.append("  " + "─" * max(fit.inner - 4, 4), style="dim")
+                content.append("\n\n")
+            else:
+                # The separator's three rows say nothing a short window can
+                # afford: the list's own header row (the search query and
+                # scope, the artist tabs) is what they would cost
+                content.append("\n")
             if self._mode == self.MODE_SEARCH:
                 content.append_text(self._build_search_display())
             elif self._mode == self.MODE_BROWSE:
@@ -5333,6 +5355,13 @@ class HeadlessTidalPlayer:
         scope Tab landed on — so they are drawn at every height and it is the
         rows under them that give way. (The scope row still gets *narrower*
         with the pane; that is width, and it is decided where it is drawn.)
+        `chrome` is what keeps that promise once the page is down to one row:
+        without it the crop in _build_display, which cuts the body from the
+        bottom, reached those header rows while the separator's three blank
+        rows and the queue/quality line — rows that say nothing — sat safe
+        above them. The bug that lever exists for was the search scope row
+        vanishing from a 13-row terminal that still had four rows of
+        decoration on screen.
         """
         if self._mini_player:
             return ()
@@ -5340,7 +5369,7 @@ class HeadlessTidalPlayer:
             return ("artwork", "hint_rows")
         if self._mode == self.MODE_SETTINGS:
             return ("prose", "page_rows", "hint_rows")
-        return ("page_rows", "hint_rows")
+        return ("page_rows", "chrome", "hint_rows")
 
     def _console_size(self):
         try:
