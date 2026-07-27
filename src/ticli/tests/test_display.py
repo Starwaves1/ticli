@@ -969,13 +969,53 @@ class TestTheRowsThatSayWhereYouAre:
 
     @pytest.mark.parametrize("mode", (HeadlessTidalPlayer.MODE_ARTIST,
                                       HeadlessTidalPlayer.MODE_SEARCH))
-    def test_a_short_window_keeps_the_row_and_drops_rows_instead(self, mode):
-        h = self._harness(60, mode, height=18)
+    @pytest.mark.parametrize("height", (10, 12, 14, 18))
+    def test_a_short_window_keeps_the_row_and_drops_rows_instead(self, mode, height):
+        """Down to height 10, which is a six-row pane — the shortest window
+        with room for anything below the track at all. The reported bug was
+        the search scope row vanishing from a 13-row terminal: the page was
+        already down to one row, the crop cuts the body from the bottom, and
+        the next thing it reached was the scope row while the separator's
+        blank rows sat safe above it. The chrome lever gives those up first."""
+        h = self._harness(60, mode, height=height)
         try:
-            assert _tab_rows(h), _body(h)
-            h.assert_one_frame(f"{mode} at 60x18")
+            assert _tab_rows(h), (mode, height, _body(h))
+            h.assert_one_frame(f"{mode} at 60x{height}")
         finally:
             h.live.stop()
+
+    def test_a_short_window_spends_result_rows_not_the_scope_row(self):
+        """What gives way, in order: rows of the list — ↑/↓ still reaches
+        everything a shorter page hides — then the separator and the status
+        line, which say nothing. The scope row outlives them all, because it
+        is the one row that says which scope Tab landed on."""
+        tall = self._harness(80, HeadlessTidalPlayer.MODE_SEARCH, height=30)
+        short = self._harness(80, HeadlessTidalPlayer.MODE_SEARCH, height=14)
+        try:
+            rows = lambda h: len([r for r in _body(h) if "Track number" in r])
+            assert rows(tall) > rows(short) >= 1, (rows(tall), rows(short))
+            assert _tab_rows(short), _body(short)
+            short.assert_one_frame("search at 80x14")
+        finally:
+            tall.live.stop()
+            short.live.stop()
+
+    def test_the_chrome_is_only_given_up_under_pressure(self):
+        """The separator and the queue line are part of the screen's look —
+        pulled only when the page is already down to one row and the pane
+        still does not fit, and back the moment the window is."""
+        divider = lambda h: [r for r in _body(h)
+                             if r.strip() and set(r.strip()) == {"─"}]
+        roomy = self._harness(80, HeadlessTidalPlayer.MODE_SEARCH, height=30)
+        short = self._harness(80, HeadlessTidalPlayer.MODE_SEARCH, height=12)
+        try:
+            assert divider(roomy), _body(roomy)
+            assert any("Queue: " in r for r in _body(roomy))
+            assert not divider(short), _body(short)
+            assert not any("Queue: " in r for r in _body(short))
+        finally:
+            roomy.live.stop()
+            short.live.stop()
 
 
 class TestScrubbingAndTheOverlayOnScreen:
