@@ -150,3 +150,10 @@ Recurring theme, applied deliberately:
 - **Commit messages carry reasoning**, including measurements and rejected
   alternatives. This paid off directly: the history is reconstructable from
   the repo alone.
+- **Update `ai/` in the same commit as the code.** A dated entry in
+  `HISTORY.md` for every change; `DECISIONS.md` when something is decided,
+  built or deferred; `INCIDENTS.md` when a failure teaches a rule. Correct
+  anything your work made untrue rather than leaving it to rot, and write down
+  what you *didn't* do — dropped scope and refuted hypotheses have been among
+  the most valuable entries. See `ai/README.md` for what belongs where. This
+  is a standing obligation on every agent, not a task that gets assigned.

@@ -2580,7 +2580,7 @@ class HeadlessTidalPlayer:
                 "track_ids": track_ids,
                 "queue_index": queue_index,
                 "position": self._get_position(),
-                "search_history": self._search_history[:20],
+                "search_history": self._search_history[:200],
             }
             # A full save rewrites the whole file, so the pin has to be carried
             # through it or the last add of the session would be forgotten
@@ -2615,7 +2615,7 @@ class HeadlessTidalPlayer:
             data = json.loads(STATE_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             return
-        self._search_history = data.get("search_history", [])[:20]
+        self._search_history = data.get("search_history", [])[:200]
         self._last_playlist_id = data.get("last_playlist_id") or None
         track_ids = data.get("track_ids", [])
         queue_index = data.get("queue_index", 0)
@@ -3715,19 +3715,25 @@ class HeadlessTidalPlayer:
         elif self._search_query:
             content.append("\n\n   Press Enter to search", style="dim")
         elif self._history_rows():
-            # The blank pane remembers. These are memories, not answers — dim,
-            # no type badges — and the first printable key replaces them with
-            # the live query exactly as if they had never been there.
+            # The blank pane remembers. These are memories, not answers — no
+            # type badges — and the first printable key replaces them with
+            # the live query exactly as if they had never been there. Paged
+            # the same way as results: the window follows the cursor, so a
+            # long history is walked, not truncated.
+            rows = self._history_rows()
+            page = self._page_rows()
+            page_start = (0 if self._search_history_cursor is None
+                          else (self._search_history_cursor // page) * page)
             content.append("\n\n   Recent searches", style="dim")
             content.append("\n")
-            for i, entry in enumerate(self._history_rows()):
+            for i in range(page_start, min(page_start + page, len(rows))):
                 content.append("\n")
                 if i == self._search_history_cursor:
                     content.append("  ▸ ", style="bold cyan")
-                    content.append(entry, style="bold white")
+                    content.append(rows[i], style="bold white")
                 else:
                     content.append("    ", style="")
-                    content.append(entry, style="dim")
+                    content.append(rows[i], style="white")
 
         return content
 
@@ -5430,18 +5436,19 @@ class HeadlessTidalPlayer:
         # Remove if already present, then prepend
         self._search_history = [h for h in self._search_history if h.lower() != q.lower()]
         self._search_history.insert(0, q)
-        self._search_history = self._search_history[:20]
+        self._search_history = self._search_history[:200]
 
     def _history_rows(self) -> list:
-        """The recent searches the blank pane is showing right now — empty
+        """The recent searches the blank pane belongs to right now — empty
         whenever anything else has a claim on that pane (a query being typed,
         rows, a message, a fetch in flight). The keys and the display both ask
-        this one question, and both cap at the page size, so the cursor can
-        only ever land on a row that is actually on screen."""
+        this one question, so the cursor can only ever land on a row that
+        exists; which page of these rows is on screen is the display's
+        business, the same as for results."""
         if (self._search_query or self._search_results
                 or self._search_loading or self._search_message):
             return []
-        return self._search_history[:self._page_rows()]
+        return self._search_history
 
     @staticmethod
     def _search_split(page: int) -> tuple:
