@@ -780,6 +780,127 @@ class TestDownloadingSomethingAlreadyCached:
         assert cached.exists(), "it deleted the file under the playing track"
         assert p._cache.audio_record(42) is not None
 
+    def test_the_deferred_reclaim_fires_once_the_track_moves_on(self, monkeypatch):
+        """Skipping the playing track is right, but skipped must not mean
+        forgiven: nothing else ever takes the duplicate. `reconcile()` keeps
+        a tracker entry whose file is present, and eviction ranks by plays —
+        the much-played track you download while listening is exactly the one
+        eviction keeps for ever. So the drop defers the id and the monitor's
+        tick retries it the first time the track is no longer current."""
+        p = self._player_expecting_no_network(monkeypatch)
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        p._current_track = _track()          # id 42, the one being downloaded
+        assert _download(p, "LOSSLESS")["state"] == "done"
+        assert cached.exists()
+
+        p._reclaim_deferred_copies()         # the tick, track still playing
+        assert cached.exists(), "it reclaimed the copy under the playing track"
+
+        p._current_track = _track(tid=99)    # the song moved on
+        p._reclaim_deferred_copies()         # the same tick, one track later
+        assert not cached.exists(), "the deferred reclaim never fired"
+        assert p._cache.audio_record(42) is None
+
+    def test_the_startup_sweep_reclaims_a_duplicate_that_survived_a_quit(self):
+        """Quit while the deferred track is still playing and the pair is on
+        disk the next morning. The sweep beside `reconcile()` catches it —
+        and every duplicate created before the drop existed at all."""
+        p = _player(quality="LOSSLESS")
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        dest = downloads.destination(downloads.track_metadata(_track()), ".m4a")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(_mp4())
+        downloads.record(42, dest.relative_to(downloads.download_dir()),
+                         "LOSSLESS", dest.stat().st_size, granted="LOSSLESS")
+
+        p._reclaim_download_duplicates()
+
+        assert not cached.exists(), "the sweep left the duplicate behind"
+        assert p._cache.audio_record(42) is None
+        assert downloads.path_for(42) is not None, "the sweep took the download"
+
+    def test_the_sweep_defers_the_playing_track_to_the_tick(self):
+        """A restore can already be audible by the time the sweep runs, and
+        the sweep must not cause the very hiccup the per-download drop
+        avoids. Same deferral, same retry."""
+        p = _player(quality="LOSSLESS")
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        dest = downloads.destination(downloads.track_metadata(_track()), ".m4a")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(_mp4())
+        downloads.record(42, dest.relative_to(downloads.download_dir()),
+                         "LOSSLESS", dest.stat().st_size, granted="LOSSLESS")
+        p._current_track = _track()
+
+        p._reclaim_download_duplicates()
+        assert cached.exists(), "the sweep unlinked the playing track's copy"
+
+        p._current_track = _track(tid=99)
+        p._reclaim_deferred_copies()
+        assert not cached.exists()
+
+    def test_a_hand_deleted_download_does_not_take_the_cached_copy_with_it(self):
+        """The sweep walks `downloads.present()`, not the raw index: a
+        download the user dragged to the trash is not a download, and
+        `_local_source` falls back to the cached copy then — reclaiming it
+        would delete the one copy that still plays."""
+        p = _player(quality="LOSSLESS")
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        dest = downloads.destination(downloads.track_metadata(_track()), ".m4a")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(_mp4())
+        downloads.record(42, dest.relative_to(downloads.download_dir()),
+                         "LOSSLESS", dest.stat().st_size, granted="LOSSLESS")
+        dest.unlink()                        # deleted by hand, index left stale
+
+        p._reclaim_download_duplicates()
+
+        assert cached.exists(), "the sweep trusted the index over the disk"
+
+    def test_a_file_gone_at_unlink_time_still_forgets_the_entry(self, monkeypatch):
+        """Eviction racing the drop: the path was looked up, then the file
+        went. The entry must still be forgotten — already gone is the state
+        the drop wanted (the reading `clear()` gives FileNotFoundError), and
+        keeping it recreates the exact entry-with-no-file the drop cleans up
+        when it *sees* it."""
+        p = _player(quality="LOSSLESS")
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        real = player_mod.cached_audio_path
+
+        def raced(track_id):
+            path = real(track_id)
+            cached.unlink()      # eviction wins between the lookup and unlink
+            return path
+
+        monkeypatch.setattr(player_mod, "cached_audio_path", raced)
+        p._drop_superseded_cache_copy(42)
+        assert p._cache.audio_record(42) is None, \
+            "a vanished file left its tracker entry behind"
+
+    def test_reclaim_works_with_cache_songs_off_but_the_files_kept(self, monkeypatch):
+        """Turn `cache_songs` off and answer "n" to `Clear cached songs as
+        well?` and the files stay on disk — still unreachable behind a
+        download, and with the setting off nothing else (`reconcile` early
+        returns, no cache write ever sweeps) will ever reclaim them. The
+        drop is gated on evidence, not on the setting."""
+        p = _player(quality="LOSSLESS")
+        cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
+        p._cache = MetadataCache(songs=False)     # the "n" answer: files kept
+        track = _track()
+        track.get_stream = lambda: types.SimpleNamespace(
+            audio_quality="LOSSLESS",
+            get_stream_manifest=lambda: types.SimpleNamespace(
+                is_bts=True, get_urls=lambda: ["https://cdn/x.mp4"]))
+        p._download_track = track
+        # No promotion with the setting off, so the bytes come off the wire
+        patch_get(monkeypatch, player_mod, lambda *a, **k: _FakeStream(_mp4()))
+
+        assert _download(p, "LOSSLESS")["state"] == "done"
+
+        assert not cached.exists(), \
+            "cache_songs off left the unreachable duplicate for ever"
+        assert p._cache.audio_record(42) is None
+
     def test_the_recorded_tier_is_the_one_that_was_granted(self, monkeypatch):
         p = self._player_expecting_no_network(monkeypatch)
         self._cached(p._cache, 42, "LOSSLESS", body=_mp4())

@@ -2131,6 +2131,13 @@ class HeadlessTidalPlayer:
         # asking about. Nothing is unlinked until that answer comes back.
         self._downloads_cursor = 0
         self._downloads_delete: Optional[dict] = None
+        # Cached copies a landing download could not reclaim because that
+        # very track was playing (see _drop_superseded_cache_copy). Track ids
+        # as strings. Written from download writer threads and read on the
+        # monitor's tick, so every touch is under the lock — a set mutated
+        # from two threads is not one of the whole-object-replacement cases.
+        self._reclaim_deferred = set()
+        self._reclaim_lock = threading.Lock()
         # The _play_gen whose play has already been counted, so one
         # listen is one point however many ticks go past (see
         # _maybe_count_play). -1 is "none yet", which no gen ever is.
@@ -3310,6 +3317,9 @@ class HeadlessTidalPlayer:
             self._flush_seek()
             # The download bars' rate number, on this tick and no other
             self._sample_download_rates()
+            # A cached copy whose reclaim was deferred because its track was
+            # playing gets its retry here, on the first tick it no longer is
+            self._reclaim_deferred_copies()
             # Save state periodically so a crash doesn't lose the position
             if time.time() - last_save > 10:
                 self._save_state()
@@ -4051,6 +4061,13 @@ class HeadlessTidalPlayer:
                     self._wake()
             except Exception as e:  # pragma: no cover - bookkeeping only
                 logger.debug("Could not reconcile the cache tracker: %s", e)
+            # The one moment duplicates that survived a quit are caught.
+            # After reconcile on purpose, so a cache file adopted just now
+            # is already in the tracker when its download shadows it.
+            try:
+                self._reclaim_download_duplicates()
+            except Exception as e:  # pragma: no cover - bookkeeping only
+                logger.debug("Could not sweep download duplicates: %s", e)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -6949,32 +6966,103 @@ class HeadlessTidalPlayer:
         is disposable by definition and this deletes nothing the user cannot
         get back by playing the track.
 
-        **Never the track playing right now.** On POSIX unlinking an open
-        file is safe and mpv plays on, but if the backend has not opened it
-        yet it exits and `source_vanished` restarts from the network — an
-        audible hiccup, paid for a bookkeeping tidy-up. The copy stays until
-        the song is over; `reconcile()` and eviction both handle it from
-        there, and one duplicate for the length of one track is nothing.
+        **Never the track playing right now** — but skipped is not forgiven.
+        On POSIX unlinking an open file is safe and mpv plays on, but if the
+        backend has not opened it yet it exits and `source_vanished` restarts
+        from the network: an audible hiccup, paid for a bookkeeping tidy-up.
+        So the id goes into `_reclaim_deferred` instead, and the monitor's
+        existing 0.5 s tick retries it the moment the track is no longer
+        current (`_reclaim_deferred_copies`). It has to, because nothing else
+        ever would: `reconcile()` *keeps* an entry whose file is on disk, and
+        eviction ranks by (plays, last) — the much-played track this deferral
+        protects is exactly the one eviction keeps for ever. A quit mid-track
+        strands the pair on disk, which is what the startup sweep
+        (`_reclaim_download_duplicates`) is for.
 
-        Runs on the runner's single writer thread (see `_download_deliver`),
-        because `forget_cached` rewrites the whole tracker file.
+        Gated on evidence, never on the `cache_songs` setting: turn the
+        setting off and answer "n" to `Clear cached songs as well?` and the
+        files are still on disk, still unreachable behind the download, and
+        this is the only thing that will ever reclaim them —
+        `cached_audio_path` and `forget_cached` both work with the setting
+        off. A file already gone at unlink time is the state we wanted (the
+        reading `clear()` gives FileNotFoundError), so the tracker entry is
+        still forgotten: eviction racing this drop must not leave the exact
+        entry-with-no-file this function cleans up when it finds it. Only a
+        real OSError keeps the entry — a Windows PermissionError means the
+        file genuinely remains, and forgetting it would lie.
+
+        Runs wherever `_commit` runs: the bulk runner's single writer thread
+        for `record=False`, but inline on the download screen's daemon thread
+        and the re-fetch thread for `record=True` — and on the monitor thread
+        for deferred retries. The tracker's read-modify-write is serialized
+        by `MetadataCache` itself; the deferred set is under `_reclaim_lock`.
         """
-        if track_id is None or not self._cache.keeps_audio:
+        if track_id is None:
             return
-        if str(getattr(self._current_track, "id", None)) == str(track_id):
+        key = str(track_id)
+        if str(getattr(self._current_track, "id", None)) == key:
+            with self._reclaim_lock:
+                self._reclaim_deferred.add(key)
             return
+        with self._reclaim_lock:
+            self._reclaim_deferred.discard(key)
         path = cached_audio_path(track_id)
-        if not path:
-            self._cache.forget_cached([track_id])  # entry with no file
-            return
-        try:
-            os.unlink(path)
-        except OSError as e:
-            # A cache copy that will not go is not a failed download
-            logger.debug("Could not drop the superseded cached copy: %s", e)
-            return
+        if path:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass  # already gone is the state we wanted
+            except OSError as e:
+                # The file genuinely remains, so the entry stays too
+                logger.debug("Could not drop the superseded cached copy: %s", e)
+                return
         self._cache.forget_cached([track_id])
         self._cache.invalidate_audio_count()
+
+    def _reclaim_deferred_copies(self) -> None:
+        """Retry the reclaims `_drop_superseded_cache_copy` deferred.
+
+        On `_monitor_playback`'s existing 0.5 s tick — no new thread, no new
+        timer — and almost always a lock, an empty check and nothing else. An
+        id whose track is still playing stays deferred; anything else goes
+        back through the same drop logic, which removes it from the set (or
+        re-defers it, if a race made it current again). The snapshot is taken
+        under the lock and the drops happen outside it, because the drop
+        takes the lock itself.
+        """
+        with self._reclaim_lock:
+            if not self._reclaim_deferred:
+                return
+            current = str(getattr(self._current_track, "id", None))
+            ready = [t for t in self._reclaim_deferred if t != current]
+        for track_id in ready:
+            self._drop_superseded_cache_copy(track_id)
+
+    def _reclaim_download_duplicates(self) -> None:
+        """The startup sweep: every track in both tiers loses its cached copy.
+
+        The per-download drop misses two kinds of pair: the track that was
+        playing when its download landed and kept playing until quit, so the
+        deferral never got its retry; and every duplicate created before the
+        drop existed at all. Left alone they survive for ever — `reconcile()`
+        keeps a tracker entry whose file is present, and eviction ranks by
+        (plays, last), which the much-played tracks people download score
+        best on. So this runs once at startup, beside `reconcile()` on its
+        daemon thread, and hands each pair to the same drop logic; a track
+        already audible by then (a restore can be) is deferred to the
+        monitor's tick like any other.
+
+        `downloads.present()` rather than the raw index, because a download
+        the user deleted by hand is not a download: `_local_source` falls
+        back to the cached copy then, and reclaiming it would delete the one
+        copy that still plays. Runs whatever `cache_songs` says — the files
+        on disk are the evidence, and with the setting off nothing else would
+        ever reclaim them.
+        """
+        for row in downloads.present():
+            track_id = row["id"]
+            if cached_audio_path(track_id) or self._cache.audio_record(track_id):
+                self._drop_superseded_cache_copy(track_id)
 
     # ── Re-fetch everything at the current quality ──
     #
