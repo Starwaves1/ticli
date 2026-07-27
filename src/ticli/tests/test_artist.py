@@ -328,6 +328,37 @@ class TestSections:
         assert text.count("[TRACK]") == 5
         assert "Page 1/4" in text
 
+    def test_a_downloaded_track_is_marked_here_too(self, config_file, monkeypatch):
+        """The same gutter browse, queue and search use. A marker on three
+        list screens out of four is its own kind of jank."""
+        p, _ = _open(page_size=5)
+        first = p._artist_rows()[0]["obj"]
+        monkeypatch.setattr(p, "_downloaded",
+                            lambda tid: tid == getattr(first, "id", None))
+        lines = [l for l in p._build_artist_display().plain.splitlines()
+                 if "[TRACK]" in l]
+        # After the cursor gutter, before the badge
+        assert 0 < lines[0].index("↓") < lines[0].index("[TRACK]"), lines[0]
+        assert "↓" not in lines[1], lines[1]
+        # Reserved, not inserted: an undownloaded row's badge sits in the same
+        # column as a downloaded one's, or the list would look ragged
+        assert (lines[0].index("[TRACK]") == lines[1].index("[TRACK]")), \
+            "the marker shifted the badge column"
+
+    def test_a_row_that_is_not_a_track_reserves_the_gutter_anyway(self, config_file):
+        """Only a track can be downloaded, but an albums section still has to
+        line its badges up with a tracks section's."""
+        p, _ = _open(page_size=5)
+        _tab_to(p, "albums")
+        lines = [l for l in p._build_artist_display().plain.splitlines()
+                 if "[ALBUM]" in l]
+        assert lines, "no album rows to check"
+        assert "↓" not in lines[0]
+        p2, _ = _open(page_size=5)
+        track_line = [l for l in p2._build_artist_display().plain.splitlines()
+                      if "[TRACK]" in l][0]
+        assert lines[0].index("[ALBUM]") == track_line.index("[TRACK]")
+
     def test_playlist_rows_are_the_only_ones_kept_from_the_page(self, config_file):
         p, _ = _open()
         _tab_to(p, "playlists")

@@ -3774,6 +3774,14 @@ class HeadlessTidalPlayer:
             content.append("\n")
             content.append("  ▸ " if selected else "    ",
                            style="bold cyan" if selected else "")
+            # Same gutter as browse, queue and search. A mixed section holds
+            # albums and artists too, and only a track can be downloaded — so
+            # the columns are reserved on every row rather than only on the
+            # track ones, or the badges below a downloaded track would sit two
+            # columns left of the badges above it.
+            self._download_mark(
+                content, getattr(obj, "id", None)
+                if row["type"] == "track" else None)
             content.append(f"[{row['type'].upper()}]",
                            style=type_styles.get(row["type"], "dim"))
             item_name = getattr(obj, "name", None) or "?"
