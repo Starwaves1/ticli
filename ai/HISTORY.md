@@ -773,6 +773,67 @@ keypress, plus the no-overflow matrix re-run with the footer hidden (every mode
 
 ---
 
+## 2026-07-27
+
+### A downloaded song is never re-fetched for a tier you did not ask it for
+
+Garrett: *"Check that a downloaded song (not cached song) is never
+unconsentually upgraded in quality when it is streamed at a higher quality. It
+should just stream from download and not stream data."*
+
+`_local_copy` applied **one rule to both tiers**: a copy stored below the tier
+currently selected in settings is passed over, and playback falls through to
+the network. For the cache that is right and has not changed — it is
+machine-owned, disposable, and a stale tier there is worth one request. For a
+download it was wrong. Downloading an album at LOSSLESS and later setting the
+app to HI-RES made every one of those songs stream: the file he deliberately
+put in `~/Music/Ticli` was passed over and his data was spent on audio already
+on his disk. (His file was never overwritten — that half was already right —
+but the fetch is the thing he did not want.)
+
+**The rule now: a downloaded copy always wins.** It is played whatever the
+quality setting says, and no tier comparison happens on the download tier at
+all. Quality changes for a download when the user asks, with `[R]` on the
+settings page, which is the consent and already exists.
+
+The honesty half, which is not optional here: a download can now play *below*
+the tier the settings page shows, so the player's badge stopped being the
+setting's label and became **what is really playing** — `LOSSLESS ·
+downloaded`, or a bare `downloaded` when the index never recorded a tier,
+because "we do not know" is honest and the setting's label would not be. It
+rides the status line that was already drawn, next to `Queue: 3/12`. **Not** a
+toast: this is true of every track of a downloaded album, and a notice per
+track is nagging. No setting for it, and the setting's label comes straight
+back the moment the bytes come off the network.
+
+Mechanically it is one function split in two. `_local_source(track)` returns
+`(path, badge)`; `_local_copy` is the path half, kept for the prefetch, which
+only wants to know whether the network is needed. `_tier_is_enough` is now the
+cache's rule alone. The badge is assigned whole, behind the same `_play_gen`
+check as the play it describes, so a late-landing start cannot label the wrong
+song. Both tiers are still verified by `stat` at the moment of use, so a file
+deleted by hand still falls through to the network.
+
+Two second-order effects, both checked. The quality gate (`_note_granted_quality`)
+learns nothing on a local-copy path because no stream is described — already
+true and already documented; the change only turns a stream into a local play
+for a track the user had already fetched at a tier the gate had seen, so
+nothing widened. And a download at a *lower* tier now shadows a *higher*
+cached copy of the same track — which cannot arise in practice, because
+`_drop_superseded_cache_copy` deletes the cached copy the moment a download
+lands, and is the right answer anyway: the user's file wins.
+
+12 tests (`TestADownloadedTrackIsNeverUpgradedBehindYourBack`), asserting the
+observable thing: what the audio backend was handed, and that the network was
+touched zero times — enforced by making `get_stream`, `_stream_description`,
+`_stream_url` and `requests.get` all fail the test. Every stored tier against
+every setting, the bytes on disk being the bytes played, the prefetch spending
+nothing either, a hand-deleted download still falling through, the cache rule
+proved *not* to have moved with it, and the music folder byte-for-byte
+unchanged by playing. 1365 in the suite.
+
+---
+
 ## In flight at time of writing
 
 - **Responsive narrow-width layout + `v` volume overlay** — width-derived

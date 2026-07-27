@@ -2207,6 +2207,10 @@ class HeadlessTidalPlayer:
         self._track_changing = False
         # Bumped per play request so a stale one can't clobber a newer one
         self._play_gen = 0
+        # What the player badge says instead of the quality setting, set when
+        # the bytes come from somewhere the setting does not describe (a
+        # download). None means the setting is the truth.
+        self._playing_badge = None
         # Next-track URL prefetch: the result, and the id we already asked for
         self._prefetch = None
         self._prefetch_id = None
@@ -2717,7 +2721,7 @@ class HeadlessTidalPlayer:
                 # too late, so replaying a 20-track cached playlist spent 20
                 # playbackinfo requests on URLs it then threw away — the
                 # exact endpoint whose burst rate got the owner blocked.
-                local = self._local_copy(real)
+                local, badge = self._local_source(real)
                 if local:
                     url, granted = "", None
                 else:
@@ -2729,6 +2733,11 @@ class HeadlessTidalPlayer:
                     return
                 artist = ", ".join(a.name for a in real.artists) if real.artists else ""
                 title = f"{real.name} — {artist}" if artist else real.name
+                # What the badge on the player says from here on. Assigned
+                # whole, next to the play it describes and behind the same
+                # generation check, so the screen can never claim a tier for
+                # a track that is not the one playing.
+                self._playing_badge = badge
                 self.audio.play_url(url, seek=seek, title=title, cache_key=real.id,
                                     local=local, quality=granted)
                 if self._play_gen != gen:
@@ -2745,46 +2754,94 @@ class HeadlessTidalPlayer:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _local_copy(self, track) -> Optional[str]:
-        """A copy of this track already on disk that is good enough to play.
+    def _local_source(self, track) -> tuple:
+        """`(path, badge)` — the copy of this track already on disk that will
+        be played, and what the player should say it is. `(None, None)` when
+        nothing here will do and the track has to be streamed.
 
-        Two tiers and one rule. The **download** is preferred — it is the
-        user's own file and means a downloaded library plays offline — and
-        the **cache** is next; either is verified at the moment of use rather
-        than trusted, so a file deleted by hand falls straight through to the
-        network, which is the whole of "manual deletion is handled durably".
+        Two tiers, and now **two different rules**, because the two tiers are
+        owned by different people.
 
-        "Good enough" is the quality question, and both wrong answers matter:
-        a copy stored *below* the tier now selected is skipped, so the track
-        is fetched at the quality that was asked for rather than silently
-        served the old one; a copy stored *above* it is kept, because being
-        temporarily set to LOW must never destroy a hi-res copy. A copy whose
-        tier was never recorded counts as good enough — unknown is not
-        evidence of a downgrade, and re-fetching a whole library on the
-        strength of a missing field is not something to do without being
-        asked (the settings page has an action for that, deliberately).
+        The **download** is the user's own file, and it always wins. It is
+        played whatever the quality setting says, and no tier is compared:
+        having set the app to HI-RES is not a request to re-fetch a song that
+        is already sitting in `~/Music/Ticli`, and doing it anyway spends the
+        user's data on audio he deliberately put on his own disk. The one
+        thing that changes a download's quality is the one thing that asks:
+        `[R]` on the settings page. That is the consent, and this path must
+        not quietly borrow it.
+
+        The **cache** is machine-owned and disposable, so the old rule stands
+        there and both wrong answers still matter: a cached copy stored
+        *below* the tier now selected is skipped, so the track is fetched at
+        the quality that was asked for rather than silently served the old
+        one; one stored *above* it is kept, because being temporarily set to
+        LOW must never destroy a hi-res copy. A cached copy whose tier was
+        never recorded counts as good enough — unknown is not evidence of a
+        downgrade, and re-fetching a whole library on the strength of a
+        missing field is not something to do without being asked.
+
+        Either tier is verified at the moment of use rather than trusted, so
+        a file deleted by hand falls straight through to the network, which
+        is the whole of "manual deletion is handled durably".
+
+        `badge` is the honesty half. A download can now play *below* the tier
+        the settings page shows, and a player that went on displaying the
+        setting would be claiming a quality it is not producing — the exact
+        lie this codebase has been burned by before. So a download says what
+        it actually is (`LOSSLESS · downloaded`), on the status line it was
+        already drawing, and the setting's label is only shown when the
+        setting is really what is being played. Nothing is toasted: this is
+        true for every track of a downloaded album, and a notice per track
+        would be nagging.
 
         The quality gate learns nothing on this path, since no stream is
-        described. It still learns on every cache *miss*, which is every new
-        track; the only user who would notice is one whose entire library is
-        cached, and for them `[U]` re-fetches at the new tier.
+        described — unchanged by the download rule, which only ever turns a
+        stream *into* a local play for a track the user already fetched at a
+        tier the gate has seen. It still learns on every miss, which is every
+        new track; the only user who would notice is one whose entire library
+        is on this disk, and for them `[R]` re-fetches at the new tier.
         """
         track_id = getattr(track, "id", None)
         owned = downloads.path_for(track_id)
         if owned is not None:
             entry = downloads.load_index().get(str(track_id)) or {}
-            if self._tier_is_enough(entry.get("granted")):
-                return str(owned)
+            return str(owned), self._download_badge(entry.get("granted"))
         cached = cached_audio_path(track_id) if self._cache.keeps_audio else None
         if cached:
             record = self._cache.audio_record(track_id) or {}
             if self._tier_is_enough(record.get("quality")):
-                return cached
+                return cached, None
+        return None, None
+
+    def _local_copy(self, track) -> Optional[str]:
+        """Just the path from `_local_source` — for the callers that only
+        want to know whether the network is needed at all."""
+        return self._local_source(track)[0]
+
+    def _download_badge(self, granted) -> Optional[str]:
+        """What the player says while a downloaded file is playing.
+
+        The tier the file really holds, plus where it came from. A tier that
+        was never recorded says only `downloaded`: "we do not know" is an
+        honest answer and the setting's label would not be one.
+        """
+        label = self._tier_label(granted)
+        return f"{label} · downloaded" if label else "downloaded"
+
+    def _tier_label(self, granted) -> Optional[str]:
+        """The badge for a tidalapi tier (`LOSSLESS`), or None if it is not
+        one of ours. `QUALITY_MAP` is the only translation table there is, so
+        it is read backwards rather than duplicated."""
+        for name, quality in self.QUALITY_MAP.items():
+            if granted == quality:
+                return self.QUALITY_LABELS.get(name)
         return None
 
     def _tier_is_enough(self, stored) -> bool:
-        """Whether a copy stored at `stored` still satisfies the current
-        quality setting. Unknown says yes — see `_local_copy`."""
+        """Whether a **cached** copy stored at `stored` still satisfies the
+        current quality setting. Unknown says yes — see `_local_source`.
+        Downloads do not ask: they are the user's files and always win."""
         wanted = self.QUALITY_MAP.get(self._quality_name)
         if stored not in QUALITY_RANK or wanted not in QUALITY_RANK:
             return True
@@ -3476,7 +3533,14 @@ class HeadlessTidalPlayer:
         status_line = Text()
         if self._queue:
             status_line.append(f"   Queue: {self._queue_index + 1}/{len(self._queue)}", style="dim")
-        quality_label = self.QUALITY_LABELS.get(self._quality_name, "")
+        # The setting's label is only the truth while the setting is what is
+        # being played. A downloaded file is the user's own and is played
+        # whatever the setting says (see `_local_source`), so it says what it
+        # actually is instead — a badge reading HI-RES over a LOSSLESS
+        # download would be exactly the kind of claim this project does not
+        # make.
+        quality_label = self._playing_badge or \
+            self.QUALITY_LABELS.get(self._quality_name, "")
         if quality_label:
             status_line.append(f"   {quality_label}", style="dim cyan")
 
@@ -6865,9 +6929,9 @@ class HeadlessTidalPlayer:
     def _drop_superseded_cache_copy(self, track_id) -> None:
         """Delete the cached copy of a track that has just been downloaded.
 
-        `_local_copy` looks in the downloads tier *first*, so from the moment
-        a download lands the cached copy of the same track can never be
-        played again. It is not a spare: it is a second copy of identical
+        `_local_source` answers from the downloads tier *unconditionally*, so
+        from the moment a download lands the cached copy of the same track
+        can never be played again. It is not a spare: it is a second copy of identical
         audio, counted against the cache budget and competing in eviction
         against songs that can still be used. Keeping it means a deliberate
         download quietly evicts somebody else's staple.
