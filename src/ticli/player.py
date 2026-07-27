@@ -174,6 +174,41 @@ def _boxed(rows: list, width: int, margin: int, style: str) -> list:
     return out
 
 
+# The download bar: a heavy rule into a dotted remainder. `╸` is the left half
+# of `━`, which buys a half-cell step for nothing — a bar that jumps a whole
+# character at a time reads as a progress *report*, one that moves every frame
+# reads as a thing happening. Owner's pick out of ten, ai/bar-styles-demo.py.
+BAR_FULL, BAR_HALF, BAR_EMPTY = "━", "╸", "┈"
+
+
+def _bar_split(fraction: float, width: int) -> tuple:
+    """`(filled, remainder)`, split so the two halves can be coloured apart.
+
+    Lifted from `_split` in ai/bar-styles-demo.py rather than re-derived: the
+    rounding is the whole of the half-cell step and getting it subtly wrong
+    is a bar that sticks at the ends.
+    """
+    fraction = max(0.0, min(1.0, fraction))
+    steps = int(round(fraction * width * 2))
+    whole, rem = divmod(steps, 2)
+    done = BAR_FULL * whole
+    if rem and whole < width:
+        done += BAR_HALF
+        whole += 1
+    return done, BAR_EMPTY * (width - whole)
+
+
+def _format_rate(per_second: float) -> str:
+    """`5.2MB/s`. Empty before the first sample window has closed, which reads
+    as measuring rather than as stalled."""
+    if per_second <= 0:
+        return ""
+    for unit, scale in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if per_second >= scale:
+            return f"{per_second / scale:.1f}{unit}/s"
+    return f"{int(per_second)}B/s"
+
+
 def _hint_piece(hint: Hint, level: int) -> str:
     if level >= HINT_KEYS:
         return f"[{hint.key}]"
@@ -504,6 +539,24 @@ STREAM_TRUNCATED_MARGIN = 15.0
 # fetched. See _start_refetch_job for why every part of this is structural.
 REFETCH_MIN_INTERVAL = 2.0
 
+# How many CDN fetches a bulk job runs at once, and it is a constant rather
+# than a setting on purpose. The parallelism goes **only** on the fetch: a
+# `fetch_to_file` is a plain GET to the CDN, which the API limiter never sees,
+# so three of them cost the API nothing. Resolving — `session.track()` then
+# `get_stream()` — stays serial and paced (see _PacedRun), so the peak API
+# request rate of a three-wide run is identical to a one-wide run's. "There is
+# no parallelism to tune and no way to ask for more" is the property that keeps
+# ai/INCIDENTS #1 from happening again, and it is still true where it matters.
+DOWNLOAD_WORKERS = 3
+# How often the resolver looks for a free worker slot while all of them are
+# busy. Not a new polling loop: it is inside a job that is already running and
+# already sleeping out its pacing floor, and it stops when the job does.
+WORKER_POLL_SECONDS = 0.05
+# The rate on screen is the mean of the last this-many byte samples, taken on
+# the monitor thread's existing 0.5 s tick — a 1.5 s window. No new thread and
+# no new timer: the tick already exists. See _sample_download_rates.
+RATE_SAMPLES = 3
+
 # What TIDAL saying "stop" looks like in an exception. On any of these the
 # rule (ai/WORKING-RULES.md) is to stop making requests entirely and report —
 # never to retry, which is what turned a rate limit into an edge block.
@@ -772,6 +825,181 @@ def fetch_to_file(sources: list, part: str, abandoned=None, progress=None) -> st
                         if progress is not None:
                             progress(done, total)
     return ext
+
+
+class _PacedRun:
+    """The engine behind every bulk job: **resolve serially and paced, fetch
+    N-wide.** One copy, because two copies is how one of them quietly stops
+    honouring the rate limit.
+
+    The split is not an optimisation, it is where the limiter is. Resolving a
+    track is API traffic — `session.track()` then `get_stream()` — and 53 of
+    those in 2.8 s got the owner's IP blocked and his music stopped
+    (ai/INCIDENTS #1). So resolving stays exactly as the serial re-fetch left
+    it: one at a time, on this thread, never closer together than
+    `REFETCH_MIN_INTERVAL` between *starts*, so a run of instant failures
+    cannot become a burst either. Fetching is a plain GET to a CDN that the
+    API limiter never sees, so up to `workers` of those run at once and the
+    **peak API request rate is identical to a one-wide run's**. The re-fetch
+    passes `workers=1` and is therefore the same code path it always was.
+
+    Four properties, all structural:
+
+    * **Bounded.** The resolver will not run ahead of the fetchers — it waits
+      for a free slot before resolving the next item, so a signed stream URL
+      is never left sitting for the hour it takes to expire, and a 500-track
+      run holds three streams rather than five hundred.
+    * **Interruptible.** `alive()` is checked before every item, while waiting
+      for a slot, inside the pacing sleep, and inside `fetch_to_file`'s chunk
+      loop through the caller's `abandoned`.
+    * **Stop, never retry, on evidence of a block.** A 429, a 401 subStatus
+      4006 or a bot-detection page from *either* half ends the whole run. The
+      check sits after the slot wait, so at one worker the previous item's
+      verdict is always in before the next one is resolved.
+    * **Lock-free.** Workers only ever append to `results` and write their own
+      slot; this thread is the only reader of the tally and the only writer of
+      anything shared. `records` is drained here rather than in the workers
+      for the same reason — a read-modify-write of the download index from
+      three threads at once would lose rows.
+    """
+
+    def __init__(self, items, resolve, fetch, alive, report,
+                 workers: int = 1, slots=()):
+        self.items = list(items)
+        self.resolve = resolve
+        self.fetch = fetch
+        self.alive = alive
+        self.report = report
+        self.workers = max(1, workers)
+        # One per worker, or None where the caller wants no per-slot display.
+        # A slot has exactly one writer at a time — the worker holding it —
+        # so its fields need no lock either.
+        self.slots = tuple(slots) if slots else (None,) * self.workers
+        # (ok, message, record) per finished item. Appended by workers, read
+        # only here; append is atomic under the GIL.
+        self.results: list = []
+        self._written = 0
+
+    # ── what the caller asks for ──
+
+    def run(self) -> tuple:
+        """`(done, failed, blocked)`. Returns early and reports nothing when
+        the run was cancelled — the canceller owns the state at that point."""
+        threads: dict = {}
+        blocked = ""
+        for item in self.items:
+            if not self.alive():
+                return None
+            index = self._free_slot(threads)
+            if index is None:
+                return None
+            blocked = self._blocked()
+            if blocked:
+                break
+            started = time.monotonic()
+            self._flush()
+            try:
+                handle = self.resolve(item)
+            except _DownloadSuperseded:
+                return None
+            except Exception as e:
+                message = str(e)
+                if _looks_rate_limited(message):
+                    blocked = message[:PLAYER_ERROR_CHARS]
+                    break
+                logger.debug("Could not resolve %s: %s", item, e)
+                self.results.append((False, message, None))
+                self._flush()
+                self._pace(started)
+                continue
+            thread = threading.Thread(
+                target=self._work, args=(item, handle, index), daemon=True)
+            threads = {**threads, index: thread}
+            thread.start()
+            self._pace(started)
+        for thread in threads.values():
+            thread.join()
+        if not self.alive():
+            return None
+        blocked = blocked or self._blocked()
+        self._flush()
+        done = sum(1 for ok, _m, _r in self.results[:] if ok)
+        return done, len(self.results) - done, blocked
+
+    # ── the machinery ──
+
+    def _work(self, item, handle, index) -> None:
+        slot = self.slots[index]
+        try:
+            record = self.fetch(item, handle, slot)
+            self.results.append((True, "", record))
+        except _DownloadSuperseded:
+            self.results.append((False, "cancelled", None))
+        except Exception as e:
+            logger.debug("Fetch of %s failed: %s", item, e)
+            self.results.append((False, str(e), None))
+        finally:
+            # A fetch that got as far as finishing has already said so on its
+            # own slot, and that row stays on screen as a tick until the slot
+            # is taken again. Only an unfinished one is cleared here.
+            if slot is not None and slot.get("state") == "running":
+                slot["state"] = "idle"
+            # The tally, but **not** the records: those are written by the one
+            # thread that runs `_flush`, because a read-modify-write of the
+            # download index from three threads at once loses rows
+            self._tally()
+
+    def _free_slot(self, threads):
+        """The index of a worker that is not busy, waiting for one if they all
+        are. None means the run was cancelled while waiting."""
+        while self.alive():
+            for index in range(self.workers):
+                thread = threads.get(index)
+                if thread is None or not thread.is_alive():
+                    return index
+            time.sleep(WORKER_POLL_SECONDS)
+        return None
+
+    def _pace(self, started: float) -> None:
+        """The floor between the *start* of one item and the next. Read from
+        the module at call time, so a test can shorten it."""
+        remaining = REFETCH_MIN_INTERVAL - (time.monotonic() - started)
+        while remaining > 0 and self.alive():
+            time.sleep(min(0.25, remaining))
+            remaining -= 0.25
+
+    def _blocked(self) -> str:
+        for ok, message, _record in self.results[:]:
+            if not ok and _looks_rate_limited(message):
+                return message[:PLAYER_ERROR_CHARS]
+        return ""
+
+    def _tally(self) -> None:
+        """Tell the caller the whole tally, never a delta — every counter is
+        recomputed from `results`, so two workers reporting at once cannot
+        lose an update the way a read-modify-write of a shared dict would."""
+        results = self.results[:]
+        done = sum(1 for ok, _m, _r in results if ok)
+        self.report(done=done, failed=len(results) - done)
+
+    def _flush(self) -> None:
+        """The tally, plus the side effects only the resolver thread may run.
+
+        A finished fetch hands back a `record` callable rather than writing
+        the download index itself: `downloads.record` is a read-modify-write
+        of one JSON file, and three of those at once lose rows. This thread
+        is the only one that ever calls them, and the only one that reads or
+        writes `_written`.
+        """
+        results = self.results[:]
+        for _ok, _message, record in results[self._written:]:
+            if record is not None:
+                try:
+                    record()
+                except Exception as e:  # an index row is advisory, never fatal
+                    logger.debug("Could not record a finished download: %s", e)
+        self._written = len(results)
+        self._tally()
 
 
 def _empty_search_pool() -> dict:
@@ -1783,6 +2011,13 @@ class HeadlessTidalPlayer:
         # than mutated, so the paint thread can never read it half-written.
         self._download_open = False
         self._download_track = None
+        # Everything the box is about. One entry is the ordinary single-track
+        # box, unchanged; more than one makes it a confirmation for a whole
+        # playlist, album, artist section or queue, and _download_label is
+        # what to call them. _download_track stays the first of them, so the
+        # single-track readouts need no branch.
+        self._download_tracks: list = []
+        self._download_label = ""
         self._download_cursor = 0
         self._download_job = None
         self._download_job_gen = 0
@@ -2923,6 +3158,8 @@ class HeadlessTidalPlayer:
             # A press that came in too soon after the last one left its
             # position waiting; this tick is what delivers it
             self._flush_seek()
+            # The download bars' rate number, on this tick and no other
+            self._sample_download_rates()
             # Save state periodically so a crash doesn't lose the position
             if time.time() - last_save > 10:
                 self._save_state()
@@ -4027,6 +4264,7 @@ class HeadlessTidalPlayer:
                 Hint("y", "add to playlist", "add", 6),
             ]
             hints.append(Hint("d", "download", "get", 7))
+            hints.append(Hint("D", "download all", "all", 9))
             if self._browse_playlist is not None:
                 hints.append(Hint("x", "remove", "del", 8))
             hints.append(Hint("v", "volume", "vol", 3))
@@ -4042,6 +4280,7 @@ class HeadlessTidalPlayer:
                 Hint("Tab", "section", None, 1),
                 Hint("a", "play all", "all", 5),
                 Hint("d", "download", "get", 6),
+                Hint("D", "download all", "all", 7),
                 Hint("v", "volume", "vol", 4),
                 Hint("\u2190/Esc", "back", None, 2),
             ]
@@ -4053,6 +4292,7 @@ class HeadlessTidalPlayer:
                 Hint("x", "remove", "del", 6),
                 Hint("y", "add to playlist", "add", 7),
                 Hint("d", "download", "get", 8),
+                Hint("D", "download all", "all", 9),
                 Hint("v", "volume", "vol", 3),
                 Hint("\u2190/Esc", "back", None, 1),
             ]
@@ -4192,6 +4432,14 @@ class HeadlessTidalPlayer:
         this login is not served is dimmed and labelled `unavailable`, one
         already on this disk is ticked, and a real byte count is printed
         without the `~` every estimate carries (`_download_facts`).
+
+        A whole playlist is **the same box** with a count on the size line
+        and, once it is running, up to three bars where the button was. The
+        bars are the first thing a short window gives up — three of them,
+        then two, then one, then the summary line alone, which is already the
+        count and the button. A box that overflowed would be answered by Rich
+        replacing its bottom row with a red ellipsis, and the bottom row is
+        the one that says how to stop.
         """
         # Two columns of border and one of padding on each side
         avail = max(fit.inner - 4, 10)
@@ -4199,14 +4447,17 @@ class HeadlessTidalPlayer:
         # The button goes through the same _fit_hints every footer does, so a
         # narrow window makes it terser rather than cutting it in half. A
         # clipped `[Es…` is a key nobody can read.
-        action = (self._download_status_row(job) if job.get("state")
+        action = (self._download_status_row(job, avail) if job.get("state")
                   else _hints_text(_fit_hints(DOWNLOAD_BUTTONS, avail, 1), 0))
         head, size, pick = self._download_box_rows()
         # What a pane too short for the whole box gives up, and in this
         # order: the title only repeats what you pressed [d] on, and the tier
         # is one arrow away. The number and the button are the box.
-        rows = [(2, head), (0, size), (1, pick), (0, action)]
-        for priority in (2, 1):
+        rows = [(2, head), (0, size), (1, pick)]
+        rows += [(3 + i, bar) for i, bar
+                 in enumerate(self._download_bar_rows(job, avail))]
+        rows.append((0, action))
+        for priority in (5, 4, 3, 2, 1):
             if len(rows) + 2 <= max(fit.rows, 3):
                 break
             rows = [row for row in rows if row[0] != priority]
@@ -4218,18 +4469,33 @@ class HeadlessTidalPlayer:
         """The three lines above the button: what, how big, at which tier."""
         track = self._download_track
         tier = self._download_tier()
-        sizes, owned = self._download_facts()
+        bulk = self._download_bulk()
+        # Deliberately not asked for in bulk: it is two index reads about the
+        # *first* track, and "✓ on disk" under a count of thirteen would be a
+        # claim about twelve songs nobody checked
+        sizes, owned = ({}, None) if bulk else self._download_facts()
 
-        head = Text(str(getattr(track, "name", None) or "Unknown track"),
-                    style="bold white")
-        artist = ", ".join(a.name for a in (getattr(track, "artists", None) or [])
-                           if getattr(a, "name", None))
-        if artist:
-            head.append(" — " + artist, style="dim")
+        if bulk:
+            head = Text(self._download_label or "These tracks",
+                        style="bold white")
+        else:
+            head = Text(str(getattr(track, "name", None) or "Unknown track"),
+                        style="bold white")
+            artist = ", ".join(a.name for a in (getattr(track, "artists", None) or [])
+                               if getattr(a, "name", None))
+            if artist:
+                head.append(" — " + artist, style="dim")
 
         # The line he asked to be able to read at a glance. White, alone, and
         # exact whenever the bytes are already known here for free.
-        size = Text(self._download_size(tier), style="bold white")
+        if bulk:
+            count = len(self._download_tracks)
+            size = Text(f"{count} tracks", style="bold white")
+            total = self._download_bulk_estimate(tier)
+            size.append("   ~" + downloads.format_bytes(total) if total > 0
+                        else "   —", style="bold white")
+        else:
+            size = Text(self._download_size(tier), style="bold white")
 
         pick = Text("↑↓  ", style="dim")
         gated = self._quality_unavailable(tier)
@@ -4240,21 +4506,83 @@ class HeadlessTidalPlayer:
             pick.append("  ✓ on disk", style="green")
         return [head, size, pick]
 
+    def _download_bar_rows(self, job: dict, avail: int) -> list:
+        """One line per fetch that is under way, in the style the owner picked.
+
+            ▸ Nightcall           ━━━━━━━━━━━╸┈┈┈┈┈┈┈┈┈┈  12.4 MB  5.2MB/s
+
+        Nothing here reads the disk or the index: every number is on the slot
+        the worker is writing, and the rate is the mean the monitor tick
+        already computed. A repaint is twice a second.
+        """
+        if not job.get("bulk") or job.get("state") != "running":
+            return []
+        namew, barw = self._download_bar_columns(avail)
+        rows = []
+        for slot in job.get("slots") or ():
+            state = slot.get("state")
+            if state not in ("running", "done"):
+                continue
+            title = str(slot.get("title") or "")[:namew].ljust(namew)
+            row = Text()
+            if state == "done":
+                # Collapsed: a tick, the name, and the size that is really on
+                # the disk — no `~`, because this one was counted
+                row.append("✓ ", style="bold green")
+                row.append(title, style="dim")
+                row.append(" ")
+                row.append(BAR_FULL * barw, style="green")
+                row.append(f"  {downloads.format_bytes(slot.get('size') or 0):>9}",
+                           style="green")
+                row.append(" " * 10)
+            else:
+                done = slot.get("done") or 0
+                total = slot.get("total") or slot.get("estimate") or 0
+                filled, rest = _bar_split(done / total if total else 0.0, barw)
+                row.append("▸ ", style="bold cyan")
+                row.append(title)
+                row.append(" ")
+                row.append(filled, style="cyan")
+                row.append(rest, style="dim")
+                row.append(f"  {downloads.format_bytes(done):>9}", style="white")
+                row.append(f"  {_format_rate(self._slot_rate(slot)):<8}",
+                           style="dim")
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _download_bar_columns(avail: int) -> tuple:
+        """`(name width, bar width)` for a box this wide.
+
+        Every bar row is padded to exactly `name + bar + 24`, so `_boxed` —
+        which centres each line inside the border — centres the block as a
+        block and the columns line up. A ragged ✓ row sitting a few columns
+        off the bars above it was the first thing that looked wrong.
+        """
+        namew = max(6, min(20, avail - 44))
+        return namew, max(6, avail - namew - 26)
+
     def _download_job_here(self) -> dict:
-        """The one job, if it happens to be for the track the box is showing.
+        """The one job, if it happens to be about what the box is showing.
         A job for anything else is finished business and says nothing about
         this track."""
         job = self._download_job or {}
+        if job.get("bulk"):
+            # Only one run exists at a time, so a bulk job belongs to any bulk
+            # box — and a single-track box must not report on it
+            return job if self._download_bulk() else {}
         if job.get("track_id") != getattr(self._download_track, "id", None):
             return {}
         return job
 
-    def _download_status_row(self, job: dict) -> Text:
+    def _download_status_row(self, job: dict, avail: int = 70) -> Text:
         """What the job is doing, in the button's place — it is the only thing
         on the box that changes. Running, done and failed read differently,
         in one line each."""
         row = Text()
         state = job.get("state")
+        if job.get("bulk"):
+            return self._download_bulk_status_row(job, avail)
         if state == "running":
             done, total = job.get("done") or 0, job.get("total") or 0
             row.append(downloads.format_bytes(done), style="yellow")
@@ -4282,6 +4610,60 @@ class HeadlessTidalPlayer:
             row.append(f"Failed — {job.get('error')}", style="red")
             row.append("   [Enter]", style="bold")
             row.append(" retry", style="dim")
+        return row
+
+    def _download_bulk_status_row(self, job: dict, avail: int) -> Text:
+        """The line under the bars: what has landed, what is left, how fast,
+        and how to stop.
+
+        It is also what the box degrades *to*. With every bar dropped this
+        line alone still answers "is it working and how much is left", which
+        is the whole question — so it is the one row that must never be
+        clipped, and it gives up its own pieces (the rate, then the byte
+        count) rather than let Rich take `[x] cancel` off the end.
+        """
+        slots = job.get("slots") or ()
+        state = job.get("state")
+        done, failed = job.get("done") or 0, job.get("failed") or 0
+        total = job.get("tracks") or 0
+        if state != "running":
+            row = Text()
+            if state == "blocked":
+                row.append(f"Stopped — {job.get('error')}", style="red")
+                row.append("   nothing retried", style="dim")
+            elif state == "cancelled":
+                row.append(f"Cancelled after {done}", style="yellow")
+            else:
+                row.append(f"Saved {done} ✓", style="green")
+            if failed:
+                row.append(f"  {failed} failed", style="red")
+            row.append("   [Esc]", style="bold")
+            row.append(" close", style="dim")
+            return row
+
+        fetched = sum((s.get("banked") or 0) + (s.get("done") or 0) for s in slots)
+        rate = _format_rate(sum(self._slot_rate(s) for s in slots))
+        pieces = [(downloads.format_bytes(fetched) + " fetched", "white"),
+                  (f"{max(total - done - failed, 0)} to go", "dim")]
+        if rate:
+            pieces.append((rate, "white"))
+        cancel = ("[x] cancel", "bold")
+        # Widest arrangement that fits, and the last one always does
+        for parts, gap in ((pieces + [cancel], "   ·   "),
+                           (pieces + [cancel], "  "),
+                           (pieces[:2] + [cancel], "  "),
+                           ([pieces[1], cancel], "  ")):
+            row = Text()
+            for index, (text, style) in enumerate(parts):
+                if index:
+                    row.append(gap, style="dim")
+                row.append(text, style=style)
+            if cell_len(row.plain) <= avail:
+                break
+        namew, barw = self._download_bar_columns(avail)
+        pad = namew + barw + 24 - cell_len(row.plain)
+        if 0 < pad:
+            row.append(" " * pad)
         return row
 
     def _compose(self, fit) -> tuple:
@@ -5428,33 +5810,76 @@ class HeadlessTidalPlayer:
 
     # ── Downloads ──
 
-    def _open_download(self):
+    def _download_target(self, whole: bool = False) -> tuple:
+        """`(the tracks [d] means here, what to call them)`. No network.
+
+        A row means the track on it. A **"Play All" row means the whole
+        list** — that was the bug: `_target_track_for_picker` fell through to
+        `self._current_track`, so pressing `d` on Play All opened a box about
+        an unrelated song. The artist page's Albums and Playlists tabs are
+        the same shape (no track under the cursor at all), and there the
+        section's own tracks are the sensible target.
+
+        `whole` is `[D]`, which asks for the list wherever the cursor is. It
+        exists because the queue has no Play All row to press `d` on and the
+        whole queue is the one thing a queue can obviously mean.
+        """
+        if self._mode == self.MODE_BROWSE and self._browse_tracks:
+            if whole or self._browse_cursor < 0:
+                return list(self._browse_tracks), self._browse_title or "This list"
+            return [self._browse_tracks[self._browse_cursor]], ""
+        if self._mode == self.MODE_QUEUE and self._queue:
+            if whole:
+                return list(self._queue), "Queue"
+            if self._queue_cursor < len(self._queue):
+                return [self._queue[self._queue_cursor]], ""
+        if self._mode == self.MODE_ARTIST:
+            rows = self._artist_rows()
+            row = (rows[self._artist_cursor]
+                   if rows and 0 <= self._artist_cursor < len(rows) else None)
+            if row is not None and row["type"] == "track" and not whole:
+                return [row["obj"]], ""
+            section = self._artist_section_tracks()
+            if section:
+                name = getattr(self._artist, "name", "") or "Artist"
+                label = self.ARTIST_SECTION_LABELS[self._artist_section]
+                return list(section), f"{name} · {label}"
+        track = self._current_track
+        return ([track] if track is not None else []), ""
+
+    def _open_download(self, whole: bool = False):
         """Open the download box over whatever [d] was pressed on.
 
-        The same target rule the add-to-playlist picker uses, so [d] and [y]
-        never disagree about which track the screen you are looking at means.
-        Nothing is pushed onto the nav history and no mode changes: the box
-        is drawn over the screen you were on and Esc takes it away again, so
-        there is nowhere to be lost. The cursor is pre-placed on the tier
-        settings is set to, which is what makes the common case `d` then
+        The same target rule the add-to-playlist picker uses wherever there is
+        one track to mean, so [d] and [y] never disagree about which track the
+        screen you are looking at means — and `_download_target` where there
+        is not. Nothing is pushed onto the nav history and no mode changes:
+        the box is drawn over the screen you were on and Esc takes it away
+        again, so there is nowhere to be lost. The cursor is pre-placed on the
+        tier settings is set to, which is what makes the common case `d` then
         `Enter` — or `d` then `d` — and no reading.
         """
-        track = self._target_track_for_picker()
-        if track is None:
+        tracks, label = self._download_target(whole)
+        if not tracks:
             self._set_toast("No track selected")
             return
+        track = tracks[0]
         self._download_open = True
         self._download_known = None
+        self._download_tracks = tracks
+        self._download_label = label if len(tracks) > 1 else ""
         self._download_track = track
         try:
             self._download_cursor = QUALITY_CHOICES.index(self._quality_name)
         except ValueError:
             self._download_cursor = 0
         # A job for a different track is finished business; one for this track
-        # is what the screen should still be reporting on
+        # is what the screen should still be reporting on. A *running* one is
+        # never dropped — a bulk run keeps its bars while you look at
+        # something else.
         job = self._download_job
         running = bool(job) and job.get("state") == "running"
-        if job and job.get("track_id") != getattr(track, "id", None):
+        if job and not running and job.get("track_id") != getattr(track, "id", None):
             self._download_job = None
         if not running:
             # A download the app was killed in the middle of left a scratch
@@ -5490,6 +5915,18 @@ class HeadlessTidalPlayer:
         """
         return downloads.estimate_bytes(
             getattr(self._download_track, "duration", 0), tier)
+
+    def _download_bulk(self) -> bool:
+        """Whether the box is about a list rather than a song."""
+        return len(self._download_tracks) > 1
+
+    def _download_bulk_estimate(self, tier: str) -> int:
+        """What a whole playlist is likely to cost at `tier`. **No network,
+        and it must stay that way.** Every duration is already on the tracks,
+        so this is arithmetic; a real per-track size is one `playbackinfo`
+        each, and 53 of those in 2.8 s is ai/INCIDENTS #1 exactly."""
+        return sum(downloads.estimate_bytes(getattr(t, "duration", 0), tier)
+                   for t in self._download_tracks)
 
     def _download_facts(self) -> tuple:
         """`(tier → exact bytes already on this disk, the downloaded file)`.
@@ -5563,6 +6000,10 @@ class HeadlessTidalPlayer:
             return
         job = self._download_job
         if job and job.get("state") == "running":
+            # Single-flight, but not silent: from a single-track box a bulk
+            # run in the background is invisible, so a key that refuses has
+            # to say why rather than look dead
+            self._set_toast("A download is already running — [x] stops it")
             return
         self._download_job_gen = gen = self._download_job_gen + 1
         track_id = getattr(track, "id", None)
@@ -5614,6 +6055,147 @@ class HeadlessTidalPlayer:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    @staticmethod
+    def _new_download_slots() -> tuple:
+        """One display slot per fetch worker.
+
+        A slot has exactly one writer at a time — the worker holding it — and
+        the monitor thread only ever touches `samples`/`mark`, which no worker
+        reads. So the bars need no lock, and they are deliberately *not* kept
+        inside the job dict's own fields: two workers merging changes into one
+        dict could lose an update, and losing a bar is visible.
+        """
+        return tuple({"title": "", "done": 0, "total": 0, "estimate": 0,
+                      "state": "idle", "size": 0, "banked": 0,
+                      "samples": (), "mark": None}
+                     for _ in range(DOWNLOAD_WORKERS))
+
+    def _start_bulk_download_job(self, tier: str):
+        """Download every track the box is about, at `tier`.
+
+        Resolving is serial and paced and fetching is three-wide — see
+        `_PacedRun`, which is the same engine the re-fetch runs at one worker.
+        The peak API request rate is therefore exactly a serial run's; what
+        got three times faster is the part TIDAL's limiter never sees.
+
+        One run at a time, by the same single-flight rule everything else
+        here uses, so a held-down Enter cannot fan out.
+        """
+        tracks = list(self._download_tracks)
+        if not tracks:
+            return
+        job = self._download_job
+        if job and job.get("state") == "running":
+            return
+        self._download_job_gen = gen = self._download_job_gen + 1
+        slots = self._new_download_slots()
+        self._download_job = {
+            "state": "running", "bulk": True, "tier": tier, "track_id": None,
+            "tracks": len(tracks), "done": 0, "failed": 0, "slots": slots,
+            "error": "",
+        }
+
+        def _alive():
+            return self._download_job_gen == gen
+
+        def _update(**changes):
+            current = dict(self._download_job or {})
+            current.update(changes)
+            self._download_job = current
+            self._wake()
+
+        def _fetch(track, plan, slot):
+            slot.update(title=plan["title"] or str(plan["track_id"]),
+                        done=0, total=0, size=0, samples=(), mark=None,
+                        estimate=downloads.estimate_bytes(
+                            getattr(track, "duration", 0), tier),
+                        state="running")
+            last = [0.0]
+
+            def _progress(done, total):
+                slot["done"] = done
+                slot["total"] = total or slot["estimate"]
+                # Cheap per chunk; a repaint per chunk is not
+                now = time.monotonic()
+                if now - last[0] >= 0.25:
+                    last[0] = now
+                    self._wake()
+
+            _final, _written, size, _landed = self._download_deliver(
+                plan, abandoned=lambda: not _alive(), progress=_progress,
+                record=False)
+            # `banked` is this slot's share of the run's total, and `done`
+            # goes back to zero so the two never count the same bytes twice
+            slot.update(done=0, total=0, size=size,
+                        banked=slot["banked"] + size, state="done")
+            return plan.get("record")
+
+        def _run():
+            outcome = _PacedRun(
+                items=tracks,
+                resolve=lambda track: self._download_plan(track, tier),
+                fetch=_fetch,
+                alive=_alive,
+                report=_update,
+                workers=DOWNLOAD_WORKERS,
+                slots=slots,
+            ).run()
+            if outcome is None:
+                self._wake()
+                return
+            done, failed, blocked = outcome
+            if blocked:
+                _update(state="blocked", error=blocked)
+                self._set_toast(
+                    "TIDAL is rate-limiting — download stopped. "
+                    "Nothing will be retried.",
+                    seconds=PLAYER_ERROR_SECONDS)
+            else:
+                _update(state="done")
+                self._set_toast(
+                    f"Downloaded {done} song{'' if done == 1 else 's'}"
+                    f" to {downloads.display_dir()}"
+                    + (f" · {failed} failed" if failed else ""))
+            self._wake()
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _sample_download_rates(self) -> None:
+        """Move every active download's byte counter into its rate window.
+
+        Called from `_monitor_playback`, on the 0.5 s tick that already
+        exists — no new thread and no new timer, which is a hard rule here
+        and the reason the window is 1.5 s rather than some number chosen for
+        smoothness. Three samples is long enough that the digit stops
+        twitching and short enough that a real stall shows within a second.
+        The whole of the arithmetic is a three-element tuple and a mean.
+
+        Zero until the first sample has landed, which `_format_rate` prints
+        as nothing at all: measuring, rather than stalled.
+        """
+        job = self._download_job
+        if not job or job.get("state") != "running":
+            return
+        now = time.monotonic()
+        for slot in job.get("slots") or ():
+            if slot.get("state") != "running":
+                slot["mark"] = None
+                continue
+            done = slot.get("done") or 0
+            mark = slot.get("mark")
+            if mark is None or now <= mark[0]:
+                slot["mark"] = (now, done)
+                continue
+            then, before = mark
+            slot["samples"] = (slot["samples"]
+                               + ((done - before) / (now - then),))[-RATE_SAMPLES:]
+            slot["mark"] = (now, done)
+
+    @staticmethod
+    def _slot_rate(slot: dict) -> float:
+        samples = slot.get("samples") or ()
+        return sum(samples) / len(samples) if samples else 0.0
+
     def _download_to_music(self, track, tier: str, abandoned, progress=None):
         """Put one track in the music folder at `tier`. Returns
         `(path, tags written, bytes, the tier it actually landed at)`; raises
@@ -5629,44 +6211,99 @@ class HeadlessTidalPlayer:
         everything at the current quality" — and having written it twice is
         how one of them would quietly stop working. Cleaning up after a
         failure is in here too, for the same reason.
+
+        Split in two behind this signature, and the seam is where the rate
+        limiter is: `_download_plan` is the API half and `_download_deliver`
+        is the CDN half. A bulk run drives the two halves separately so that
+        three tracks can be *fetched* at once while still being *resolved*
+        one at a time; everything else calls this and gets the old behaviour.
+        """
+        try:
+            plan = self._download_plan(track, tier)
+        except Exception:
+            self._discard_staging(getattr(track, "id", None))
+            raise
+        return self._download_deliver(plan, abandoned, progress)
+
+    def _download_plan(self, track, tier: str) -> dict:
+        """Everything a download needs from TIDAL, and **nothing else**.
+
+        This is the whole API cost of one download — `session.track()` if the
+        row was a cached one, then one `get_stream()` — which is why a bulk
+        run does exactly this much serially and paced, and parallelises only
+        what comes after it. Anything that is a plain CDN GET, or disk, is
+        deliberately on the other side of the seam.
         """
         track_id = getattr(track, "id", None)
+        real = self._resolve_track(track)
+        if real is None:
+            raise RuntimeError("track could not be resolved")
+        # The extension is not known until the CDN answers, so the file is
+        # written under a provisional name and moved once the container has
+        # identified itself. Named for the track, so three at once cannot
+        # collide.
+        staging = (downloads.download_dir()
+                   / f".ticli-{track_id}{downloads.PART_SUFFIX}")
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        ext, granted = self._promote_cached_copy(track_id, tier, staging)
+        sources = None
+        if ext is None:
+            # Steps down a tier at a time rather than failing outright, so a
+            # track this login cannot have at HIRES still lands as LOSSLESS
+            # instead of not landing at all
+            url, granted, tier = self._stream_at_best_tier(real, tier)
+            sources = stream_sources(url)
+        return {"track_id": track_id, "real": real, "staging": staging,
+                "meta": downloads.track_metadata(real), "tier": tier,
+                "ext": ext, "granted": granted, "sources": sources,
+                "title": getattr(real, "name", None) or ""}
+
+    def _download_deliver(self, plan: dict, abandoned, progress=None,
+                          record=True):
+        """The bytes, the name, the tags and the index row. No API request at
+        all, which is what makes it safe to run three of these at once.
+
+        `record=False` hands the index write back to the caller as
+        `plan["record"]`, because `downloads.record` is a read-modify-write of
+        one JSON file and three of those at once lose rows. The bulk runner
+        takes that callable and runs it on its own single thread.
+        """
+        track_id = plan["track_id"]
         final = None
         try:
-            real = self._resolve_track(track)
-            if real is None:
-                raise RuntimeError("track could not be resolved")
-            meta = downloads.track_metadata(real)
-            # The extension is not known until the CDN answers, so the file is
-            # written under a provisional name and moved once the container
-            # has identified itself
-            staging = (downloads.download_dir()
-                       / f".ticli-{track_id}{downloads.PART_SUFFIX}")
-            staging.parent.mkdir(parents=True, exist_ok=True)
-            ext, granted = self._promote_cached_copy(track_id, tier, staging)
+            # A promoted cached copy never reaches `fetch_to_file`, so this is
+            # the only place a cancel between resolving and delivering can be
+            # noticed. Without it, cancelling a bulk run could still land one
+            # more file after the key was pressed.
+            if abandoned is not None and abandoned():
+                raise _DownloadSuperseded()
+            ext = plan["ext"]
             if ext is None:
-                # Steps down a tier at a time rather than failing outright, so
-                # a track this login cannot have at HIRES still lands as
-                # LOSSLESS instead of not landing at all
-                url, granted, tier = self._stream_at_best_tier(real, tier)
-                ext = fetch_to_file(stream_sources(url), str(staging),
+                ext = fetch_to_file(plan["sources"], str(plan["staging"]),
                                     abandoned=abandoned, progress=progress)
-            final = downloads.destination(meta, ext)
+            final = downloads.destination(plan["meta"], ext)
             final.parent.mkdir(parents=True, exist_ok=True)
             # A re-fetch at another tier can land under another extension, and
             # the old file is then a second copy of the same song in the same
             # folder. By exact name, and only ones ticli wrote.
             previous = downloads.path_for(track_id)
-            os.replace(staging, final)
+            os.replace(plan["staging"], final)
             if previous is not None and previous != final:
                 try:
                     previous.unlink()
                 except OSError:
                     pass
-            written = tags.write_tags(final, meta, self._cover_bytes(real))
+            written = tags.write_tags(final, plan["meta"],
+                                      self._cover_bytes(plan["real"]))
             size = final.stat().st_size
-            downloads.record(track_id, final.relative_to(downloads.download_dir()),
-                             tier, size, granted=granted)
+            relative = final.relative_to(downloads.download_dir())
+            tier, granted = plan["tier"], plan["granted"]
+            if record:
+                downloads.record(track_id, relative, tier, size,
+                                 granted=granted)
+            else:
+                plan["record"] = lambda: downloads.record(
+                    track_id, relative, tier, size, granted=granted)
             # The folder changed, and so did the one exact size the box could
             # show for this track
             self._downloads_usage = None
@@ -5800,6 +6437,11 @@ class HeadlessTidalPlayer:
         `~/Music/Ticli` through the same `_download_to_music` the download
         screen uses (tagged, and the old file removed if the container
         changed), and the cached songs go back into the cache directory.
+
+        The engine is `_PacedRun` at **one** worker, which is the serial,
+        paced loop this used to spell out inline — shared now with the bulk
+        download rather than copied, because two copies of the pacing is how
+        one of them quietly stops honouring it.
         """
         job = self._refetch_job
         if job and job.get("state") == "running":
@@ -5813,7 +6455,7 @@ class HeadlessTidalPlayer:
         self._refetch_gen = gen = self._refetch_gen + 1
         self._refetch_job = {
             "state": "running", "tier": tier, "done": 0, "total": total,
-            "failed": 0, "error": "", "current": "",
+            "failed": 0, "error": "",
         }
 
         def _update(**changes):
@@ -5823,53 +6465,36 @@ class HeadlessTidalPlayer:
             self._wake()
 
         def _run():
-            done = failed = 0
-            blocked = ""
-            try:
-                for kind, key in ([("download", k) for k in plan["downloads"]]
-                                  + [("cache", k) for k in plan["cache"]]):
-                    if self._refetch_gen != gen:
-                        return
-                    started = time.monotonic()
-                    _update(current=str(key))
-                    try:
-                        self._refetch_one(kind, key, tier, gen)
-                        done += 1
-                    except _DownloadSuperseded:
-                        return
-                    except Exception as e:
-                        message = str(e)
-                        if _looks_rate_limited(message):
-                            # Stop entirely and report. Never retry — that is
-                            # what turned a rate limit into an edge block.
-                            blocked = message[:PLAYER_ERROR_CHARS]
-                            break
-                        logger.debug("Re-fetch of %s failed: %s", key, e)
-                        failed += 1
-                    _update(done=done, failed=failed)
-                    # The floor is on the *start* of each track, so a run of
-                    # instant failures cannot turn into a burst
-                    remaining = REFETCH_MIN_INTERVAL - (time.monotonic() - started)
-                    while remaining > 0 and self._refetch_gen == gen:
-                        time.sleep(min(0.25, remaining))
-                        remaining -= 0.25
-            finally:
-                if self._refetch_gen == gen:
-                    if blocked:
-                        _update(state="blocked", error=blocked,
-                                done=done, failed=failed, current="")
-                        self._set_toast(
-                            "TIDAL is rate-limiting — re-fetch stopped. "
-                            "Nothing will be retried.",
-                            seconds=PLAYER_ERROR_SECONDS)
-                    else:
-                        _update(state="done", done=done, failed=failed,
-                                current="")
-                        self._set_toast(
-                            f"Re-fetched {done} song{'' if done == 1 else 's'}"
-                            f" at {tier}"
-                            + (f" · {failed} failed" if failed else ""))
+            outcome = _PacedRun(
+                items=([("download", k) for k in plan["downloads"]]
+                       + [("cache", k) for k in plan["cache"]]),
+                # A re-fetch resolves inside _refetch_one, which is also where
+                # the cache half writes its own file — so at one worker the
+                # whole of it is still one track at a time, paced
+                resolve=lambda item: item,
+                fetch=lambda item, _h, _s: self._refetch_one(
+                    item[0], item[1], tier, gen),
+                alive=lambda: self._refetch_gen == gen,
+                report=_update,
+                workers=1,
+            ).run()
+            if outcome is None:
                 self._wake()
+                return
+            done, failed, blocked = outcome
+            if blocked:
+                _update(state="blocked", error=blocked)
+                self._set_toast(
+                    "TIDAL is rate-limiting — re-fetch stopped. "
+                    "Nothing will be retried.",
+                    seconds=PLAYER_ERROR_SECONDS)
+            else:
+                _update(state="done")
+                self._set_toast(
+                    f"Re-fetched {done} song{'' if done == 1 else 's'}"
+                    f" at {tier}"
+                    + (f" · {failed} failed" if failed else ""))
+            self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -6707,6 +7332,8 @@ class HeadlessTidalPlayer:
             self._open_playlist_picker()
         elif key == "d":
             self._open_download()
+        elif key == "D":
+            self._open_download(whole=True)
         elif key == "x":
             self._remove_from_browse_playlist()
 
@@ -6744,6 +7371,8 @@ class HeadlessTidalPlayer:
             self._open_playlist_picker()
         elif key == "d":
             self._open_download()
+        elif key == "D":
+            self._open_download(whole=True)
 
     def _handle_queue_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:
@@ -6769,6 +7398,8 @@ class HeadlessTidalPlayer:
             self._open_playlist_picker()
         elif key == "d":
             self._open_download()
+        elif key == "D":
+            self._open_download(whole=True)
 
     def _handle_playlists_key(self, key: str):
         if key == KEY_ESC or key == KEY_LEFT:
@@ -6848,8 +7479,13 @@ class HeadlessTidalPlayer:
             self._download_cursor = min(len(QUALITY_CHOICES) - 1,
                                         self._download_cursor + 1)
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT, "d", "D"):
-            self._start_download_job(self._download_tier())
-            self._download_open = False
+            if self._download_bulk():
+                # The box stays up: it is where the bars are, and a run with
+                # no visible progress is the janky version of this
+                self._start_bulk_download_job(self._download_tier())
+            else:
+                self._start_download_job(self._download_tier())
+                self._download_open = False
 
     def _handle_settings_key(self, key: str):
         # Typing a number into a row: digits extend it, Backspace shortens it,
