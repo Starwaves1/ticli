@@ -22,10 +22,12 @@ too (see utils/tags.py); the path is what survives when they cannot be.
 `duration x nominal bitrate` gives every tier at once with no request at all.
 The alternative — one `playbackinfo` per track for a real `Content-Length` —
 is exactly the pattern that got the owner's IP blocked (see ai/INCIDENTS #1),
-and it takes the user's playback down with it. Everything shown is prefixed
-`~` and the accuracy of each tier is stated where it is shown, because the
-four tiers are not equally knowable: AAC is near-constant-bitrate and lands
-within a couple of percent, FLAC is variable and does not.
+and it takes the user's playback down with it. Everything estimated is
+prefixed `~`; a size shown without one is a byte count already on this disk,
+from the index below or from the cache tracker, and never a guess. The four
+tiers are not equally knowable — AAC is near-constant-bitrate and lands
+within a couple of percent, FLAC is variable and does not — which is what
+the `~` is there to admit.
 
 **Manual deletion is expected, not an error.** The index below is advisory —
 every read stats the file, so a track the user dragged to the trash is simply
@@ -78,15 +80,6 @@ NOMINAL_BITRATE = {
     "HIGH": 320_000,
     "LOSSLESS": 850_000,
     "HIRES": 2_500_000,
-}
-
-# One line per tier, shown under the picker for whichever tier is hovered.
-# Says what the `~` is worth, in the tier's own terms.
-ESTIMATE_ACCURACY = {
-    "LOW": "AAC is near-constant bitrate — measured within 3%, and always a little low.",
-    "HIGH": "AAC is near-constant bitrate — measured within 2%, and always a little low.",
-    "LOSSLESS": "FLAC is variable — usually within 20%, and up to a third high on quiet records.",
-    "HIRES": "The master's resolution isn't known until it's fetched — this is a rough guide only.",
 }
 
 # Only ever unlinked by name, and only ever ones this module wrote. A finished

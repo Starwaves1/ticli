@@ -467,7 +467,6 @@ class TestTheVolumeOverlay:
         HeadlessTidalPlayer.MODE_QUEUE,
         HeadlessTidalPlayer.MODE_PLAYLISTS,
         HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
-        HeadlessTidalPlayer.MODE_DOWNLOAD,
         HeadlessTidalPlayer.MODE_SETTINGS,
     )
 
@@ -675,10 +674,10 @@ class TestTheVolumeOverlayAgainstTypingScreens:
             assert p._can_open_volume() is wanted or mode != p.MODE_ADD_TO_PLAYLIST
 
 
-class TestTheVolumeOverlayAndTheDownloadScreen:
-    """`d` opens a screen and `v` opens an overlay over whatever screen is
-    open. They are different keys doing different things and neither may eat
-    the other — including while a download is actually running."""
+class TestTheVolumeOverlayAndTheDownloadBox:
+    """`d` opens a box and `v` opens an overlay. They are different keys
+    doing different things and neither may eat the other — but only one of
+    them may be on screen at a time, because both want the arrows."""
 
     def _player(self, mode=None):
         p = HeadlessTidalPlayer()
@@ -689,52 +688,72 @@ class TestTheVolumeOverlayAndTheDownloadScreen:
             p._mode = mode
         return p
 
-    def test_d_opens_the_download_screen_and_v_does_not(self):
+    def test_d_opens_the_download_box_and_v_does_not(self):
         p = self._player()
         p._handle_key("d")
-        assert p._mode == p.MODE_DOWNLOAD
+        assert p._download_open is True
         assert p._volume_open is False
+        # and it is an overlay, not a place: the screen underneath is where
+        # it was, and nothing was pushed onto the history to get back from
+        assert p._mode == p.MODE_PLAYER
+        assert p._nav_history == []
 
-    def test_v_opens_over_the_download_screen_without_leaving_it(self):
-        p = self._player(HeadlessTidalPlayer.MODE_DOWNLOAD)
+    def test_v_does_not_open_underneath_the_download_box(self):
+        """The box is modal. Two overlays wanting the same arrows at once is
+        the one thing the volume overlay's own rule already forbids."""
+        p = self._player()
+        p._handle_key("d")
         p._handle_key("v")
-        assert p._volume_open is True
-        assert p._mode == p.MODE_DOWNLOAD
+        assert p._volume_open is False
+        assert p._download_open is True
+        assert p._can_open_volume() is False
 
-    def test_a_running_job_keeps_its_progress_while_the_overlay_is_up(self):
-        """The overlay takes the footer's rows, not the screen's: a job's own
-        progress line lives in the body and must still be there — you turned
-        the volume down, you did not cancel anything."""
-        p = self._player(HeadlessTidalPlayer.MODE_DOWNLOAD)
-        p._download_job = {"state": "running", "tier": "LOSSLESS",
+    def test_the_box_passes_no_key_through_to_the_screen_underneath(self):
+        """A key aimed at a box in the way must not act on what it covers.
+        `x` cancels a download here; underneath, in the queue, it removes a
+        track — and a removal you did not ask for is unrecoverable."""
+        p = self._player(HeadlessTidalPlayer.MODE_QUEUE)
+        p._queue = [_fake_track(1), _fake_track(2)]
+        p._queue_cursor = 0
+        p._handle_key("d")
+        p._handle_key("q")
+        p._handle_key("s")
+        assert p._mode == p.MODE_QUEUE and p._download_open is True
+        p._handle_key("x")
+        assert len(p._queue) == 2, "x reached the queue underneath"
+        p._handle_key(player_mod.KEY_ESC)
+        assert p._download_open is False
+
+    def test_a_running_job_keeps_its_progress_on_the_box(self):
+        p = self._player()
+        p._handle_key("d")
+        p._download_job = {"state": "running", "tier": "LOSSLESS", "track_id": 1,
                            "done": 1024, "total": 4096}
-        p._handle_key("v")
-        text = p._build_download_display().plain
-        assert "Downloading LOSSLESS" in text
+        text = "".join(row.plain for row in
+                       p._build_download_overlay(player_mod.ROOMY_FIT))
         assert "25%" in text
+        assert "[x] cancel" in text
         assert p._download_job["state"] == "running"
 
-    def test_the_overlay_does_not_pass_x_through_to_cancel_the_job(self):
-        """`x` cancels a download. While the overlay is up it must reach
-        nothing at all — an overlay that swallowed a key and acted on it
-        underneath would cancel a download from a volume bar."""
-        p = self._player(HeadlessTidalPlayer.MODE_DOWNLOAD)
-        cancelled = []
-        p._cancel_download = lambda: cancelled.append(1)
-        p._handle_key("v")
-        p._handle_key("x")
-        assert cancelled == []
-        p._handle_key(player_mod.KEY_ESC)
-        p._handle_key("x")
-        assert cancelled == [1], "and it works again once the overlay is shut"
+    def test_x_cancels_only_a_job_for_the_track_on_the_box(self):
+        """The one job may be for something else entirely — the box is not
+        allowed to report, or cancel, a download it is not about."""
+        p = self._player()
+        p._handle_key("d")
+        p._download_job = {"state": "running", "tier": "LOW", "track_id": 99,
+                           "done": 0, "total": 0}
+        text = "".join(row.plain for row in
+                       p._build_download_overlay(player_mod.ROOMY_FIT))
+        assert "[x] cancel" not in text, text
+        assert "[Enter] download" in text
 
-    def test_the_footer_offers_cancel_only_while_there_is_a_job(self):
-        p = self._player(HeadlessTidalPlayer.MODE_DOWNLOAD)
-        assert "x" not in [h.key for h in p._mode_hints()]
-        p._download_job = {"state": "running", "tier": "LOW", "done": 0, "total": 0}
-        assert "x" in [h.key for h in p._mode_hints()]
-        p._download_job = {"state": "done", "path": "/tmp/x.m4a", "tags": None}
-        assert "x" not in [h.key for h in p._mode_hints()]
+    def test_the_box_carries_its_own_keys_instead_of_a_footer(self):
+        p = self._player()
+        p._handle_key("d")
+        assert p._mode_hints() == []
+        text = "".join(row.plain for row in
+                       p._build_download_overlay(player_mod.ROOMY_FIT))
+        assert "[Enter] download" in text and "[Esc] cancel" in text
 
     def test_d_is_not_a_key_in_search(self):
         """Search types every printable key, `d` included — same rule as `v`."""

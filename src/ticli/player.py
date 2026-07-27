@@ -103,6 +103,12 @@ Hint.__new__.__defaults__ = (None, 0)
 
 HINT_FULL, HINT_SHORT, HINT_KEYS = 0, 1, 2
 
+# The download box's own footer. Hints rather than a string, so it goes
+# through the same _fit_hints as every other footer in the app and gets
+# terser in a narrow window instead of being cut off mid-key.
+DOWNLOAD_BUTTONS = (Hint("Enter", "download", "get", 0),
+                    Hint("Esc", "cancel", None, 1))
+
 
 def _clip_lines(text: "Text", width: int) -> list:
     """`text` as a list of lines, each cut to `width` with an ellipsis."""
@@ -142,6 +148,30 @@ def _side_by_side(left: list, right: list) -> "Text":
             line.append_text(right[j])
         out.append(line)
     return Text("\n").join(out)
+
+
+def _boxed(rows: list, width: int, margin: int, style: str) -> list:
+    """`rows` inside a rounded border, each line centred within `width` and
+    the whole box pushed right by `margin`.
+
+    A list of lines, like everything else that goes into the pane, so
+    _build_display can still count the height of what it is drawing.
+    """
+    rule = "─" * (width + 2)
+    out = [Text(" " * margin + "╭" + rule + "╮", style=style)]
+    for row in rows:
+        row = row.copy()
+        row.truncate(width, overflow="ellipsis")
+        pad = max(width - cell_len(row.plain), 0)
+        line = Text(" " * margin)
+        line.append("│", style=style)
+        line.append(" " * (pad // 2 + 1))
+        line.append_text(row)
+        line.append(" " * (pad - pad // 2 + 1))
+        line.append("│", style=style)
+        out.append(line)
+    out.append(Text(" " * margin + "╰" + rule + "╯", style=style))
+    return out
 
 
 def _hint_piece(hint: Hint, level: int) -> str:
@@ -315,7 +345,6 @@ HIDE_HINT_RANK = 9
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
     QUALITY_CHOICES,
-    QUALITY_MEANINGS,
     SETTINGS_ROWS,
     coerce,
     cycle_value,
@@ -1553,7 +1582,6 @@ class HeadlessTidalPlayer:
     MODE_ADD_TO_PLAYLIST = "add_to_playlist"
     MODE_SETTINGS = "settings"
     MODE_ARTIST = "artist"
-    MODE_DOWNLOAD = "download"
 
     # The artist page's tabs, in the order Tab walks them. Each one is a
     # different TIDAL endpoint and each is fetched the first time you land on
@@ -1739,15 +1767,24 @@ class HeadlessTidalPlayer:
         # The playlist a track was last added to, pinned to the top of the
         # picker and persisted in the state file (see _remember_last_playlist).
         self._last_playlist_id: Optional[str] = None
-        # Download screen state. _download_track is what [d] was pressed on,
-        # _download_cursor the tier under the cursor (pre-placed on the one
-        # settings is set to), and _download_job the one job at a time — a
-        # whole dict, replaced rather than mutated, so the paint thread can
-        # never read it half-written.
+        # Download overlay state. _download_open is the box being up — it is a
+        # flag rather than a mode because the box is drawn *over* whatever
+        # screen [d] was pressed on, the same shape as _volume_open.
+        # _download_track is what it was pressed on, _download_cursor the tier
+        # under the cursor (pre-placed on the one settings is set to), and
+        # _download_job the one job at a time — a whole dict, replaced rather
+        # than mutated, so the paint thread can never read it half-written.
+        self._download_open = False
         self._download_track = None
         self._download_cursor = 0
         self._download_job = None
         self._download_job_gen = 0
+        # `(track id, tier → exact bytes already on this disk, downloaded
+        # path)`, read once per opening of the box. Two index reads answer it
+        # for all four tiers at once, and the box must not pay them again on
+        # every repaint — see _download_usage and ai/reference F6 for the
+        # same bargain and the milliseconds that made it necessary.
+        self._download_known: Optional[tuple] = None
         # Settings page state. _settings_edit is the digits typed into a number
         # row so far, or None when the arrows are just navigating; it is only
         # ever replaced wholesale, never appended to in place
@@ -3743,119 +3780,6 @@ class HeadlessTidalPlayer:
         content.append_text(self._build_pkce_line())
         return content
 
-    def _build_download_display(self) -> Text:
-        """The download screen: one track, one column of tiers.
-
-        A single column because that is what a cursor reads down. The tier
-        under the cursor says `download now` — the action belongs to the row
-        you are on, not to a separate button somewhere else — and *every* row
-        shows its size, because all four estimates are arithmetic on a
-        duration we already have and cost nothing to show. They are prefixed
-        `~` and the line under the picker says how good the `~` is for the
-        tier you are on, which is not the same answer for AAC and for FLAC.
-        """
-        content = Text()
-        track = self._download_track
-        content.append("   Download", style="bold magenta")
-        if track is None:
-            content.append("\n\n   No track selected", style="dim")
-            return content
-
-        artist = ", ".join(a.name for a in (getattr(track, "artists", None) or [])
-                           if getattr(a, "name", None))
-        album = getattr(track, "album", None)
-        content.append(f"\n\n   {getattr(track, 'name', '?')}", style="bold white")
-        if artist:
-            content.append(f" — {artist}", style="white")
-        if album is not None and getattr(album, "name", None):
-            content.append(f"\n   {album.name}", style="dim")
-        content.append(f"   {format_time(getattr(track, 'duration', 0))}", style="dim")
-
-        existing = downloads.path_for(getattr(track, "id", None))
-        if existing is not None:
-            content.append(f"\n\n   Already downloaded · {existing}", style="green")
-
-        content.append("\n")
-        # Three things want the same line: the tier, the action on the hovered
-        # row, and the size. What gives way, in order, is the *action* and then
-        # the size — the action because [Enter] download is in the footer and
-        # the cursor already says which row it applies to, and the size last
-        # because it is the only thing here you cannot get anywhere else. What
-        # never happens is a clipped estimate: `~24…` reads as a number, and a
-        # wrong number is worse than no number.
-        room = max(self._fit.inner - INDENT - 1, 8)
-        widest = max(len(t) for t in QUALITY_CHOICES)
-        sizes = {t: "~" + downloads.format_bytes(self._download_estimate(t))
-                 for t in QUALITY_CHOICES}
-        size_col = max(len(s) for s in sizes.values())
-        action = "download now"
-        if widest + 2 + len(action) + 2 + size_col > room:
-            action = "" if widest + 2 + size_col <= room else None
-        show_size = widest + 2 + size_col <= room or action == "download now"
-        for index, tier in enumerate(QUALITY_CHOICES):
-            selected = index == self._download_cursor
-            gated = self._quality_unavailable(tier)
-            content.append("\n")
-            content.append("  ▸ " if selected else "    ",
-                           style="bold cyan" if selected else "")
-            style = "dim" if gated else ("bold white" if selected else "white")
-            content.append(f"{tier:<{widest}}", style=style)
-            # The action sits on the hovered row and nowhere else
-            if action:
-                content.append(
-                    f"  {action if selected else '':<{len(action)}}",
-                    style="bold cyan" if selected and not gated else "dim")
-            if show_size:
-                # Right-aligned, so four estimates read as a column of sizes
-                content.append(f"  {sizes[tier]:>{size_col}}",
-                               style="dim" if gated or not selected else "cyan")
-
-        # What the hovered tier is, and what its `~` is worth. One line rather
-        # than four, because a description repeated on every row is noise and
-        # the accuracy genuinely differs between AAC and FLAC.
-        tier = self._download_tier()
-        content.append(f"\n\n   {QUALITY_MEANINGS.get(tier, '')}", style="dim")
-        content.append(f"\n   {downloads.ESTIMATE_ACCURACY.get(tier, '')}", style="dim")
-        if self._quality_unavailable(tier):
-            content.append(
-                f"\n   This login isn't served {tier}; TIDAL sends "
-                f"{self._quality_ceiling} instead — [u] on the settings page fixes it",
-                style="dim yellow")
-        content.append_text(self._build_download_status())
-        content.append(f"\n\n   Saved to {downloads.display_dir()}"
-                       "/<artist>/<album>/", style="dim")
-        return content
-
-    def _build_download_status(self) -> Text:
-        """Loading, done and failed as three different screens, and honest
-        about the tags: the file's own folder and filename always carry the
-        artist, album and title, and what got written *inside* the file is
-        reported from what was actually written, never from intent."""
-        line = Text()
-        job = self._download_job
-        if not job:
-            return line
-        state = job.get("state")
-        if state == "running":
-            done, total = job.get("done") or 0, job.get("total") or 0
-            share = f" · {done * 100 // total}%" if total else ""
-            line.append(f"\n\n   Downloading {job.get('tier')}"
-                        f" · {downloads.format_bytes(done)}{share}", style="yellow")
-            line.append("   [x] cancel", style="dim")
-        elif state == "cancelled":
-            line.append("\n\n   Download cancelled", style="dim")
-        elif state == "done":
-            line.append(f"\n\n   Saved {job.get('path')}", style="green")
-            written = job.get("tags")
-            line.append(
-                f"\n   Tagged with {written}" if written else
-                "\n   No tags could be written into this container — the folder "
-                "and filename carry the artist, album and title", style="dim")
-        elif state == "failed":
-            line.append(f"\n\n   Download failed — {job.get('error')}", style="red")
-            line.append("   [Enter] retry", style="dim")
-        return line
-
     def _build_quality_gate_note(self) -> Text:
         """Why the dimmed tiers in the ladder above are dimmed — and, if the
         tier actually in effect is one of them, where the fix is. Empty
@@ -4039,6 +3963,11 @@ class HeadlessTidalPlayer:
         if self._mini_player:
             # Tiny mode is the whole point of tiny mode: one line, no footer
             return []
+        if self._download_open:
+            # The box carries its own keys on its own bottom line, so a footer
+            # here would be a second copy of them — and the mode's real footer
+            # would be advertising keys the box is swallowing.
+            return []
         if self._mode == self.MODE_SEARCH:
             hints = [
                 Hint("Enter/\u2192", "search/open", "open", 0),
@@ -4110,20 +4039,6 @@ class HeadlessTidalPlayer:
                 Hint("v", "volume", "vol", 3),
                 Hint("\u2190/Esc", "cancel", None, 1),
             ]
-        if self._mode == self.MODE_DOWNLOAD:
-            # [x] only while there is a job to cancel, because a key that does
-            # nothing is worse than one that is not offered — and the running
-            # job's own line says it too, next to the bytes it is cancelling
-            hints = [
-                Hint("Enter", "download", "get", 0),
-                Hint("\u2191/\u2193", "quality", "tier", 1),
-                Hint("Space", "pause/play", "pause", 4),
-            ]
-            if (self._download_job or {}).get("state") == "running":
-                hints.append(Hint("x", "cancel", None, 2))
-            hints.append(Hint("v", "volume", "vol", 5))
-            hints.append(Hint("\u2190/Esc", "back", None, 3))
-            return hints
         if self._mode == self.MODE_SETTINGS:
             return [
                 Hint("\u2191/\u2193", "select", None, 1),
@@ -4224,6 +4139,105 @@ class HeadlessTidalPlayer:
             out.extend(_clip_lines(row, fit.inner))
         return out
 
+    def _build_download_overlay(self, fit) -> list:
+        """The [d] box: four lines, centred over the screen it was opened on.
+
+        A download is a confirmation, not a destination. This replaced a
+        whole mode — a column of four tiers, an action on the hovered row, a
+        size column and four lines of prose about how good each estimate
+        was. Every line of that was defensible and collectively it was the
+        thing the owner called janky. What is left is the track, the number,
+        the tier and the button.
+
+        The honesty affordances survive as *marks*, not sentences: a tier
+        this login is not served is dimmed and labelled `unavailable`, one
+        already on this disk is ticked, and a real byte count is printed
+        without the `~` every estimate carries (`_download_facts`).
+        """
+        # Two columns of border and one of padding on each side
+        avail = max(fit.inner - 4, 10)
+        job = self._download_job_here()
+        # The button goes through the same _fit_hints every footer does, so a
+        # narrow window makes it terser rather than cutting it in half. A
+        # clipped `[Es…` is a key nobody can read.
+        action = (self._download_status_row(job) if job.get("state")
+                  else _hints_text(_fit_hints(DOWNLOAD_BUTTONS, avail, 1), 0))
+        head, size, pick = self._download_box_rows()
+        # What a pane too short for the whole box gives up, and in this
+        # order: the title only repeats what you pressed [d] on, and the tier
+        # is one arrow away. The number and the button are the box.
+        rows = [(2, head), (0, size), (1, pick), (0, action)]
+        for priority in (2, 1):
+            if len(rows) + 2 <= max(fit.rows, 3):
+                break
+            rows = [row for row in rows if row[0] != priority]
+        rows = [row for _, row in rows]
+        width = min(max(cell_len(row.plain) for row in rows), avail)
+        return _boxed(rows, width, max((fit.inner - width - 4) // 2, 0), "magenta")
+
+    def _download_box_rows(self) -> list:
+        """The three lines above the button: what, how big, at which tier."""
+        track = self._download_track
+        tier = self._download_tier()
+        sizes, owned = self._download_facts()
+
+        head = Text(str(getattr(track, "name", None) or "Unknown track"),
+                    style="bold white")
+        artist = ", ".join(a.name for a in (getattr(track, "artists", None) or [])
+                           if getattr(a, "name", None))
+        if artist:
+            head.append(" — " + artist, style="dim")
+
+        # The line he asked to be able to read at a glance. White, alone, and
+        # exact whenever the bytes are already known here for free.
+        size = Text(self._download_size(tier), style="bold white")
+
+        pick = Text("↑↓  ", style="dim")
+        gated = self._quality_unavailable(tier)
+        pick.append(tier, style="dim" if gated else "bold cyan")
+        if gated:
+            pick.append("  unavailable", style="yellow")
+        elif owned is not None and tier in sizes:
+            pick.append("  ✓ on disk", style="green")
+        return [head, size, pick]
+
+    def _download_job_here(self) -> dict:
+        """The one job, if it happens to be for the track the box is showing.
+        A job for anything else is finished business and says nothing about
+        this track."""
+        job = self._download_job or {}
+        if job.get("track_id") != getattr(self._download_track, "id", None):
+            return {}
+        return job
+
+    def _download_status_row(self, job: dict) -> Text:
+        """What the job is doing, in the button's place — it is the only thing
+        on the box that changes. Running, done and failed read differently,
+        in one line each."""
+        row = Text()
+        state = job.get("state")
+        if state == "running":
+            done, total = job.get("done") or 0, job.get("total") or 0
+            row.append(downloads.format_bytes(done), style="yellow")
+            if total:
+                row.append(f"  {done * 100 // total}%", style="yellow")
+            row.append("   [x]", style="bold")
+            row.append(" cancel", style="dim")
+        elif state == "done":
+            row.append("Saved ✓", style="green")
+            # Reported from what was written, never from intent
+            if not job.get("tags"):
+                row.append(" untagged", style="dim")
+            row.append("   [Esc]", style="bold")
+            row.append(" close", style="dim")
+        elif state == "failed":
+            # In the backend's own words: a download that stopped without
+            # saying why is INCIDENTS #3 in miniature
+            row.append(f"Failed — {job.get('error')}", style="red")
+            row.append("   [Enter]", style="bold")
+            row.append(" retry", style="dim")
+        return row
+
     def _compose(self, fit) -> tuple:
         """The pane under one fit: the lines above the footer, and the footer.
 
@@ -4262,8 +4276,6 @@ class HeadlessTidalPlayer:
                 content.append_text(self._build_add_to_playlist_display())
             elif self._mode == self.MODE_SETTINGS:
                 content.append_text(self._build_settings_display())
-            elif self._mode == self.MODE_DOWNLOAD:
-                content.append_text(self._build_download_display())
 
         if self._quit_pending:
             content.append_text(self._build_quit_confirm())
@@ -4352,6 +4364,8 @@ class HeadlessTidalPlayer:
             footer = footer[:max(fit.rows - keep, 0)]
             body = body[:max(fit.rows - len(footer), 1)]
         lines = body + footer
+        if self._download_open:
+            lines = self._overlay(lines, self._build_download_overlay(fit), fit)
 
         content = Text("\n").join(lines)
         content.no_wrap = True
@@ -4361,6 +4375,26 @@ class HeadlessTidalPlayer:
             border_style="cyan",
             padding=(0, 1) if mini else (1, 2),
         )
+
+    def _overlay(self, lines: list, box: list, fit) -> list:
+        """`box` drawn over the middle of `lines`, replacing rows rather than
+        pushing them down — a pane that grew when a box opened would move the
+        screen underneath it, which is the opposite of an overlay.
+
+        The panel is only as tall as its content, so a short screen (the
+        player alone, the tiny player) has to be padded out to hold the box.
+        Never past the terminal: a box that would not fit is cropped, the
+        same as everything else here.
+        """
+        box = box[:fit.rows]
+        rows = list(lines)
+        if len(rows) < len(box):
+            rows += [Text("")] * (min(len(box), fit.rows) - len(rows))
+        top = max((len(rows) - len(box)) // 2, 0)
+        for index, row in enumerate(box):
+            if top + index < len(rows):
+                rows[top + index] = row
+        return rows
 
     def _fit_levers(self) -> tuple:
         """What this screen gives up, cheapest first, when it doesn't fit.
@@ -5338,21 +5372,22 @@ class HeadlessTidalPlayer:
     # ── Downloads ──
 
     def _open_download(self):
-        """Open the download screen for whatever [d] was pressed on.
+        """Open the download box over whatever [d] was pressed on.
 
         The same target rule the add-to-playlist picker uses, so [d] and [y]
         never disagree about which track the screen you are looking at means.
-        The cursor is pre-placed on the tier settings is set to: that is the
-        tier this session is already listening at, so Enter twice is the
-        answer for the common case and the other three are one arrow away.
+        Nothing is pushed onto the nav history and no mode changes: the box
+        is drawn over the screen you were on and Esc takes it away again, so
+        there is nowhere to be lost. The cursor is pre-placed on the tier
+        settings is set to, which is what makes the common case `d` then
+        `Enter` — or `d` then `d` — and no reading.
         """
         track = self._target_track_for_picker()
         if track is None:
             self._set_toast("No track selected")
             return
-        self._push_nav()
-        self._mode = self.MODE_DOWNLOAD
-        self._mini_player = False
+        self._download_open = True
+        self._download_known = None
         self._download_track = track
         try:
             self._download_cursor = QUALITY_CHOICES.index(self._quality_name)
@@ -5398,6 +5433,63 @@ class HeadlessTidalPlayer:
         """
         return downloads.estimate_bytes(
             getattr(self._download_track, "duration", 0), tier)
+
+    def _download_facts(self) -> tuple:
+        """`(tier → exact bytes already on this disk, the downloaded file)`.
+
+        The only two places a real byte count can be had for nothing: the
+        download index, which recorded the size of every file it wrote, and
+        the cache tracker, which recorded the size of every song it kept.
+        Both key their tier by what TIDAL **granted**, so the answer is
+        exact for at most two of the four tiers and estimated for the rest.
+        The download wins where they disagree — it is the file [d] would be
+        about to replace.
+
+        Measured once per opening of the box and kept, because the box
+        repaints twice a second and `load_index()` re-reads and re-parses the
+        whole index every call: 229 ms per repaint at 500 downloads, on the
+        UI thread (ai/reference/data-path-audit-2026-07-26.md F6). Dropped
+        when a download lands, which is the only thing that changes it.
+        """
+        track_id = getattr(self._download_track, "id", None)
+        known = self._download_known
+        if known is not None and known[0] == track_id:
+            return known[1], known[2]
+        sizes, owned = {}, None
+
+        def note(granted, size):
+            # Both stores name the tier the way tidalapi does and the box
+            # names it the way the settings page does. A tier nobody
+            # recognises is left showing an estimate: unknown is not
+            # evidence of anything, the rule `_tier_is_enough` follows too.
+            for name, quality in self.QUALITY_MAP.items():
+                if granted == quality and size:
+                    sizes[name] = int(size)
+                    return
+
+        if track_id is not None:
+            record = self._cache.audio_record(track_id) or {}
+            note(record.get("quality"), record.get("bytes"))
+            owned = downloads.path_for(track_id)
+            if owned is not None:
+                entry = downloads.load_index().get(str(track_id)) or {}
+                note(entry.get("granted"), entry.get("bytes"))
+        self._download_known = (track_id, sizes, owned)
+        return sizes, owned
+
+    def _download_size(self, tier: str) -> str:
+        """What the box says the download will cost.
+
+        A `~` on everything is the honest default: a real size is one
+        `playbackinfo` per tier, which is the request pattern that took the
+        owner's session down (ai/INCIDENTS #1). The `~` comes off only when
+        the bytes are already here to be counted.
+        """
+        sizes, _ = self._download_facts()
+        if tier in sizes:
+            return downloads.format_bytes(sizes[tier])
+        estimate = self._download_estimate(tier)
+        return "~" + downloads.format_bytes(estimate) if estimate > 0 else "—"
 
     def _start_download_job(self, tier: str):
         """Download the targeted track at `tier`, on a daemon thread.
@@ -5509,7 +5601,10 @@ class HeadlessTidalPlayer:
             size = final.stat().st_size
             downloads.record(track_id, final.relative_to(downloads.download_dir()),
                              tier, size, granted=granted)
-            self._downloads_usage = None  # the folder changed
+            # The folder changed, and so did the one exact size the box could
+            # show for this track
+            self._downloads_usage = None
+            self._download_known = None
             return final, written, size
         except Exception:
             self._discard_staging(track_id)
@@ -6141,6 +6236,15 @@ class HeadlessTidalPlayer:
             self._handle_volume_key(key)
             return
 
+        # The download box is the other overlay, and it is modal for the same
+        # reason the volume one is not: it is a confirmation with a [d] and an
+        # [Esc], and a key falling through it would act on a screen the box is
+        # covering. It is checked after volume only because volume can be over
+        # anything — the two are never up at once (_can_open_volume).
+        if self._download_open:
+            self._handle_download_key(key)
+            return
+
         # Scrub focus comes next, and `v` reaches it as "anything else": focus
         # drops and the key falls through to open the overlay. That is the
         # right way round, because the two are competing for the same arrows —
@@ -6167,8 +6271,6 @@ class HeadlessTidalPlayer:
             self._handle_playlists_key(key)
         elif self._mode == self.MODE_ADD_TO_PLAYLIST:
             self._handle_add_to_playlist_key(key)
-        elif self._mode == self.MODE_DOWNLOAD:
-            self._handle_download_key(key)
         elif self._mode == self.MODE_SETTINGS:
             self._handle_settings_key(key)
         else:
@@ -6213,14 +6315,16 @@ class HeadlessTidalPlayer:
     def _can_open_volume(self) -> bool:
         """Whether `v` means "volume" right now.
 
-        Everywhere except the three places where it means the letter v: a
+        Everywhere except the three places where it means the letter v \u2014 a
         search query, which types every printable key it gets; a settings row
-        being typed into; and the picker's new-playlist name, which types them
-        too. Nothing else binds v \u2014 the player screen, browse, the artist page,
-        the queue, playlists, the picker's list and the settings page were all
+        being typed into; and the picker's new-playlist name \u2014 and under the
+        download box, which is modal, so two overlays are never up at once.
+        Nothing else binds v: the player screen, browse, the artist page, the
+        queue, playlists, the picker's list and the settings page were all
         checked, and none of them wanted it.
         """
         return (self._mode != self.MODE_SEARCH
+                and not self._download_open
                 and self._settings_edit is None
                 and self._picker_new_name is None)
 
@@ -6520,12 +6624,18 @@ class HeadlessTidalPlayer:
                 self._picker_add_to(playlists[self._picker_cursor])
 
     def _handle_download_key(self, key: str):
-        """One column, so ↑/↓ is the whole navigation and Enter is the whole
-        action. ↑ at the top does *not* hand the arrows to the player here, the
-        same as the add-to-playlist picker: this is a chooser you came to on
-        purpose and leave on purpose, not a list you were browsing."""
-        if key == KEY_ESC or key == KEY_LEFT:
-            self._go_back()
+        """The box's keys, and it is modal: it takes every key and passes
+        none of them to the screen underneath, so nothing can be triggered
+        by a keystroke aimed at a box that is in the way.
+
+        `d` starts the download as well as `Enter` — the key that opened the
+        box also completes it, which is the whole of "d does exactly what's
+        expected". ↑/↓ pick the tier and change the number above it, and
+        both cost nothing at all. ↑ at the top does *not* hand the arrows to
+        the player, the same as the add-to-playlist picker.
+        """
+        if key in (KEY_ESC, KEY_LEFT):
+            self._download_open = False
             return
         if key == " ":
             self._toggle_play_key()
@@ -6538,8 +6648,9 @@ class HeadlessTidalPlayer:
         elif key == KEY_DOWN:
             self._download_cursor = min(len(QUALITY_CHOICES) - 1,
                                         self._download_cursor + 1)
-        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
+        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT, "d", "D"):
             self._start_download_job(self._download_tier())
+            self._download_open = False
 
     def _handle_settings_key(self, key: str):
         # Typing a number into a row: digits extend it, Backspace shortens it,

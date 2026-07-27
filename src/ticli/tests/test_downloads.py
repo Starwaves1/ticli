@@ -15,6 +15,7 @@ the cache directory and config file are redirected alongside it.
 
 import http.server
 import json
+import re
 import struct
 import tempfile
 import threading
@@ -27,6 +28,7 @@ from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
 from ticli.tests.fakes import patch_get
 from ticli.utils import cache as cache_mod
+from ticli.utils.config import QUALITY_CHOICES
 from ticli.utils import config as config_mod
 from ticli.utils import downloads, tags
 from ticli.utils.cache import MetadataCache
@@ -65,6 +67,14 @@ def _track(tid=42, duration=200, cover=None):
         album=album, track_num=8, volume_num=1,
         isrc="USQX91300110", copyright="2013 Daft Life Ltd.",
     )
+
+
+def _box_text(player) -> str:
+    """The download box as plain text, laid out the way a real window lays it
+    out — through the same builder `_build_display` calls, so a test can
+    never read a box the screen would not draw."""
+    return "\n".join(row.plain for row in
+                     player._build_download_overlay(player_mod.ROOMY_FIT))
 
 
 def _rendered(player) -> str:
@@ -224,26 +234,104 @@ class TestEstimatesCostNothing:
         assert downloads.estimate_bytes(0, "HIGH") == 0
         assert downloads.format_bytes(0) == "—"
 
-    def test_the_screen_shows_all_four_estimates_and_one_action(self, monkeypatch):
+    def test_opening_the_box_and_walking_every_tier_costs_no_request(self, monkeypatch):
+        """Four tiers hovered is four numbers shown and **zero** calls. One
+        `playbackinfo` per hover is what ai/INCIDENTS #1 was, so this is the
+        assertion the estimates exist for."""
         patch_get(monkeypatch, player_mod,
                   lambda *a, **k: pytest.fail("no requests here"))
         p = _player(quality="LOSSLESS")
-        p._download_track = _track(duration=197)
-        p._download_cursor = 2  # LOSSLESS
-        text = p._build_download_display().plain
-        import re
-        tiers = ("LOW", "HIGH", "LOSSLESS", "HIRES")
-        rows = {}
-        for line in text.splitlines():
-            words = line.replace("▸", "").split()
-            if words and words[0] in tiers:
-                rows[words[0]] = line
-        assert set(rows) == {"LOW", "HIGH", "LOSSLESS", "HIRES"}
-        for tier, line in rows.items():
-            assert re.search(r"~\d+(\.\d+)? [KMG]B", line), \
-                f"{tier} shows no size estimate of its own"
-        assert text.count("download now") == 1, "only the hovered tier acts"
-        assert "FLAC is variable" in text, "the ~ is qualified for the tier hovered"
+        p._current_track = _track(duration=197)
+        p._open_download()
+        # Walked with the arrows, painted at every stop, the way a held-down
+        # key would do it — and back up again, twice over
+        for key in ([player_mod.KEY_UP] * 5 + [player_mod.KEY_DOWN] * 5) * 2:
+            p._handle_key(key)
+            assert p._download_tier() in _box_text(p)
+        seen = set()
+        for _ in range(len(QUALITY_CHOICES)):
+            text = _box_text(p)
+            seen.add(p._download_tier())
+            assert re.search(r"~\d+(\.\d+)? [KMG]B", text), text
+            p._handle_key(player_mod.KEY_UP)
+        assert seen == set(QUALITY_CHOICES)
+
+    def test_one_tier_at_a_time_and_the_number_follows_it(self):
+        p = _player(quality="LOW")
+        p._current_track = _track(duration=197)
+        p._open_download()
+        assert "LOW" in _box_text(p)
+        p._handle_key(player_mod.KEY_DOWN)
+        text = _box_text(p)
+        assert "HIGH" in text and "LOW" not in text, text
+        assert "~" + downloads.format_bytes(
+            downloads.estimate_bytes(197, "HIGH")) in text, text
+
+
+class TestTheSizeIsExactWhenItIsFree:
+    """A `~` means an estimate and no `~` means a byte count. The only two
+    places a real one can be had for nothing are the download index and the
+    cache tracker — anywhere else it is a request, and a request per hover is
+    ai/INCIDENTS #1."""
+
+    def _opened(self, quality="HIGH"):
+        p = _player(quality=quality)
+        p._current_track = _track(duration=197)
+        p._open_download()
+        return p
+
+    def test_a_matching_download_record_shows_the_exact_bytes(self):
+        p = self._opened()
+        path = downloads.download_dir() / "A" / "B" / "01 T.m4a"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"x" * 4321)
+        downloads.record(42, path.relative_to(downloads.download_dir()),
+                         "HIGH", 4321, granted="HIGH")
+        p._download_known = None
+        text = _box_text(p)
+        assert downloads.format_bytes(4321) in text, text
+        assert "~" not in text, text
+        assert "\u2713 on disk" in text, text
+
+    def test_a_matching_cache_record_shows_the_exact_bytes(self):
+        p = self._opened()
+        p._cache.note_cached(42, ".m4a", 9999, quality="HIGH")
+        p._download_known = None
+        text = _box_text(p)
+        assert downloads.format_bytes(9999) in text, text
+        assert "~" not in text, text
+
+    def test_a_record_at_another_tier_is_still_an_estimate(self):
+        p = self._opened()
+        p._cache.note_cached(42, ".m4a", 9999, quality="LOW")
+        p._download_known = None
+        text = _box_text(p)
+        assert "~" in text, text
+        assert downloads.format_bytes(9999) not in text, text
+
+    def test_a_track_nothing_is_known_about_is_an_estimate(self):
+        assert "~" in _box_text(self._opened())
+
+    def test_the_two_index_reads_are_not_paid_on_every_repaint(self, monkeypatch):
+        """The box repaints twice a second and `load_index()` re-reads and
+        re-parses the whole file every call: 229 ms per repaint at 500
+        downloads, on the UI thread (F6 in the data-path audit). Measured on
+        the reads themselves rather than on a clock, because the number that
+        must not grow is the number of reads."""
+        p = self._opened()
+        reads = []
+        real = downloads.load_index
+        monkeypatch.setattr(downloads, "load_index",
+                            lambda: (reads.append(1), real())[1])
+        p._download_known = None
+        for _ in range(20):
+            _box_text(p)
+        # One `path_for` (which loads the index itself) and nothing after it
+        assert len(reads) == 1, reads
+        # and a landed download drops it, so the exact size can appear
+        p._download_known = None
+        _box_text(p)
+        assert len(reads) == 2, reads
 
 
 class TestTheCursorStartsWhereSettingsIs:
@@ -253,7 +341,30 @@ class TestTheCursorStartsWhereSettingsIs:
             p._current_track = _track()
             p._open_download()
             assert p._download_cursor == index
-            assert p._mode == p.MODE_DOWNLOAD
+            assert p._download_open is True
+
+    def test_d_then_enter_and_d_then_d_do_the_same_thing(self):
+        """The two ways he described the common case, and both close the box
+        rather than leaving him somewhere to get out of."""
+        for finish in (player_mod.KEY_ENTER, "d"):
+            p = _player(quality="LOSSLESS")
+            p._current_track = _track()
+            started = []
+            p._start_download_job = lambda tier: started.append(tier)
+            p._handle_key("d")
+            assert p._download_open is True and started == []
+            p._handle_key(finish)
+            assert started == ["LOSSLESS"], finish
+            assert p._download_open is False, finish
+
+    def test_esc_spends_nothing(self):
+        p = _player()
+        p._current_track = _track()
+        p._start_download_job = lambda tier: pytest.fail("Esc started a download")
+        p._handle_key("d")
+        p._handle_key(player_mod.KEY_ESC)
+        assert p._download_open is False
+        assert p._download_job is None
 
 
 class TestTheKeyIsFree:
@@ -276,7 +387,8 @@ class TestTheKeyIsFree:
         p._queue = [_track(1), _track(2)]
         p._queue_cursor = 1
         p._handle_key("d")
-        assert p._mode == p.MODE_DOWNLOAD
+        assert p._download_open is True
+        assert p._mode == p.MODE_QUEUE, "the box is over the queue, not instead of it"
         assert p._download_track.id == 2
 
 
@@ -687,7 +799,7 @@ class TestPartialFilesAreNeverServed:
             get_stream_manifest=lambda: types.SimpleNamespace(
                 is_bts=True, get_urls=lambda: ["https://cdn.example/t.mp4"]))
         p._download_track = track
-        p._mode = p.MODE_DOWNLOAD
+        p._download_open = True
         p._start_download_job("HIGH")
         assert _wait_for(lambda: list(downloads.download_dir().rglob("*.part")))
         p._handle_key("x")  # cancel
@@ -1015,14 +1127,14 @@ class TestWhatTheFileActuallyCarries:
         assert downloads.relative_path(meta, ".m4a").parts == (
             "Unknown Artist", "Unknown Album", "Track 5.m4a")
 
-    def test_the_screen_never_claims_a_tag_that_was_not_written(self):
+    def test_the_box_never_claims_a_tag_that_was_not_written(self):
         p = _player()
         p._download_track = _track()
-        p._download_job = {"state": "done", "path": "/x/y.m4a", "tags": "",
-                           "tier": "HIGH", "track_id": 42}
-        text = p._build_download_display().plain
-        assert "No tags could be written" in text
-        assert "the folder and filename carry" in text.replace("\n   ", " ")
+        job = {"state": "done", "path": "/x/y.m4a", "tier": "HIGH", "track_id": 42}
+        p._download_job = dict(job, tags="")
+        assert "untagged" in _box_text(p)
+        p._download_job = dict(job, tags="title, artist")
+        assert "untagged" not in _box_text(p)
 
 
 class TestTheSettingsPageIsCheapToPaint:

@@ -31,6 +31,8 @@ from ticli.tests.vt import Screen
 from ticli.utils import artwork as art_mod
 from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
+from ticli.utils import downloads
+from ticli.utils.config import QUALITY_CHOICES
 
 COVER = "3f2d1c0b-1111-2222-3333-444455556666"
 
@@ -42,7 +44,6 @@ MODES = (
     HeadlessTidalPlayer.MODE_QUEUE,
     HeadlessTidalPlayer.MODE_PLAYLISTS,
     HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
-    HeadlessTidalPlayer.MODE_DOWNLOAD,
     HeadlessTidalPlayer.MODE_SETTINGS,
 )
 
@@ -72,6 +73,7 @@ def isolated_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path / "config")
     monkeypatch.setattr(config_mod, "CONFIG_FILE", tmp_path / "config" / "config.json")
     monkeypatch.setattr(cache_mod, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(downloads, "DOWNLOAD_ROOT", tmp_path / "Music" / "Ticli")
     monkeypatch.setattr(art_mod, "load",
                         lambda cover, cols, rows, **kw: _grid(cols, rows))
     return tmp_path
@@ -1240,13 +1242,16 @@ class TestTheTitleIsTheLastThingToGo:
 
     def test_but_a_long_body_still_gives_way_before_the_footer(self):
         """The other side of the rule, and the one it would be easy to break
-        by applying "identity first" everywhere. The download screen's body is
-        twenty-two rows in a twenty-row pane — but what it loses to a crop is
+        by applying "identity first" everywhere. The settings page's body is
+        longer than the pane at every width — but what it loses to a crop is
         the tail of its prose, not the track, so the footer keeps both of its
-        rows and `[←/Esc] back` stays on screen."""
-        rows = _rows(60, 24, mode=HeadlessTidalPlayer.MODE_DOWNLOAD)
-        assert len(_hint_rows(rows)) == 2, rows
-        assert any("[←/Esc]" in r for r in rows), rows
+        rows and `[Esc] back` stays on screen."""
+        rows = _rows(60, 24, mode=HeadlessTidalPlayer.MODE_SETTINGS)
+        body = [r for r in rows
+                if "\u256d" not in r and "\u2570" not in r
+                and r.strip().strip("\u2502").strip()]
+        assert _hint_rows(body[-2:]) == body[-2:], rows
+        assert any("[Esc]" in r for r in body[-2:]), rows
 
 
 class TestTheCoverBesideTheTrack:
@@ -1339,45 +1344,138 @@ class TestTheCoverBesideTheTrack:
             h.live.stop()
 
 
-class TestTheDownloadTiersFit:
-    """Three things want one line: the tier, `download now` on the hovered
-    row, and the size. A clipped size is the one outcome that must not
-    happen — `~24…` reads as a number, and a wrong number is worse than none."""
+class TestTheDownloadBox:
+    """[d] is a small box centred over whatever screen you were looking at.
 
-    def _rows(self, width):
-        h = Harness(width=width, height=24,
-                    artwork=_art(width, 24))
-        p = _loaded(h.player, "Satisfied (Ambient Reprise)")
-        p._mode = p.MODE_DOWNLOAD
-        p._download_cursor = 2
-        lines, widths = _frame(p)
-        assert max(widths) <= width, (width, max(widths))
-        text = ["".join(seg.text for seg in line) for line in lines]
-        return [r for r in text if any(t in r for t in ("LOW", "HIGH", "LOSSLESS", "HIRES"))]
+    Driven through the real `Live` into `vt.Screen`, because every claim
+    here is about the grid: that the box is centred in the window, that the
+    number above the tier is the one the tier means, and that Esc puts back
+    the screen it was drawn over — none of which a returned Text can settle.
+    """
 
-    @pytest.mark.parametrize("width", WIDTHS + (40,))
-    def test_a_size_is_whole_or_absent_never_cut(self, width):
-        rows = self._rows(width)
-        assert rows, width
-        for row in rows:
-            assert "…" not in row, (width, row)
-            if "~" in row:
-                # A size that is there is a complete one: digits, a dot, a unit
-                tail = row.split("~")[1].strip().rstrip("│").strip()
-                assert re.match(r"^\d+(\.\d+)?\s(B|KB|MB|GB)$", tail), (width, row)
+    def _open(self, width=80, height=24):
+        h = Harness(width=width, height=height, artwork=None)
+        h.player._show_artwork = False
+        h.player._mode = h.player.MODE_QUEUE
+        h.player._queue_cursor = 1
+        h.start()
+        h.repaint()
+        before = h.screen.text()
+        h.player._handle_key("d")
+        h.repaint()
+        return h, before
 
-    def test_the_action_gives_way_before_the_size(self):
-        """The action is in the footer and the cursor already says which row it
-        applies to; the size is the only thing on this screen you cannot get
-        anywhere else."""
-        wide = "".join(self._rows(80))
-        narrow = "".join(self._rows(40))
-        assert "download now" in wide and "~" in wide
-        assert "download now" not in narrow, "the action goes first"
-        assert "~" in narrow, "the size stays"
+    def _box(self, h):
+        """The box's rows, found by the border it draws and not by any string
+        the builder happens to put inside it."""
+        rows = h.screen.text()
+        top = [i for i, r in enumerate(rows) if "\u256d" in r and "Ticli" not in r]
+        assert len(top) == 1, rows
+        bottom = [i for i, r in enumerate(rows) if "\u2570" in r and i > top[0]]
+        assert bottom, rows
+        return rows[top[0]:bottom[0] + 1]
 
-    def test_every_tier_is_listed_at_every_width(self):
-        for width in WIDTHS + (40,):
-            rows = self._rows(width)
-            for tier in ("LOW", "HIGH", "LOSSLESS", "HIRES"):
-                assert any(tier in r for r in rows), (width, tier)
+    def _size_line(self, h):
+        return [r for r in self._box(h) if re.search(r"\d+(\.\d+)? [KMG]B", r)]
+
+    def test_it_is_centred_in_the_window(self):
+        for width in (60, 80, 100, 120):
+            h, _ = self._open(width=width)
+            try:
+                for row in self._box(h):
+                    left = len(row) - len(row.lstrip())
+                    # Rows are rstripped, so the panel's own right border is
+                    # the last cell on the line
+                    right = len(row) - 1 - max(row.rfind("\u2502"), row.rfind("\u256e"),
+                                               row.rfind("\u256f"))
+                    assert abs(left - right) <= 1, (width, repr(row))
+            finally:
+                h.live.stop()
+
+    def test_the_size_is_the_estimate_for_the_tier_that_is_showing(self):
+        h, _ = self._open()
+        try:
+            player = h.player
+            for index, tier in enumerate(QUALITY_CHOICES):
+                player._download_cursor = index
+                h.repaint()
+                box = self._box(h)
+                expected = "~" + downloads.format_bytes(
+                    downloads.estimate_bytes(player._download_track.duration, tier))
+                assert any(expected in r for r in box), (tier, expected, box)
+                assert any(tier in r for r in box), (tier, box)
+        finally:
+            h.live.stop()
+
+    def test_down_moves_the_tier_and_the_number_above_it(self):
+        h, _ = self._open()
+        try:
+            was = h.player._download_tier()
+            first = self._size_line(h)
+            h.player._handle_key(player_mod.KEY_DOWN)
+            h.repaint()
+            second = self._size_line(h)
+            assert first and second and first != second, (first, second)
+            # and the tier under the cursor moved with it, by one
+            assert h.player._download_tier() == QUALITY_CHOICES[
+                QUALITY_CHOICES.index(was) + 1]
+            assert any(h.player._download_tier() in r for r in self._box(h))
+        finally:
+            h.live.stop()
+
+    def test_esc_puts_back_the_screen_it_was_drawn_over(self):
+        h, before = self._open()
+        try:
+            assert h.screen.text() != before, "the box never appeared"
+            h.player._handle_key(player_mod.KEY_ESC)
+            h.repaint()
+            assert h.screen.text() == before
+            assert h.player._mode == h.player.MODE_QUEUE
+        finally:
+            h.live.stop()
+
+    def test_the_box_fits_and_strands_nothing_at_every_size(self):
+        for width, height in ((40, 14), (60, 20), (80, 24), (120, 40)):
+            h, _ = self._open(width=width, height=height)
+            try:
+                rows = h.screen.text()
+                # One panel, and the box inside it: assert_one_frame counts
+                # top borders, and the box has one of its own
+                assert len([r for r in rows if "Ticli" in r]) == 1, rows
+                assert h.stranded() == [], (width, height)
+                assert all(len(r) <= width for r in rows), (width, rows)
+                box = self._box(h)
+                # Whatever else it gives up, the number and the button stay
+                assert self._size_line(h), (width, height, box)
+                assert any("[Enter]" in r for r in box), (width, height, box)
+            finally:
+                h.live.stop()
+
+    @pytest.mark.parametrize("mode", MODES)
+    @pytest.mark.parametrize("width", OVERFLOW_WIDTHS)
+    def test_it_fits_over_every_screen_at_every_size(self, mode, width):
+        """The box is drawn over whatever was there, so it inherits that
+        screen's overflow problem as well as its own. Same matrix the modes
+        themselves are held to, because a pane that overflows is not
+        harmless: Rich answers it by replacing the bottom line with a red
+        ellipsis, and here the bottom line is the button."""
+        for height in OVERFLOW_HEIGHTS:
+            h = Harness(width=width, height=height, artwork=_art(width, height))
+            p = _loaded(h.player, WIDE_TITLE, _art(width, height))
+            p._mode = mode
+            p._download_open = True
+            lines, widths = _frame(p)
+            assert len(lines) <= height, (mode, width, height, len(lines))
+            assert max(widths) <= width, (mode, width, height, max(widths))
+            text = ["".join(seg.text for seg in line) for line in lines]
+            assert any("\u256d" in r and "Ticli" not in r for r in text), \
+                (mode, width, height, text)
+
+    def test_the_footer_underneath_is_not_left_advertising_swallowed_keys(self):
+        """The box takes every key. A footer still offering [s] search would
+        be naming keys that now do nothing at all."""
+        h, _ = self._open()
+        try:
+            assert _hints_on_screen(h) == [], h.screen.text()
+        finally:
+            h.live.stop()
