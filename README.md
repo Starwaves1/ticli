@@ -1,5 +1,17 @@
 # Ticli
 
+# Note to self: I should really update this README
+
+
+
+
+
+
+
+
+
+
+
 An unofficial terminal music player for TIDAL. Search, browse, queue, and play music — all from your terminal. Not affiliated with TIDAL.
 
 Ticli connects directly to TIDAL's API using your premium account. No desktop app needed. Just authenticate, search, and play.
