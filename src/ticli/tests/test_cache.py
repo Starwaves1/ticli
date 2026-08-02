@@ -1610,7 +1610,7 @@ class TestACachedTrackCostsNoRequest:
     exact endpoint whose burst rate got the owner's IP blocked (INCIDENTS #1).
     """
 
-    def _player_with(self, quality="LOSSLESS"):
+    def _player_with(self, quality="HIGH"):
         p = HeadlessTidalPlayer(quality=quality)
         p.session = _FakeSession(latency=0)
         p._cache = MetadataCache(songs=True)
@@ -1684,7 +1684,7 @@ class TestReplayingAtAHigherQuality:
         return p
 
     def test_a_low_copy_is_re_fetched_at_the_higher_setting(self):
-        p = self._player_with("HIRES")
+        p = self._player_with("MAX")
         _cached_file(p._cache, 12, quality="HIGH")
         calls = []
         p._play_track(_streaming_track(12, calls))
@@ -1709,7 +1709,7 @@ class TestReplayingAtAHigherQuality:
         is not evidence of a downgrade, and re-fetching someone's whole
         library on the strength of a missing field is not something to do
         unasked — the settings page has an action for exactly that."""
-        p = self._player_with("HIRES")
+        p = self._player_with("MAX")
         path = _cached_file(p._cache, 12, quality=None)
         calls = []
         p._play_track(_streaming_track(12, calls))
@@ -1721,7 +1721,7 @@ class TestReplayingAtAHigherQuality:
     def test_a_tier_tidal_will_not_serve_does_not_cause_a_re_fetch(self):
         """The gate has already seen a downgrade, so re-fetching would spend
         a request to be handed the same thing back."""
-        p = self._player_with("HIRES")
+        p = self._player_with("MAX")
         p._quality_ceiling = "HIGH"
         path = _cached_file(p._cache, 12, quality="HIGH")
         calls = []

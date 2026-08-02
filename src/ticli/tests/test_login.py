@@ -726,66 +726,66 @@ class TestEntitlementGating:
         return player
 
     def test_nothing_is_gated_before_a_single_track_has_played(self, token_file):
-        player = self._player_at("HIRES")
+        player = self._player_at("MAX")
         assert player._quality_ceiling is None
-        assert player._quality_unavailable("HIRES") is False
-        assert player._quality_unavailable("LOSSLESS") is False
+        assert player._quality_unavailable("MAX") is False
+        assert player._quality_unavailable("MEDIUM") is False
 
     def test_a_downgrade_gates_every_tier_above_what_was_granted(self, token_file):
-        player = self._player_at("HIRES")
+        player = self._player_at("MAX")
         player._stream_url(_StreamTrack(granted="HIGH"))
         assert player._quality_ceiling == "HIGH"
-        assert player._quality_unavailable("HIRES") is True
-        assert player._quality_unavailable("LOSSLESS") is True
-        assert player._quality_unavailable("HIGH") is False
+        assert player._quality_unavailable("MAX") is True
+        assert player._quality_unavailable("HIGH") is True
+        assert player._quality_unavailable("MEDIUM") is False
         assert player._quality_unavailable("LOW") is False
 
     def test_getting_what_was_asked_for_gates_nothing(self, token_file):
-        # LOSSLESS granted says nothing at all about HIRES — asking is the only
+        # a granted LOSSLESS says nothing at all about MAX — asking is the only
         # way to find out, and guessing here would hide a tier he pays for
-        player = self._player_at("LOSSLESS")
+        player = self._player_at("HIGH")
         player._stream_url(_StreamTrack(granted="LOSSLESS"))
         assert player._quality_ceiling is None
-        assert player._quality_unavailable("HIRES") is False
+        assert player._quality_unavailable("MAX") is False
 
     def test_an_unrecognised_answer_gates_nothing(self, token_file):
-        player = self._player_at("HIRES")
+        player = self._player_at("MAX")
         player._stream_url(_StreamTrack(granted="DOLBY_ATMOS_SOMETHING"))
         assert player._quality_ceiling is None
-        assert player._quality_unavailable("HIRES") is False
+        assert player._quality_unavailable("MAX") is False
 
     def test_a_missing_answer_gates_nothing(self, token_file):
-        player = self._player_at("HIRES")
+        player = self._player_at("MAX")
         player._note_granted_quality(None)
         assert player._quality_ceiling is None
 
     def test_better_news_lifts_an_earlier_ceiling(self, token_file):
-        player = self._player_at("HIRES")
+        player = self._player_at("MAX")
         player._stream_url(_StreamTrack(granted="HIGH"))
-        assert player._quality_unavailable("LOSSLESS") is True
+        assert player._quality_unavailable("HIGH") is True
         player._stream_url(_StreamTrack(granted="HI_RES_LOSSLESS"))
         assert player._quality_ceiling is None
-        assert player._quality_unavailable("HIRES") is False
+        assert player._quality_unavailable("MAX") is False
 
     def test_a_successful_pkce_upgrade_re_opens_the_tiers_without_a_restart(
             self, token_file, monkeypatch):
         session = _PkceSession()
         player = _player(session)
-        player._quality_name = "HIRES"
+        player._quality_name = "MAX"
         player._stream_url(_StreamTrack(granted="HIGH"))
-        assert player._quality_unavailable("HIRES") is True
+        assert player._quality_unavailable("MAX") is True
         monkeypatch.setattr(player, "_restore_tty", lambda: None)
         monkeypatch.setattr(player, "_raw_tty", lambda: None)
         _typed(monkeypatch, "https://tidal.com/android/login/auth?code=good-code")
         player._upgrade_to_pkce()
         assert player._quality_ceiling is None
-        assert player._quality_unavailable("HIRES") is False
+        assert player._quality_unavailable("MAX") is False
 
     def test_a_cancelled_upgrade_leaves_the_gate_where_it_was(
             self, token_file, monkeypatch):
         session = _PkceSession()
         player = _player(session)
-        player._quality_name = "HIRES"
+        player._quality_name = "MAX"
         player._stream_url(_StreamTrack(granted="HIGH"))
         monkeypatch.setattr(player, "_restore_tty", lambda: None)
         monkeypatch.setattr(player, "_raw_tty", lambda: None)
@@ -795,7 +795,7 @@ class TestEntitlementGating:
 
 
 class TestGatingOnThePage:
-    def _settings_page(self, granted=None, quality="HIRES"):
+    def _settings_page(self, granted=None, quality="MAX"):
         player = _player(_StreamSession())
         player._quality_name = quality
         player._settings_cursor = 0  # the quality row, where the ladder shows
@@ -810,9 +810,9 @@ class TestGatingOnThePage:
     def test_a_gated_tier_is_named_with_its_reason_not_hidden(self, token_file):
         page = self._settings_page(granted="HIGH")._build_settings_display().plain
         # Still listed — a hidden option looks like a missing feature
-        assert "LOSSLESS" in page and "HIRES" in page
+        assert "HIGH and MAX" in page
         assert "isn't served" in page
-        assert "TIDAL sends HIGH instead" in page
+        assert "TIDAL sends MEDIUM instead" in page
 
     def test_the_page_points_at_the_fix_when_the_chosen_tier_is_gated(self, token_file):
         page = self._settings_page(granted="HIGH")._build_settings_display().plain

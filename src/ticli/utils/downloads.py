@@ -74,13 +74,13 @@ DOWNLOAD_ROOT = None
 # two are arithmetic, and the difference is stated in the interface rather
 # than smoothed over:
 #
-#   LOW / HIGH  — AAC, effectively constant bitrate. Estimating from the
+#   LOW / MEDIUM — AAC, effectively constant bitrate. Estimating from the
 #     nominal rate under-reads the real file by 0.3-2.1% (four real TIDAL
 #     tracks, ai/reference/download-research-2026-07-25.md §1.4) and by 0.67%
 #     at 320k / 3.4% at 96k when re-measured locally against ffmpeg's encoder.
 #     One-signed and small: the estimate is never high.
 #
-#   LOSSLESS    — FLAC 16/44.1. PCM is 1411.2 kbps and FLAC keeps roughly 60%
+#   HIGH        — FLAC 16/44.1. PCM is 1411.2 kbps and FLAC keeps roughly 60%
 #     of that on commercial material, so 850 kbps. Measured on a real PKCE
 #     track from this machine's own cache (24/88.2 FLAC, 124 s), transcoded
 #     locally to 16/44.1: the whole track came to 765 kbps (54% of PCM), while
@@ -89,15 +89,15 @@ DOWNLOAD_ROOT = None
 #     honest bound is roughly +/-20% on ordinary material and up to a third
 #     high on sparse or quiet recordings. Not the +/-1% AAC gets.
 #
-#   HIRES       — FLAC above CD, and the master's resolution is not known
+#   MAX         — FLAC above CD, and the master's resolution is not known
 #     until the stream is fetched: 24/44.1, 24/96 and 24/192 differ by 4x.
 #     2500 kbps is 24/96 at the same ~52% ratio the one measured hi-res track
 #     showed (2200 kbps at 24/88.2). Treat it as an order of magnitude.
 NOMINAL_BITRATE = {
     "LOW": 96_000,
-    "HIGH": 320_000,
-    "LOSSLESS": 850_000,
-    "HIRES": 2_500_000,
+    "MEDIUM": 320_000,
+    "HIGH": 850_000,
+    "MAX": 2_500_000,
 }
 
 # Only ever unlinked by name, and only ever ones this module wrote. A finished
@@ -279,13 +279,14 @@ def record(track_id, relpath: Path, quality: str, size: int,
     """Remember a finished download. Whole-dict replacement, no locks.
 
     Two tiers are recorded and they are not the same thing. `quality` is the
-    tier the **user asked for** (`LOW`/`HIGH`/`LOSSLESS`/`HIRES`, the settings
-    spelling) and is what the screen says. `granted` is the tier TIDAL
-    actually **served**, in tidalapi's own spelling — the only one that can be
+    tier the **user asked for** (`LOW`/`MEDIUM`/`HIGH`/`MAX`, the settings
+    spelling; older entries hold the pre-rename names and are translated at
+    display time, never rewritten). `granted` is the tier TIDAL actually
+    **served**, in tidalapi's own spelling — the only one that can be
     compared against anything, and the only honest answer to "is this file
     below the quality I have set now?". A device-flow session asks for hi-res
-    and is handed `HIGH`; recording the request would make that file look
-    like something it is not, for ever.
+    and is handed 320k AAC (`"HIGH"` on the wire); recording the request
+    would make that file look like something it is not, for ever.
     """
     if track_id is None:
         return

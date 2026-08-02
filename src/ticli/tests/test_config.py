@@ -62,7 +62,7 @@ def config_file(tmp_path, monkeypatch):
 class TestLoadConfig:
     def test_defaults_when_file_missing(self, config_file):
         cfg = load_config()
-        assert cfg["quality"] == "LOSSLESS"
+        assert cfg["quality"] == "HIGH"
         assert cfg["page_size"] == 15
         assert cfg["progress_bar_max"] == 50
         assert cfg["volume"] == 100
@@ -97,20 +97,25 @@ class TestMigration:
     """v1 named every tier one step below the stream it asked for. The rename
     must keep an existing user on the exact same bytes, never downgrade them."""
 
-    def test_v1_low_becomes_high(self, config_file):
+    def test_v1_low_lands_on_medium(self, config_file):
+        """v1's "LOW" asked for the 320k stream; the v1 rename called that
+        HIGH and the v5 rename calls it MEDIUM. Two hops, same bytes."""
         config_file.write_text(json.dumps({"version": 1, "quality": "LOW"}))
+        assert load_config()["quality"] == "MEDIUM"
+
+    def test_v1_high_lands_on_high(self, config_file):
+        """v1's "HIGH" asked for the lossless stream — which the v5 scheme
+        happens to call HIGH again. The name comes full circle; the stream
+        never moved."""
+        config_file.write_text(json.dumps({"version": 1, "quality": "HIGH"}))
         assert load_config()["quality"] == "HIGH"
 
-    def test_v1_high_becomes_lossless(self, config_file):
-        config_file.write_text(json.dumps({"version": 1, "quality": "HIGH"}))
-        assert load_config()["quality"] == "LOSSLESS"
-
-    def test_v1_top_tiers_are_unchanged(self, config_file):
-        """v1's LOSSLESS and HIGH asked for the same stream, and HIRES was
-        already correct — neither name moves."""
-        for saved in ("LOSSLESS", "HIRES"):
+    def test_v1_top_tiers_take_the_new_names(self, config_file):
+        """v1's LOSSLESS and HIRES pass the v1 block untouched and are then
+        renamed by the v5 block like any other old spelling."""
+        for saved, now in (("LOSSLESS", "HIGH"), ("HIRES", "MAX")):
             config_file.write_text(json.dumps({"version": 1, "quality": saved}))
-            assert load_config()["quality"] == saved
+            assert load_config()["quality"] == now
 
     def test_v1_stream_is_preserved_end_to_end(self, config_file):
         """The point of the migration: same tidalapi Quality before and after."""
@@ -135,16 +140,56 @@ class TestMigration:
         config_file.write_text(json.dumps({"version": 1, "quality": "HIGH"}))
         assert load_config()["version"] == config_mod.CONFIG_VERSION
 
+
+class TestMigrationV5:
+    """v4 named the tiers after tidalapi's wire values; v5 uses TIDAL's own
+    player's names. Same rule as v1: a rename must keep an existing user on
+    the exact same bytes — the name moves, the stream never does."""
+
+    def test_every_v4_name_lands_on_its_stream(self, config_file):
+        import tidalapi
+
+        expected = {
+            "LOW": ("LOW", tidalapi.Quality.low_96k),
+            "HIGH": ("MEDIUM", tidalapi.Quality.low_320k),
+            "LOSSLESS": ("HIGH", tidalapi.Quality.high_lossless),
+            "HIRES": ("MAX", tidalapi.Quality.hi_res_lossless),
+        }
+        for saved, (name, stream) in expected.items():
+            config_file.write_text(json.dumps({"version": 4, "quality": saved}))
+            assert load_config()["quality"] == name
+            assert HeadlessTidalPlayer.QUALITY_MAP[name] == stream
+
+    def test_high_is_disambiguated_by_the_version_number(self, config_file):
+        """"HIGH" is the one spelling both schemes use for different streams:
+        320k AAC in v4, 16-bit FLAC in v5. The version number is the only
+        thing that can tell the two apart, and it must."""
+        config_file.write_text(json.dumps({"version": 4, "quality": "HIGH"}))
+        assert load_config()["quality"] == "MEDIUM"
+        config_file.write_text(json.dumps({"version": 5, "quality": "HIGH"}))
+        assert load_config()["quality"] == "HIGH"
+
+    def test_a_v1_file_chains_through_both_renames(self, config_file):
+        """The full gauntlet: v1 "LOW" asked for 320k, which v2 called HIGH
+        and v5 calls MEDIUM — and the player must end up streaming exactly
+        what that user has heard since v1."""
+        import tidalapi
+
+        config_file.write_text(json.dumps({"version": 1, "quality": "LOW"}))
+        p = HeadlessTidalPlayer()
+        assert p.config["quality"] == "MEDIUM"
+        assert p.session.audio_quality == tidalapi.Quality.low_320k
+
     def test_junk_version_never_raises(self, config_file):
-        config_file.write_text(json.dumps({"version": "banana", "quality": "HIRES"}))
-        assert load_config()["quality"] == "HIRES"
+        config_file.write_text(json.dumps({"version": "banana", "quality": "MAX"}))
+        assert load_config()["quality"] == "MAX"
 
     def test_migration_is_idempotent(self, config_file):
         """Load, save, load again — the value must settle, not climb a tier
         per launch."""
         config_file.write_text(json.dumps({"version": 1, "quality": "LOW"}))
         save_config(load_config())
-        assert load_config()["quality"] == "HIGH"
+        assert load_config()["quality"] == "MEDIUM"
 
 
 class TestCacheMigrationV2:
@@ -205,7 +250,7 @@ class TestCacheMigrationV2:
         config_file.write_text(json.dumps(
             {"version": 1, "quality": "LOW", "cache_mode": "FULL", "cache_budget_mb": 512}))
         cfg = load_config()
-        assert cfg["quality"] == "HIGH"  # v1 rename still applies
+        assert cfg["quality"] == "MEDIUM"  # the v1 and v5 renames still apply
         assert cfg["cache_songs"] is True
         assert cfg["cache_budget_gb"] == 1
 
@@ -265,7 +310,7 @@ class TestBarWidthMigrationV3:
         config_file.write_text(json.dumps(
             {"version": 1, "quality": "LOW", "progress_bar_width": 96}))
         cfg = load_config()
-        assert cfg["quality"] == "HIGH"
+        assert cfg["quality"] == "MEDIUM"  # the v1+v5 rename chain rides along
         assert cfg["progress_bar_max"] == 96
 
 
@@ -290,7 +335,7 @@ class TestVolumeSurvivesLeavingThePage:
     def test_a_file_written_before_the_move_still_loads(self, config_file):
         """The whole v3 record, exactly as the last release wrote it."""
         config_file.write_text(json.dumps({
-            "version": 3, "quality": "HIRES", "page_size": 20,
+            "version": 3, "quality": "MAX", "page_size": 20,
             "progress_bar_width": 64, "volume": 120, "show_artwork": False,
             "cache_metadata": True, "cache_songs": True, "cache_budget_gb": 4,
         }))
@@ -298,7 +343,7 @@ class TestVolumeSurvivesLeavingThePage:
         assert cfg["volume"] == 120
         assert cfg["progress_bar_max"] == 64
         assert cfg["page_size"] == 20
-        assert cfg["quality"] == "HIRES"
+        assert cfg["quality"] == "MAX"
         assert cfg["cache_budget_gb"] == 4
 
     def test_the_page_no_longer_lists_it_but_the_spec_still_holds_it(self):
@@ -354,9 +399,9 @@ class TestQualityTiers:
 
 class TestSaveLoadRoundTrip:
     def test_round_trip(self, config_file):
-        save_config({"quality": "HIRES", "page_size": 25, "progress_bar_max": 80})
+        save_config({"quality": "MAX", "page_size": 25, "progress_bar_max": 80})
         cfg = load_config()
-        assert cfg["quality"] == "HIRES"
+        assert cfg["quality"] == "MAX"
         assert cfg["page_size"] == 25
         assert cfg["progress_bar_max"] == 80
 
@@ -413,7 +458,7 @@ class TestCoerce:
         assert coerce(get_spec("page_size"), True) == DEFAULTS["page_size"]
 
     def test_choice_is_case_insensitive(self):
-        assert coerce(get_spec("quality"), "hires") == "HIRES"
+        assert coerce(get_spec("quality"), "max") == "MAX"
 
     def test_unknown_choice_falls_back(self):
         assert coerce(get_spec("quality"), "MP3") == DEFAULTS["quality"]
@@ -422,15 +467,15 @@ class TestCoerce:
 class TestCycleValue:
     def test_choice_wraps_forward(self):
         spec = get_spec("quality")
-        assert cycle_value(spec, "HIRES", 1) == "LOW"
+        assert cycle_value(spec, "MAX", 1) == "LOW"
 
     def test_choice_wraps_backward(self):
         spec = get_spec("quality")
-        assert cycle_value(spec, "LOW", -1) == "HIRES"
+        assert cycle_value(spec, "LOW", -1) == "MAX"
 
     def test_choice_steps_in_spec_order(self):
         spec = get_spec("quality")
-        assert cycle_value(spec, "LOW", 1) == "HIGH"
+        assert cycle_value(spec, "LOW", 1) == "MEDIUM"
 
     def test_every_choice_setting_wraps_at_both_ends(self):
         """Choices are a ring: → off the last lands on the first, and back."""
@@ -492,25 +537,25 @@ class TestSettingsKeyHandler:
     def test_quality_cycles_and_wraps(self, config_file):
         p = self._player()
         p._settings_cursor = 0  # quality row
-        assert p.config["quality"] == "LOSSLESS"
+        assert p.config["quality"] == "HIGH"
         p._handle_settings_key(player_mod.KEY_RIGHT)
-        assert p.config["quality"] == "HIRES"
+        assert p.config["quality"] == "MAX"
         p._handle_settings_key(player_mod.KEY_RIGHT)
         assert p.config["quality"] == "LOW"  # wrapped past the last value
         p._handle_settings_key(player_mod.KEY_RIGHT)
-        assert p.config["quality"] == "HIGH"
+        assert p.config["quality"] == "MEDIUM"
         p._handle_settings_key(player_mod.KEY_LEFT)
         assert p.config["quality"] == "LOW"
         p._handle_settings_key(player_mod.KEY_LEFT)
-        assert p.config["quality"] == "HIRES"  # wrapped past the first value
+        assert p.config["quality"] == "MAX"  # wrapped past the first value
 
     def test_quality_change_applies_live(self, config_file):
         import tidalapi
 
         p = self._player()
         p._settings_cursor = 0
-        p._handle_settings_key(player_mod.KEY_LEFT)  # LOSSLESS → HIGH
-        assert p._quality_name == "HIGH"
+        p._handle_settings_key(player_mod.KEY_LEFT)  # HIGH → MEDIUM
+        assert p._quality_name == "MEDIUM"
         assert p.session.audio_quality == tidalapi.Quality.low_320k
 
     def test_page_size_change_applies_live_and_saves(self, config_file):
@@ -653,7 +698,7 @@ class TestNumericEntry:
         p = self._player("quality")
         self._type(p, "3")
         assert p._settings_edit is None
-        assert p.config["quality"] == "LOSSLESS"
+        assert p.config["quality"] == "HIGH"
 
     def test_arrows_still_step_when_not_typing(self, config_file):
         p = self._player()
@@ -940,15 +985,15 @@ class TestConfiguredValuesUsed:
     def test_configured_quality_used_when_flag_omitted(self, config_file):
         import tidalapi
 
-        save_config({**DEFAULTS, "quality": "HIRES"})
+        save_config({**DEFAULTS, "quality": "MAX"})
         p = HeadlessTidalPlayer()
-        assert p._quality_name == "HIRES"
+        assert p._quality_name == "MAX"
         assert p.session.audio_quality == tidalapi.Quality.hi_res_lossless
 
     def test_flag_overrides_config_without_saving_it(self, config_file):
         save_config({**DEFAULTS, "quality": "LOW"})
-        p = HeadlessTidalPlayer(quality="hires")
-        assert p._quality_name == "HIRES"
+        p = HeadlessTidalPlayer(quality="max")
+        assert p._quality_name == "MAX"
         assert p.config["quality"] == "LOW"  # saved default untouched
         assert json.loads(config_file.read_text())["quality"] == "LOW"
 
@@ -970,9 +1015,9 @@ class TestCLIQuality:
 
     def test_explicit_quality_is_passed_through(self, monkeypatch):
         seen = self._patch_player(monkeypatch)
-        result = CliRunner().invoke(cli_mod.cli, ["--quality", "HIRES"])
+        result = CliRunner().invoke(cli_mod.cli, ["--quality", "MAX"])
         assert result.exit_code == 0
-        assert seen["quality"] == "HIRES"
+        assert seen["quality"] == "MAX"
         assert seen["ran"] is True
 
     def test_omitted_quality_defers_to_config(self, monkeypatch):
@@ -981,9 +1026,29 @@ class TestCLIQuality:
         assert result.exit_code == 0
         assert seen["quality"] is None  # player falls back to config.json
 
+    def test_the_old_spellings_still_work(self, monkeypatch):
+        """The pre-rename names keep doing what they always did — corrected
+        to the new name out loud, never rejected."""
+        for legacy, now in (("LOSSLESS", "HIGH"), ("hires", "MAX")):
+            seen = self._patch_player(monkeypatch)
+            result = CliRunner().invoke(cli_mod.cli, ["--quality", legacy])
+            assert result.exit_code == 0
+            assert seen["quality"] == now
+            assert f"--quality {now}" in result.output
+
+    def test_high_says_what_it_means_now(self, monkeypatch):
+        """"HIGH" changed meaning (320k AAC → 16-bit FLAC). It is accepted
+        with the new meaning, and says so — an old script that meant AAC
+        must be told it is now getting FLAC, not silently upgraded."""
+        seen = self._patch_player(monkeypatch)
+        result = CliRunner().invoke(cli_mod.cli, ["--quality", "HIGH"])
+        assert result.exit_code == 0
+        assert seen["quality"] == "HIGH"
+        assert "MEDIUM" in result.output
+
     def test_help_still_lists_choices(self):
         result = CliRunner().invoke(cli_mod.cli, ["--help"])
         assert result.exit_code == 0
         # click renders a case-insensitive Choice lowercased
-        for choice in ("low", "high", "lossless", "hires"):
+        for choice in ("low", "medium", "high", "max"):
             assert choice in result.output.lower()

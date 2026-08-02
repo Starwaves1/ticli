@@ -727,7 +727,7 @@ class TestTheVolumeOverlayAndTheDownloadBox:
     def test_a_running_job_keeps_its_progress_on_the_box(self):
         p = self._player()
         p._handle_key("d")
-        p._download_job = {"state": "running", "tier": "LOSSLESS", "track_id": 1,
+        p._download_job = {"state": "running", "tier": "HIGH", "track_id": 1,
                            "done": 1024, "total": 4096}
         text = "".join(row.plain for row in
                        p._build_download_overlay(player_mod.ROOMY_FIT))
