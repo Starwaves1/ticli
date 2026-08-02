@@ -877,9 +877,12 @@ class _PacedRun:
       verdict is always in before the next one is resolved.
     * **Lock-free.** Workers only ever append to `results` and write their own
       slot; this thread is the only reader of the tally and the only writer of
-      anything shared. `records` is drained here rather than in the workers
-      for the same reason — a read-modify-write of the download index from
-      three threads at once would lose rows.
+      anything shared. `records` is still drained here alone, but for
+      ordering and simplicity, not as the defence: the download index holds
+      `downloads._index_lock` across its whole load-modify-save cycle — it
+      has to, the UI thread's [x] delete overlaps a run no matter what this
+      thread does — so the lock is the guarantee, and this thread just keeps
+      commits in landing order and off the fetch workers.
     """
 
     def __init__(self, items, resolve, fetch, alive, report,
@@ -2745,13 +2748,25 @@ class HeadlessTidalPlayer:
         data = self._read_state_dict()
         if not data:
             return
-        self._search_history = data.get("search_history", [])[:200]
+        # Same "corrupt → defaults" contract as the fields below: a history
+        # that is not a list reads as empty, and non-str elements of one are
+        # dropped — either shape used to crash here (the slice) or on the
+        # search screen. The write side stays a plain [:200] of what memory
+        # holds, which this guarantees is a list of strings.
+        history = data.get("search_history", [])
+        if not isinstance(history, list):
+            history = []
+        self._search_history = [h for h in history if isinstance(h, str)][:200]
         self._last_playlist_id = data.get("last_playlist_id") or None
         track_ids = data.get("track_ids", [])
         # Sanitized here because the record path below runs synchronously —
         # unlike the legacy thread there is no catch-all around it, and the
         # contract since the non-dict incident is "corrupt → defaults, never
-        # raises". Wrong types read as their defaults, same as absent.
+        # raises". Wrong types read as their defaults, same as absent. The
+        # *record fields* honor the same contract one layer down, in the
+        # CachedTrack/CachedPlaylist constructors themselves, because the
+        # metadata cache builds the same shims from the same record shape —
+        # only the state file's own scalars are this reader's to check.
         queue_index = data.get("queue_index", 0)
         if not isinstance(queue_index, int):
             queue_index = 0

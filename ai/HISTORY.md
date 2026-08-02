@@ -1102,6 +1102,84 @@ splitting one exact unlink from its row's removal is what a torn delete
 looks like). WORKING-RULES' precedent list now names `_index_lock` alongside
 its two siblings. 1423 in the suite.
 
+### The record shims now deliver the "corrupt → defaults" contract they claimed
+
+Adversarial verification of the record-shaped restore (4dfaee2) reproduced a
+hole in its stated contract. The restore's comment promised "corrupt →
+defaults, never raises", but the sanitization only covered the state file's
+own scalars (`queue_index`, `position`) and the dict-with-id row guard — the
+record's *fields* were passed to `CachedTrack` raw, and two corrupt shapes
+hard-crashed the app:
+
+- `tracks=[{"id": 1, "duration": 200, "artists": 5}]` — `TypeError: 'int'
+  object is not iterable` iterating `artists` inside `CachedTrack.__init__`,
+  synchronously inside `run()` with no catch-all: the app cannot start.
+- `tracks=[{"id": 1, "name": "Track 1", "duration": "long"}]` — the restore
+  "succeeds", but the corrupt string rides the shim and the **first frame**
+  crashes instead (`duration > 0` in `_build_progress_line`; `_seek_by`
+  identically). The branch's own corrupt-fields test blessed exactly this
+  fixture, asserting only that `_restore_state` does not raise — the crash
+  had moved downstream, not gone.
+
+What makes both must-fix rather than edge-case: the corrupt file *persists*.
+Neither path deletes or rewrites it before crashing, so it is not one crash,
+it is a crash at every launch until someone deletes the file by hand.
+
+The fix landed at the **shim layer** — `CachedTrack.__init__` and
+`CachedPlaylist.__init__` now guarantee every field its documented type
+(`name` non-empty str else "?", `duration`/`num_tracks` int-or-float-not-bool
+else 0, `artists` only the non-empty str elements of a list — a number in an
+artists list is corruption, not an artist, so it is dropped, never
+stringified — `album`/`creator` non-empty str → `_Named` else None, `id`
+verbatim since it is only compared and resolved, and a non-dict record reads
+as all defaults). **Rejected: sanitizing in `_restore_state` only.** The
+metadata cache builds the same shims from the same record shape out of
+`metadata.json` and had the same exposure; a per-caller copy of the contract
+is how one goes missing (INCIDENTS #6, and 530adf4's own commit message:
+"three copies of the contract is how one of them went missing"). One place
+both consumers import. The restore's dict-with-id row guard is untouched —
+rows without an id still fall back to the id fetch.
+
+`search_history` had a pre-existing hole of the same class, reproduced too:
+530adf4's guarded reader still sliced before checking shape, so
+`{"search_history": {"not": "alist"}}` raised `TypeError: unhashable type
+'slice'` at every launch. A non-list history now reads as `[]` and non-str
+elements of a list are dropped, before the `[:200]`; the write side is
+unchanged (it slices what memory holds, now guaranteed a list of strings).
+
+An honest note for the record: 4dfaee2's hardening claim was narrower than
+its wording. "The fields it does arithmetic on are type-checked and read as
+their defaults" was true of the scalars it named and untrue of the record's
+own fields — which are also "fields it does arithmetic on", one frame later.
+
+Also corrected in this commit, both found in the same verification pass:
+`_PacedRun`'s "Lock-free" bullet still claimed the single drain thread was
+what stopped concurrent index writes losing rows — false since f9a38e8,
+whose commit updated the two sibling comments but missed this one; it now
+says what `_flush`'s does (the lock is the guarantee, the thread keeps
+commits ordered and off the fetch workers). And WORKING-RULES' amended lock
+rule overstated its lock-free half — shared in-memory reads are not "never"
+locked: `_reclaim_deferred` (3cd3720) is an in-place-mutated set and locks
+every touch, reads included. The rule now states the real convention —
+whole-object-replaced state reads lock-free; state that must be mutated in
+place is locked on every touch — with the reclaim set named as precedent.
+
+18 tests. In test_cache.py, field-by-field coercion asserting the resulting
+values and types, never just "no raise": artists 5 and `[5, "X", ""]`,
+duration "long" and True (bool passes `isinstance(int)` and must still read
+0), name 5, album 7, nested junk, non-dict records, and the playlist
+siblings. In test_resume.py, the corrupt-record test now pins the whole
+journey for both evidence fixtures — restore → shims carry typed defaults →
+the real `_build_player_display` renders ("--:--" for the unknown duration,
+"?" for the absent name) → a following `_save_state` writes the sanitized
+bytes, asserted against the file, so the corrupt file heals instead of
+crashing every future launch — plus the search-history shapes (dict, int,
+list with junk elements → the str-only list, capped at 200). Verified red
+first with the src change stashed at f9a38e8: artists=5 fails with the exact
+TypeError inside `CachedTrack`, the dict history with the unhashable-slice
+TypeError, duration "long" rides the shim uncoerced and the display builder
+crash was reproduced directly. 1441 in the suite (before the merge with the
+tier-renaming work below; the merged suite's count is in ai/README.md).
 
 ---
 

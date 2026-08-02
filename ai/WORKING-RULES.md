@@ -49,11 +49,16 @@ rewritten to remove ffmpeg entirely.
   cause of input lag; `get_url()` on the UI thread froze the interface on
   every track start.
 - **Daemon threads only.**
-- **Reads are lock-free. GIL-reliant.** Assign whole objects; never mutate a
-  shared list in place. A reader then sees some generation of the object (or
-  of a whole-replaced file), never a torn one — never put a lock in front of
-  a shared in-memory read. This half of the old blanket "no locks" rule is
-  still absolute.
+- **Reads of whole-object-replaced state are lock-free. GIL-reliant.**
+  Assign whole objects; a reader then sees some generation of the object (or
+  of a whole-replaced file), never a torn one, and needs no lock. State that
+  *must* be mutated in place is the other case, and it is locked on every
+  touch, reads included — the precedent is the reclaim set
+  (`_reclaim_deferred` under `_reclaim_lock`, 2026-07-27): a set added to
+  and discarded from by several threads cannot be whole-replaced without
+  losing another thread's element, so nothing about it is safe to read bare.
+  Prefer whole-object replacement wherever it fits; when it cannot, don't
+  half-lock.
 - **A multi-writer load-modify-save cycle over one on-disk JSON file is the
   exception: it gets a leaf lock.** Whole-object assignment cannot stop two
   threads' read-edit-write cycles over the same file from erasing each

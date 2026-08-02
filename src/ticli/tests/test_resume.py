@@ -534,7 +534,13 @@ class TestRecordRestore:
     def test_corrupt_fields_in_a_record_file_read_as_defaults_not_a_crash(self, tmp_path, monkeypatch):
         """The record path runs before the UI loop starts, with no thread and
         no catch-all around it, so a corrupt machine-written field must read
-        as its default — the contract the non-dict state file fix set."""
+        as its default — the contract the non-dict state file fix set. "Not a
+        crash" has to mean the whole journey, not just this call: a corrupt
+        value that merely rides along on the shim crashes the first frame
+        instead, and the corrupt file persists, so it crashes every launch.
+        The shim must carry the typed default, the real display builder must
+        render, and the next save must write the sanitized values back —
+        healing the file rather than re-reading the corruption forever."""
         state_file = self._patch_state_paths(monkeypatch, tmp_path)
         self._write_record_state(
             state_file, queue_index="two", position="half way",
@@ -547,6 +553,53 @@ class TestRecordRestore:
         assert p._queue_index == 0
         assert p._play_offset == 0
         assert p.session.track_calls == 0
+        # The shim carries the typed default, not the corruption
+        assert p._current_track.duration == 0
+        assert p._current_track.name == "Track 1"
+        assert p._current_track.artists == []
+
+        # The first frame renders — this is what the old "no raise on
+        # restore" assertion missed: duration "long" crashed
+        # _build_progress_line's `duration > 0` on every paint
+        frame = p._build_player_display()
+        assert "Track 1" in frame.plain
+        assert "--:--" in frame.plain  # an unknown duration, shown honestly
+
+        # And the next autosave heals the file: sanitized bytes on disk, so
+        # the next launch reads clean values instead of crashing again
+        p._save_state()
+        saved = json.loads(state_file.read_text())
+        assert saved["tracks"] == [{"id": 1, "name": "Track 1", "duration": 0,
+                                    "artists": [], "album": None}]
+        assert saved["track_ids"] == [1]
+
+    def test_a_corrupt_artists_field_neither_crashes_the_restore_nor_the_frame(self, tmp_path, monkeypatch):
+        """artists=5 crashed _restore_state itself — a TypeError iterating an
+        int inside CachedTrack, synchronously inside run() with nothing to
+        catch it, at every launch for as long as the file stayed on disk."""
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        self._write_record_state(
+            state_file, ids=(1,), queue_index=0,
+            tracks=[{"id": 1, "duration": 200, "artists": 5}])
+
+        p = self._player()
+        p._restore_state()  # must not raise
+
+        assert [t.id for t in p._queue] == [1]
+        assert p.session.track_calls == 0
+        assert p._current_track.name == "?"  # absent name, honest placeholder
+        assert p._current_track.duration == 200  # the good field survives
+        assert p._current_track.artists == []
+        assert p._play_offset == 42.5  # a real duration still clamps normally
+
+        frame = p._build_player_display()
+        assert "?" in frame.plain
+        assert "3:20" in frame.plain  # the intact duration still renders
+
+        p._save_state()
+        saved = json.loads(state_file.read_text())
+        assert saved["tracks"] == [{"id": 1, "name": "?", "duration": 200,
+                                    "artists": [], "album": None}]
 
     def test_a_record_file_with_a_rowless_dict_falls_back_to_the_ids(self, tmp_path, monkeypatch):
         """A "tracks" entry that is not usable (a row without an id) must not
@@ -660,6 +713,54 @@ class TestRecordRoundTrip:
         assert second["track_ids"] == first["track_ids"]
         assert second["queue_index"] == first["queue_index"]
         assert fresh.session.track_calls == 0
+
+
+class TestCorruptSearchHistory:
+    """search_history is machine-written JSON with the same exposure as the
+    records: _restore_state sliced it ([:200]) before checking its shape, so
+    a history that was not a list crashed startup — synchronously, at every
+    launch, for as long as the corrupt file stayed on disk. The contract is
+    the same as everywhere else: corrupt reads as its default, and non-str
+    elements are dropped rather than riding into the search screen. The
+    write side is untouched — it slices what memory holds, which this
+    guarantees is a list of strings."""
+
+    def _patch_state_paths(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(player_mod, "STATE_DIR", tmp_path)
+        state_file = tmp_path / "player_state.json"
+        monkeypatch.setattr(player_mod, "STATE_FILE", state_file)
+        return state_file
+
+    def _restore_over(self, state_file, history):
+        state_file.write_text(json.dumps(
+            {"search_history": history, "track_ids": []}))
+        p = HeadlessTidalPlayer()
+        p.session = _CountingSession([_fake_track(1)])
+        p._restore_state()  # must not raise
+        assert p.session.track_calls == 0
+        return p
+
+    def test_a_dict_history_reads_as_empty_not_a_crash(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        # Used to raise TypeError: unhashable type 'slice' — {}[:200]
+        p = self._restore_over(state_file, {"not": "alist"})
+        assert p._search_history == []
+
+    def test_an_int_history_reads_as_empty_not_a_crash(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        p = self._restore_over(state_file, 5)
+        assert p._search_history == []
+
+    def test_non_string_elements_are_dropped_the_strings_kept(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        p = self._restore_over(
+            state_file, [5, "abba", None, ["x"], "b side", {"q": 1}])
+        assert p._search_history == ["abba", "b side"]
+
+    def test_the_two_hundred_entry_cap_still_holds(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        p = self._restore_over(state_file, [f"query {i}" for i in range(250)])
+        assert p._search_history == [f"query {i}" for i in range(200)]
 
 
 class TestLegacyRestoreIsFrugal:
