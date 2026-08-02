@@ -16,6 +16,7 @@ import pytest
 from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
 from ticli.utils import config as config_mod
+from ticli.utils.cache import CachedTrack
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +154,26 @@ class TestRadioDoesNotRestartTheSong:
 
         assert streams == []
         assert current.radio_calls == 1
+
+
+class TestRadioFromARestoredShim:
+    def test_radio_on_a_record_restored_track_resolves_it_first(self):
+        """A session restored from saved records leaves the current track as
+        a cached shim until it is played, and a shim has no get_track_radio —
+        [r] must resolve it through the session, not die on it."""
+        real = _FakeTrack(1, radio=_mix())
+        shim = CachedTrack({"id": 1, "name": "Track 1", "duration": 200,
+                            "artists": []})
+        p = _make_player(current=shim, queue=[shim, _FakeTrack(2)],
+                         playing=False)
+        p.session = types.SimpleNamespace(track=lambda tid: real)
+
+        p._start_track_radio()
+        _settled(p)
+
+        assert real.radio_calls == 1
+        assert [t.id for t in p._queue] == [1, 100, 101, 102]
+        assert p._queue[0] is shim  # the restored row itself is untouched
 
 
 class TestQueueAfterRadio:

@@ -27,7 +27,11 @@ Last updated: 2026-07-24 (initial brainstorm with Garrett).
       state autosaves every 10s (crash-safe); restore fetches current track
       first so it appears before the rest of the queue loads; restore never
       clobbers playback the user starts in the meantime. Tests in
-      `src/ticli/tests/test_resume.py`. Also fixed: ffplay fresh-play-with-seek
+      `src/ticli/tests/test_resume.py`. (2026-08-02: the state file now also
+      carries flattened track records, and restoring from them costs **zero**
+      requests — the fetch-per-id behavior described here survives only as
+      the legacy path for pre-upgrade files, now paced and stop-on-429. See
+      HISTORY.) Also fixed: ffplay fresh-play-with-seek
       used the just-started (empty) cache file — now seeks the URL directly.
    2. Add-to-playlist — **BUILT 2026-07-24, awaiting Garrett's testing.**
       `y` key in player/queue/browse opens a picker of editable playlists

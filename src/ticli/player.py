@@ -404,6 +404,7 @@ from ticli.utils.cache import (
     MetadataCache,
     format_gb,
     is_owned_audio,
+    track_record,
 )
 from ticli.utils import artwork, downloads, tags
 
@@ -590,6 +591,14 @@ def _rough_minutes(tracks: int) -> str:
 def _looks_rate_limited(message: str) -> bool:
     lowered = (message or "").lower()
     return any(sign in lowered for sign in RATE_LIMIT_SIGNS)
+
+
+def _restore_sleep(seconds: float) -> None:
+    """The legacy restore's one pacing sleep — the wait that keeps its
+    fetches at least REFETCH_MIN_INTERVAL apart. A module function rather
+    than an inline `time.sleep` so a test can replace the wait and still
+    prove the floor was asked for; it holds no state to leak between tests."""
+    time.sleep(seconds)
 
 # Ascending, so "did TIDAL give us less than we asked for?" is a comparison.
 # Keys are tidalapi's own Quality values, which is what a Stream reports back
@@ -2599,13 +2608,20 @@ class HeadlessTidalPlayer:
             self._merge_position_into_saved_state()
             return
         try:
-            track_ids = [t.id for t in self._queue]
+            queue = self._queue
             queue_index = self._queue_index
-            if not track_ids and self._current_track is not None:
-                track_ids = [self._current_track.id]
+            if not queue and self._current_track is not None:
+                queue = [self._current_track]
                 queue_index = 0
             state = {
-                "track_ids": track_ids,
+                # Kept even though "tracks" carries strictly more: the ids
+                # are what every pre-record build reads, so a downgrade still
+                # resumes. "tracks" is the same record shape the metadata
+                # cache stores — flattened through track_record, which reads
+                # tidalapi Tracks and restored CachedTrack shims alike, so a
+                # save straight after a restore loses nothing.
+                "track_ids": [t.id for t in queue],
+                "tracks": [track_record(t) for t in queue],
                 "queue_index": queue_index,
                 "position": self._get_position(),
                 "search_history": self._search_history[:200],
@@ -2636,30 +2652,100 @@ class HeadlessTidalPlayer:
         self._save_state()
 
     def _restore_state(self):
-        """Restore queue and search history from previous session."""
+        """Restore queue and search history from previous session.
+
+        Two formats, one file. A file this build wrote carries "tracks" —
+        the record shape the metadata cache stores — and restores with **zero
+        network requests**: the queue is built from `CachedTrack` shims, and
+        `_play_track`'s existing `_resolve_track` swap fetches the real track
+        lazily, one request, when a track is actually played. Restoring a
+        whole saved playlist used to spend one `session.track()` per id at
+        every launch, serially and unpaced — the burst shape of ai/INCIDENTS
+        #1, in production. The record path is synchronous on purpose: run()
+        calls this before the UI loop starts, the attach cannot fail, so full
+        saves stay enabled and no `_restore_pending` latch is needed.
+
+        A file with only "track_ids" — every pre-upgrade file — still fetches
+        on a daemon thread, but frugally: paced to REFETCH_MIN_INTERVAL
+        between request starts, stood down quietly if the user moves on, and
+        ended outright — no attach, latch left set, a toast saying so — on
+        any sign TIDAL is rate-limiting. The legacy path retires itself: the
+        first full save of the session writes records next to the ids.
+        """
         data = self._read_state_dict()
         if not data:
             return
         self._search_history = data.get("search_history", [])[:200]
         self._last_playlist_id = data.get("last_playlist_id") or None
         track_ids = data.get("track_ids", [])
+        # Sanitized here because the record path below runs synchronously —
+        # unlike the legacy thread there is no catch-all around it, and the
+        # contract since the non-dict incident is "corrupt → defaults, never
+        # raises". Wrong types read as their defaults, same as absent.
         queue_index = data.get("queue_index", 0)
+        if not isinstance(queue_index, int):
+            queue_index = 0
         position = data.get("position", 0) or 0
+        if not isinstance(position, (int, float)):
+            position = 0
+
+        records = data.get("tracks")
+        if (isinstance(records, list) and records
+                and all(isinstance(r, dict) and r.get("id") is not None
+                        for r in records)):
+            tracks = [CachedTrack(r) for r in records]
+            idx = min(max(queue_index, 0), len(tracks) - 1)
+            current = tracks[idx]
+            # Same clamp as ever: a position at the very end restarts from
+            # 0:00 rather than seeking past EOF, and never autoplay
+            duration = current.duration if isinstance(
+                current.duration, (int, float)) else 0
+            if 1 <= position < duration - 2:
+                self._play_offset = position
+            self._queue = tracks
+            self._queue_index = idx
+            self._current_track = current
+            return
+
         if not track_ids:
             return
 
         self._restore_pending = True
 
         def _run():
+            blocked = ""
+            abandoned = False
+            last_start = None
+
+            def _fetch(tid):
+                """One paced fetch, or None. The floor sits between request
+                *starts*, so a run of instant failures cannot burst either.
+                Flags rather than raises: `abandoned` when the user moved on
+                while we waited, `blocked` on any sign TIDAL is refusing —
+                and a plain failure just drops the track, as it always has."""
+                nonlocal blocked, abandoned, last_start
+                if last_start is not None:
+                    remaining = REFETCH_MIN_INTERVAL - (time.monotonic() - last_start)
+                    if remaining > 0:
+                        _restore_sleep(remaining)
+                if not (self.running and self._restore_pending):
+                    abandoned = True
+                    return None
+                last_start = time.monotonic()
+                try:
+                    return self.session.track(tid)
+                except Exception as e:
+                    if _looks_rate_limited(str(e)):
+                        blocked = str(e)[:PLAYER_ERROR_CHARS]
+                    else:
+                        logger.debug("Could not restore track %s: %s", tid, e)
+                    return None
+
             try:
                 # Fetch the current track first so it appears immediately,
                 # paused at its saved position, before the rest of the queue loads
                 idx = min(max(queue_index, 0), len(track_ids) - 1)
-                current = None
-                try:
-                    current = self.session.track(track_ids[idx])
-                except Exception:
-                    pass
+                current = _fetch(track_ids[idx])
                 if current is not None and not self._playing and self._current_track is None:
                     duration = getattr(current, "duration", 0) or 0
                     if 1 <= position < duration - 2:
@@ -2668,15 +2754,32 @@ class HeadlessTidalPlayer:
 
                 tracks = []
                 for i, tid in enumerate(track_ids):
-                    if i == idx and current is not None:
-                        tracks.append(current)
+                    if i == idx:
+                        if current is not None:
+                            tracks.append(current)
                         continue
-                    try:
-                        t = self.session.track(tid)
-                        if t:
-                            tracks.append(t)
-                    except Exception:
-                        pass
+                    if blocked or abandoned:
+                        break
+                    t = _fetch(tid)
+                    if t is not None:
+                        tracks.append(t)
+                if blocked:
+                    # Stop entirely and report — never retry (WORKING-RULES:
+                    # retries are what turned a rate limit into an edge
+                    # block). No attach either: the latch stays set, full
+                    # saves stay suppressed, and the file keeps the whole
+                    # queue for a launch when TIDAL is willing again.
+                    self._set_toast(
+                        "TIDAL is rate-limiting — restore stopped. "
+                        "Nothing will be retried.",
+                        seconds=PLAYER_ERROR_SECONDS)
+                    self._wake()
+                    return
+                if abandoned:
+                    # The user moved on (or the app is quitting): whatever
+                    # was fetched must not attach — a partial queue landing
+                    # now could be saved over the whole one on disk.
+                    return
                 # Don't clobber anything the user started while we were loading
                 # (playing the restored track itself is fine — attach its queue)
                 # `_restore_pending` is also the claim on the queue: anything
@@ -3195,7 +3298,14 @@ class HeadlessTidalPlayer:
         def _run():
             tracks = None
             try:
-                tracks = track.get_track_radio(limit=RADIO_LIMIT)
+                # The current track can still be a cached shim — restored
+                # from a saved record, or a cached row in its first second —
+                # and a shim has no get_track_radio. Resolve it first, the
+                # same swap _play_track does; one extra request, only ever
+                # on a track that has not been played yet.
+                real = self._resolve_track(track)
+                if real is not None:
+                    tracks = real.get_track_radio(limit=RADIO_LIMIT)
             except Exception as e:
                 logger.debug("Track radio failed: %s", e)
             finally:
