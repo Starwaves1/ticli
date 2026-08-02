@@ -185,7 +185,8 @@ class TestPlayAllDownloadsTheWholeThing:
         p._handle_key("d")
         lines = _box_text(p).splitlines()
         assert "Get Lucky" in lines[1] and "Daft Punk" in lines[1]
-        assert "~7.6 MB" in lines[2]
+        estimate = downloads.estimate_bytes(_track().duration, "HIGH")
+        assert f"~{downloads.format_bytes(estimate)}" in lines[2]
         assert "HIGH" in lines[3]
         assert "[Enter] download" in lines[4]
 
@@ -216,13 +217,13 @@ class TestTheBulkEstimateCostsNothing:
         p._download_tracks = [_track(1, duration=100), _track(2, duration=200)]
         p._download_track = p._download_tracks[0]
         p._download_label = "Two"
+        p._download_cursor = QUALITY_CHOICES.index("MEDIUM")
+        medium = _box_text(p)
         p._download_cursor = QUALITY_CHOICES.index("HIGH")
         high = _box_text(p)
-        p._download_cursor = QUALITY_CHOICES.index("LOSSLESS")
-        lossless = _box_text(p)
-        assert high != lossless, "the number did not follow the tier"
+        assert medium != high, "the number did not follow the tier"
         assert downloads.format_bytes(
-            p._download_bulk_estimate("LOSSLESS")) in lossless
+            p._download_bulk_estimate("HIGH")) in high
 
     def test_every_size_still_carries_the_estimate_mark(self):
         p = _player()
@@ -349,7 +350,7 @@ class TestABlockStopsTheWholeRun:
             _counting(tracks, calls, fail=lambda tid: (_ for _ in ()).throw(
                 RuntimeError("401 subStatus 4006 Session does not have"
                              " streaming privileges")))
-            assert _bulk(p, tier="HIRES")["state"] == "blocked"
+            assert _bulk(p, tier="MAX")["state"] == "blocked"
             assert calls == [1], calls
         finally:
             server.close()

@@ -1,7 +1,8 @@
 # Ticli — Design Decisions & Roadmap
 
-Project memory for AI-assisted development. Not committed (ai/ is gitignored).
-Last updated: 2026-07-24 (initial brainstorm with Garrett).
+Project memory for AI-assisted development. (Tracked in git since 1927cab —
+an earlier note here claimed ai/ was gitignored, which is no longer true.)
+Last updated: 2026-08-02.
 
 ## Product goals
 
@@ -271,6 +272,35 @@ recorded). Under "never display a value that isn't real", a badge reading
 HI-RES over a LOSSLESS download is the same class of lie as a quality menu
 offering tiers TIDAL never served. Status line only — no toast, because it is
 true for every track of a downloaded album — and no setting.
+
+## Quality tiers are named TIDAL's way (Garrett, 2026-08-02 — locked, built)
+
+From a screenshot of the official app's quality screen: **ticli's tier names
+match TIDAL's player** — Low / High / Max — **with the 320k AAC rung surfaced
+as MEDIUM** (the app files it under Low's bitrate dropdown without naming it;
+"Set 320k to medium" is his wording). Built 2026-08-02: `LOW / MEDIUM / HIGH /
+MAX` across settings, CLI, badges and the download picker; config v5
+migration renames saved values (the v1 precedent, reused); `LOSSLESS`/`HIRES`
+live on as CLI aliases; `--quality HIGH` — the one spelling that changed
+meaning — announces its new meaning on stderr each use.
+
+Sub-decision, initially made without him as tier-name badges, **overturned by
+Garrett the same day**: *"I'd like formats even if sometimes it falls back to
+a slightly different quality."* The badge is now the stream format —
+`96k AAC / 320k AAC / 16/44.1 FLAC / 24/192 FLAC` — with the overclaim risk
+on MAX (a nominal 24/192 label over a master that is really 24/48) accepted
+by him explicitly. `QUALITY_LABELS` in player.py is the single seam, and the
+settings ladder shows the format beside each tier name again (70 columns for
+all four, still inside the page's 80-column budget).
+
+## The README documents mpv only (Garrett, 2026-08-02)
+
+*"MPV pog yes. Dropped ff"* — both READMEs now name mpv as the player and
+requirement; ffmpeg/ffplay no longer appear in install, requirements or the
+diagram. **The ffplay fallback is still in the code** (`AUDIO_PLAYERS`,
+volume clamping, seek-by-respawn, its tests): removing it is real surgery and
+was not asked for. Open question: delete the ffplay path, or keep it as the
+undocumented zero-install fallback?
 
 ## Settings page at small sizes (Garrett, 2026-07-26 — locked)
 

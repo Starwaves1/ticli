@@ -389,6 +389,7 @@ HIDE_HINT_RANK = 9
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
     QUALITY_CHOICES,
+    QUALITY_V4_RENAMES,
     SETTINGS_ROWS,
     coerce,
     cycle_value,
@@ -484,7 +485,7 @@ PREFETCH_MAX_AGE = 90
 # Login flows. "device" is the default: a code you type on your phone, nothing
 # to paste back, and it is what every saved session already used. Only "pkce"
 # can reach FLAC, though — the device flow's TIDAL client is entitled to AAC
-# and no more, and TIDAL answers its LOSSLESS requests with HIGH rather than
+# and no more, and TIDAL answers its FLAC requests with 320k AAC rather than
 # with an error. So PKCE is offered as a deliberate upgrade from the settings
 # page (or asked for up front with --login-flow pkce), never chosen for you.
 LOGIN_FLOWS = ("device", "pkce")
@@ -1915,15 +1916,18 @@ class HeadlessTidalPlayer:
         "suggestions": "Failed to load suggestions",
     }
 
-    # Setting name → tidalapi quality, and the terse badge shown on the player.
-    # One name per tidalapi tier, same spelling as tidalapi uses, so the setting
-    # name, the badge and the bytes TIDAL sends can never disagree. (Older
-    # configs named every tier one step low; utils.config migrates them.)
+    # Setting name → tidalapi quality. The names are TIDAL's own player's
+    # (Low / Medium / High / Max), which is *not* tidalapi's spelling — this
+    # dict is the single translation between the two vocabularies. Everything
+    # persisted (`granted`, the cache tracker's tier) and QUALITY_RANK stay in
+    # tidalapi's spelling; the settings page, the badge and the CLI speak
+    # these. (Older configs used tidalapi-style names; utils.config migrates
+    # them.)
     QUALITY_MAP = {
         "LOW": tidalapi.Quality.low_96k,
-        "HIGH": tidalapi.Quality.low_320k,
-        "LOSSLESS": tidalapi.Quality.high_lossless,
-        "HIRES": tidalapi.Quality.hi_res_lossless,
+        "MEDIUM": tidalapi.Quality.low_320k,
+        "HIGH": tidalapi.Quality.high_lossless,
+        "MAX": tidalapi.Quality.hi_res_lossless,
     }
     # Search scopes, in the order Tab cycles them. The four server-side ones
     # come first and share one request; "playlists" — *your* playlists — is
@@ -1955,11 +1959,18 @@ class HeadlessTidalPlayer:
         "tidal_playlists": ("playlists",),
     }
 
+    # The badge is the stream's format — the owner's call (2026-08-02): "I'd
+    # like formats even if sometimes it falls back to a slightly different
+    # quality." The drift he is accepting sits in MAX, whose label is the
+    # tier's nominal ceiling: the master decides the real resolution, and a
+    # 24/192 badge over a 24/48 file is a promise being quoted, not a
+    # measurement. The AAC rates are effectively exact, and 16/44.1 is what
+    # HIGH always is.
     QUALITY_LABELS = {
         "LOW": "96k AAC",
-        "HIGH": "320k AAC",
-        "LOSSLESS": "LOSSLESS",
-        "HIRES": "HI-RES",
+        "MEDIUM": "320k AAC",
+        "HIGH": "16/44.1 FLAC",
+        "MAX": "24/192 FLAC",
     }
 
     def __init__(self, quality: Optional[str] = None, login_flow: Optional[str] = None):
@@ -2780,7 +2791,7 @@ class HeadlessTidalPlayer:
 
         The **download** is the user's own file, and it always wins. It is
         played whatever the quality setting says, and no tier is compared:
-        having set the app to HI-RES is not a request to re-fetch a song that
+        having set the app to MAX is not a request to re-fetch a song that
         is already sitting in `~/Music/Ticli`, and doing it anyway spends the
         user's data on audio he deliberately put on his own disk. The one
         thing that changes a download's quality is the one thing that asks:
@@ -2805,7 +2816,7 @@ class HeadlessTidalPlayer:
         the settings page shows, and a player that went on displaying the
         setting would be claiming a quality it is not producing — the exact
         lie this codebase has been burned by before. So a download says what
-        it actually is (`LOSSLESS · downloaded`), on the status line it was
+        it actually is (`HIGH · downloaded`), on the status line it was
         already drawing, and the setting's label is only shown when the
         setting is really what is being played. Nothing is toasted: this is
         true for every track of a downloaded album, and a notice per track
@@ -3555,9 +3566,8 @@ class HeadlessTidalPlayer:
         # The setting's label is only the truth while the setting is what is
         # being played. A downloaded file is the user's own and is played
         # whatever the setting says (see `_local_source`), so it says what it
-        # actually is instead — a badge reading HI-RES over a LOSSLESS
-        # download would be exactly the kind of claim this project does not
-        # make.
+        # actually is instead — a badge reading MAX over a HIGH download
+        # would be exactly the kind of claim this project does not make.
         quality_label = self._playing_badge or \
             self.QUALITY_LABELS.get(self._quality_name, "")
         if quality_label:
@@ -4222,9 +4232,10 @@ class HeadlessTidalPlayer:
                 # feature, where a dimmed one explains itself
                 gated = self._quality_unavailable(choice)
                 content.append(choice, style="dim" if gated else ("bold cyan" if on else "dim"))
-                # Badge text, unless it just repeats the name (HIRES / HI-RES)
+                # The format beside the name, now that the two say different
+                # things
                 short = self.QUALITY_LABELS.get(choice, "")
-                if short and short.replace("-", "") != choice:
+                if short and short != choice:
                     content.append(
                         f" {short}", style="dim" if gated else ("cyan" if on else "dim"))
             content.append_text(self._build_quality_gate_note())
@@ -4330,7 +4341,7 @@ class HeadlessTidalPlayer:
         stats every file, so a track dragged to the trash in Finder is simply
         not a row here. The tier is the one TIDAL **granted**, not the one
         that was asked for — a device-flow session asks for hi-res and is
-        handed 320k AAC, and a list that said HIRES over an AAC file would be
+        handed 320k AAC, and a list that said MAX over an AAC file would be
         lying about bytes the user can go and look at.
         """
         granted_names = {quality: name for name, quality
@@ -4339,7 +4350,13 @@ class HeadlessTidalPlayer:
         for row in self._downloads():
             entry = row["entry"]
             title, artist, _album = downloads.describe(entry.get("path") or "")
-            tier = granted_names.get(entry.get("granted")) or entry.get("quality")
+            # The fallback is the *asked-for* name the downloader stored, which
+            # older indexes wrote in the pre-rename spelling. Translated at
+            # read time — never rewritten in the index, where a migration pass
+            # would risk the whole file for a display string.
+            asked = str(entry.get("quality") or "").upper()
+            tier = granted_names.get(entry.get("granted")) or \
+                QUALITY_V4_RENAMES.get(asked) or entry.get("quality")
             rows.append({
                 "id": row["id"], "path": row["path"], "bytes": row["bytes"],
                 "title": title, "artist": artist,
@@ -4444,9 +4461,12 @@ class HeadlessTidalPlayer:
         gated = [c for c in QUALITY_CHOICES if self._quality_unavailable(c)]
         if not gated:
             return line
+        # The ceiling is a tidalapi value; the ladder above speaks setting
+        # names, so translate before putting the two in one sentence
+        ceiling = self._tier_label(self._quality_ceiling) or self._quality_ceiling
         line.append(
             f"\n   {' and '.join(gated)} — this login isn't served them; "
-            f"TIDAL sends {self._quality_ceiling} instead",
+            f"TIDAL sends {ceiling} instead",
             style="dim yellow",
         )
         # _quality_name, not the saved value: --quality can be overriding it,
@@ -4473,7 +4493,7 @@ class HeadlessTidalPlayer:
         if self._fit.prose:
             line.append(
                 "\n   A clunkier sign-in — you paste back the address your browser lands on —"
-                "\n   and in exchange LOSSLESS and HI-RES stream as real FLAC instead of AAC.",
+                "\n   and in exchange HIGH and MAX stream as real FLAC instead of AAC.",
                 style="dim",
             )
         return line
@@ -5095,7 +5115,7 @@ class HeadlessTidalPlayer:
         elif state == "done":
             row.append("Saved ✓", style="green")
             # A tier that had to step down says which rung it stopped on.
-            # "Saved ✓" under a row reading `HIRES unavailable` was the one
+            # "Saved ✓" under a row reading `MAX unavailable` was the one
             # genuinely dishonest thing the box could show: the file is real,
             # but it is not the tier the line above it names.
             landed = job.get("landed")
@@ -6578,8 +6598,8 @@ class HeadlessTidalPlayer:
                 if self._download_job_gen != gen:
                     return
                 # `landed` is what arrived, which is not always what was asked
-                # for — the box says so rather than letting a HIRES request
-                # that came back LOSSLESS read as a HIRES file
+                # for — the box says so rather than letting a MAX request
+                # that came back HIGH read as a MAX file
                 _update(state="done", path=str(final), tags=written,
                         done=size, total=size, landed=landed)
                 self._set_toast(f"Downloaded to {final.parent}")
@@ -6630,11 +6650,11 @@ class HeadlessTidalPlayer:
         keeps it the question it already is, because there is still exactly
         one serial paced resolver and one pool of three fetchers.
 
-        Each batch carries **its own tier**, so a HIRES ask appended to a
-        LOSSLESS run downloads at HIRES: the tier is already per-track inside
-        the plan, and quietly fetching somebody's hi-res request as lossless
-        because a different batch got there first is the kind of dishonesty
-        this box exists to avoid.
+        Each batch carries **its own tier**, so a MAX ask appended to a
+        HIGH run downloads at MAX: the tier is already per-track inside
+        the plan, and quietly fetching somebody's hi-res request as CD
+        quality because a different batch got there first is the kind of
+        dishonesty this box exists to avoid.
 
         Anything already queued, in flight or finished is dropped by track id
         — appending a playlist that overlaps one already running must not
@@ -6906,7 +6926,7 @@ class HeadlessTidalPlayer:
         sources = None
         if ext is None:
             # Steps down a tier at a time rather than failing outright, so a
-            # track this login cannot have at HIRES still lands as LOSSLESS
+            # track this login cannot have at MAX still lands as HIGH
             # instead of not landing at all
             url, granted, tier = self._stream_at_best_tier(real, tier)
             sources = stream_sources(url)
@@ -7367,8 +7387,8 @@ class HeadlessTidalPlayer:
           of a filename would quietly install the wrong quality in somebody's
           music folder — which is worse than the re-fetch.
         * it has to be an **exact** match for what this download asked for.
-          Cached HIGH does not satisfy a HIRES download; nothing is promoted
-          upwards or downwards.
+          A cached 320k copy does not satisfy a MAX download; nothing is
+          promoted upwards or downwards.
         * the file has to actually be there, checked at the moment of use.
 
         Anything else falls through to the network, which is the same "the
@@ -7411,8 +7431,8 @@ class HeadlessTidalPlayer:
         `_note_granted_quality` exists at all. But it *can* fail outright: a
         device-flow session asked for a hi-res stream, a region without the
         master, a track pulled from a tier. A download that gives up there
-        leaves the user with nothing when a perfectly good LOSSLESS copy was
-        one step down, so this walks the ladder instead.
+        leaves the user with nothing when a perfectly good CD-quality copy
+        was one step down, so this walks the ladder instead.
 
         **A rate limit is never stepped past.** A 429, or a 401 with subStatus
         4006, means stop — retrying at another tier is three more requests
@@ -8603,16 +8623,12 @@ class HeadlessTidalPlayer:
 
 
 def main():
-    import click
-
-    @click.command()
-    @click.option("--quality", default=None, type=click.Choice(["LOW", "HIGH", "LOSSLESS", "HIRES"], case_sensitive=False), help="Audio quality for this run (overrides the saved setting)")
-    @click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in when there is no saved session")
-    def headless(quality, login_flow):
-        """Launch Ticli terminal player."""
-        HeadlessTidalPlayer(quality=quality, login_flow=login_flow).run()
-
-    headless()
+    # One CLI, defined once: this used to carry its own copy of the click
+    # options, which had already drifted from cli.py's by the time the tier
+    # rename found it. Imported lazily, mirroring cli.py's lazy import of
+    # this module the other way around.
+    from ticli.cli import main as _main
+    _main()
 
 
 if __name__ == "__main__":

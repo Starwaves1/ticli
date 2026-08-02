@@ -220,7 +220,7 @@ class TestEstimatesCostNothing:
         p = _player()
         p._download_track = _track(duration=197)
         estimates = {tier: p._download_estimate(tier)
-                     for tier in ("LOW", "HIGH", "LOSSLESS", "HIRES")}
+                     for tier in ("LOW", "MEDIUM", "HIGH", "MAX")}
         assert all(v > 0 for v in estimates.values())
         # Strictly increasing: a higher tier is never a smaller file
         assert list(estimates.values()) == sorted(estimates.values())
@@ -228,7 +228,7 @@ class TestEstimatesCostNothing:
     def test_the_arithmetic_is_duration_times_nominal_bitrate(self):
         # 197 s at 320 kbps: the research measured the real file at 7,931,562
         # bytes and this estimate at 7,880,000 — a 0.65% under-read
-        assert downloads.estimate_bytes(197, "HIGH") == 7_880_000
+        assert downloads.estimate_bytes(197, "MEDIUM") == 7_880_000
 
     def test_an_unknown_duration_says_so_rather_than_showing_zero(self):
         assert downloads.estimate_bytes(0, "HIGH") == 0
@@ -240,7 +240,7 @@ class TestEstimatesCostNothing:
         assertion the estimates exist for."""
         patch_get(monkeypatch, player_mod,
                   lambda *a, **k: pytest.fail("no requests here"))
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         p._current_track = _track(duration=197)
         p._open_download()
         # Walked with the arrows, painted at every stop, the way a held-down
@@ -263,9 +263,9 @@ class TestEstimatesCostNothing:
         assert "LOW" in _box_text(p)
         p._handle_key(player_mod.KEY_DOWN)
         text = _box_text(p)
-        assert "HIGH" in text and "LOW" not in text, text
+        assert "MEDIUM" in text and "LOW" not in text, text
         assert "~" + downloads.format_bytes(
-            downloads.estimate_bytes(197, "HIGH")) in text, text
+            downloads.estimate_bytes(197, "MEDIUM")) in text, text
 
 
 class TestTheSizeIsExactWhenItIsFree:
@@ -285,8 +285,10 @@ class TestTheSizeIsExactWhenItIsFree:
         path = downloads.download_dir() / "A" / "B" / "01 T.m4a"
         path.parent.mkdir(parents=True)
         path.write_bytes(b"x" * 4321)
+        # granted is the wire spelling: the hovered tier is HIGH, whose wire
+        # value is LOSSLESS — that match is what makes the byte count exact
         downloads.record(42, path.relative_to(downloads.download_dir()),
-                         "HIGH", 4321, granted="HIGH")
+                         "HIGH", 4321, granted="LOSSLESS")
         p._download_known = None
         text = _box_text(p)
         assert downloads.format_bytes(4321) in text, text
@@ -295,7 +297,7 @@ class TestTheSizeIsExactWhenItIsFree:
 
     def test_a_matching_cache_record_shows_the_exact_bytes(self):
         p = self._opened()
-        p._cache.note_cached(42, ".m4a", 9999, quality="HIGH")
+        p._cache.note_cached(42, ".m4a", 9999, quality="LOSSLESS")
         p._download_known = None
         text = _box_text(p)
         assert downloads.format_bytes(9999) in text, text
@@ -336,7 +338,7 @@ class TestTheSizeIsExactWhenItIsFree:
 
 class TestTheCursorStartsWhereSettingsIs:
     def test_pre_placed_on_the_tier_in_settings(self):
-        for quality, index in (("LOW", 0), ("HIGH", 1), ("LOSSLESS", 2), ("HIRES", 3)):
+        for quality, index in (("LOW", 0), ("MEDIUM", 1), ("HIGH", 2), ("MAX", 3)):
             p = _player(quality=quality)
             p._current_track = _track()
             p._open_download()
@@ -347,14 +349,14 @@ class TestTheCursorStartsWhereSettingsIs:
         """The two ways he described the common case, and both close the box
         rather than leaving him somewhere to get out of."""
         for finish in (player_mod.KEY_ENTER, "d"):
-            p = _player(quality="LOSSLESS")
+            p = _player(quality="HIGH")
             p._current_track = _track()
             started = []
             p._start_download_job = lambda tier: started.append(tier)
             p._handle_key("d")
             assert p._download_open is True and started == []
             p._handle_key(finish)
-            assert started == ["LOSSLESS"], finish
+            assert started == ["HIGH"], finish
             assert p._download_open is False, finish
 
     def test_esc_spends_nothing(self):
@@ -504,11 +506,11 @@ class TestATierThatCannotBeServedStepsDown:
     def test_it_walks_down_until_one_works(self):
         server = _Server({"/track.mp4": _mp4()})
         try:
-            p = _player(quality="HIRES")
+            p = _player(quality="MAX")
             track, asked = self._track_failing_above(server, "LOSSLESS")
             track._session = p.session
             p._download_track = track
-            job = _download(p, "HIRES")
+            job = _download(p, "MAX")
 
             assert job["state"] == "done", job.get("error")
             assert asked == ["HI_RES_LOSSLESS", "LOSSLESS"], \
@@ -517,24 +519,24 @@ class TestATierThatCannotBeServedStepsDown:
             assert downloads.path_for(track.id) is not None
 
             # And the box says which rung it stopped on, rather than letting a
-            # HIRES request that came back LOSSLESS read as a hi-res file
-            assert job["landed"] == "LOSSLESS"
+            # MAX request that came back HIGH read as a hi-res file
+            assert job["landed"] == "HIGH"
             p._download_open = True
-            assert "LOSSLESS" in _rendered(p)
+            assert "HIGH" in _rendered(p)
         finally:
             server.close()
 
     def test_the_recorded_tier_is_the_one_that_was_served(self):
         server = _Server({"/track.mp4": _mp4()})
         try:
-            p = _player(quality="HIRES")
+            p = _player(quality="MAX")
             track, _ = self._track_failing_above(server, "HIGH")
             track._session = p.session
             p._download_track = track
-            assert _download(p, "HIRES")["state"] == "done"
+            assert _download(p, "MAX")["state"] == "done"
             entry = downloads.load_index()[str(track.id)]
             assert entry["granted"] == "HIGH", \
-                "a HIGH file recorded as hi-res would mislead [R] for ever"
+                "a 320k AAC file recorded as hi-res would mislead [R] for ever"
         finally:
             server.close()
 
@@ -542,7 +544,7 @@ class TestATierThatCannotBeServedStepsDown:
         """Retrying is what turned a rate limit into an edge block
         (ai/INCIDENTS #1). Three more requests at lower tiers is the worst
         possible response to a limiter already saying no."""
-        p = _player(quality="HIRES")
+        p = _player(quality="MAX")
         asked = []
         track = _track()
 
@@ -552,26 +554,26 @@ class TestATierThatCannotBeServedStepsDown:
 
         track.get_stream = _stream
         p._download_track = track
-        job = _download(p, "HIRES")
+        job = _download(p, "MAX")
         assert job["state"] == "failed"
         assert len(asked) == 1, f"it retried a rate limit {len(asked)} times"
 
     def test_the_common_case_is_still_one_request(self):
         server = _Server({"/track.mp4": _mp4()})
         try:
-            p = _player(quality="HIGH")
+            p = _player(quality="MEDIUM")
             track, asked = self._track_failing_above(server, "HI_RES_LOSSLESS")
             track._session = p.session
             p._download_track = track
-            assert _download(p, "HIGH")["state"] == "done"
+            assert _download(p, "MEDIUM")["state"] == "done"
             assert asked == ["HIGH"], "a tier that works costs one request"
         finally:
             server.close()
 
     def test_the_ladder_is_the_tier_and_everything_under_it(self):
-        assert HeadlessTidalPlayer._tier_ladder("HIRES") == \
-            ["HIRES", "LOSSLESS", "HIGH", "LOW"]
-        assert HeadlessTidalPlayer._tier_ladder("HIGH") == ["HIGH", "LOW"]
+        assert HeadlessTidalPlayer._tier_ladder("MAX") == \
+            ["MAX", "HIGH", "MEDIUM", "LOW"]
+        assert HeadlessTidalPlayer._tier_ladder("MEDIUM") == ["MEDIUM", "LOW"]
         assert HeadlessTidalPlayer._tier_ladder("LOW") == ["LOW"]
 
 
@@ -602,7 +604,7 @@ class TestASegmentedDownload:
             # the manifest is already written; the tier is what a stream says
             p._stream_description = lambda t: (path, "LOSSLESS")
 
-            job = _download(p, "LOSSLESS")
+            job = _download(p, "HIGH")
             assert job["state"] == "done", job.get("error")
             landed = downloads.download_dir() / "Daft Punk" / \
                 "Random Access Memories" / "08 Get Lucky.m4a"
@@ -707,7 +709,7 @@ class TestDownloadingSomethingAlreadyCached:
         cache.note_cached(track_id, ext, len(body), quality=quality)
         return path
 
-    def _player_expecting_no_network(self, monkeypatch, quality="LOSSLESS"):
+    def _player_expecting_no_network(self, monkeypatch, quality="HIGH"):
         p = _player(quality=quality)
         patch_get(monkeypatch, player_mod,
                   lambda *a, **k: pytest.fail("the cached copy was re-fetched"))
@@ -721,7 +723,7 @@ class TestDownloadingSomethingAlreadyCached:
         body = _mp4()
         self._cached(p._cache, 42, "LOSSLESS", body=body)
 
-        job = _download(p, "LOSSLESS")
+        job = _download(p, "HIGH")
 
         assert job["state"] == "done", job.get("error")
         landed = downloads.download_dir() / "Daft Punk" / \
@@ -748,7 +750,7 @@ class TestDownloadingSomethingAlreadyCached:
         monkeypatch.setattr(player_mod.tags, "write_tags",
                             lambda *a, **k: (seen.append(cached.exists()),
                                              real_write(*a, **k))[1])
-        _download(p, "LOSSLESS")
+        _download(p, "HIGH")
         assert seen == [True], "promoting moved the cache's own copy"
 
     def test_the_superseded_cached_copy_is_reclaimed(self, monkeypatch):
@@ -758,7 +760,7 @@ class TestDownloadingSomethingAlreadyCached:
         eviction against songs that can still be used."""
         p = self._player_expecting_no_network(monkeypatch)
         cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
-        assert _download(p, "LOSSLESS")["state"] == "done"
+        assert _download(p, "HIGH")["state"] == "done"
 
         assert not cached.exists(), "two copies of the same audio survived"
         assert p._cache.audio_record(42) is None, \
@@ -776,7 +778,7 @@ class TestDownloadingSomethingAlreadyCached:
         p = self._player_expecting_no_network(monkeypatch)
         cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
         p._current_track = _track()          # id 42, the one being downloaded
-        assert _download(p, "LOSSLESS")["state"] == "done"
+        assert _download(p, "HIGH")["state"] == "done"
         assert cached.exists(), "it deleted the file under the playing track"
         assert p._cache.audio_record(42) is not None
 
@@ -790,7 +792,7 @@ class TestDownloadingSomethingAlreadyCached:
         p = self._player_expecting_no_network(monkeypatch)
         cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
         p._current_track = _track()          # id 42, the one being downloaded
-        assert _download(p, "LOSSLESS")["state"] == "done"
+        assert _download(p, "HIGH")["state"] == "done"
         assert cached.exists()
 
         p._reclaim_deferred_copies()         # the tick, track still playing
@@ -805,13 +807,13 @@ class TestDownloadingSomethingAlreadyCached:
         """Quit while the deferred track is still playing and the pair is on
         disk the next morning. The sweep beside `reconcile()` catches it —
         and every duplicate created before the drop existed at all."""
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
         dest = downloads.destination(downloads.track_metadata(_track()), ".m4a")
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(_mp4())
         downloads.record(42, dest.relative_to(downloads.download_dir()),
-                         "LOSSLESS", dest.stat().st_size, granted="LOSSLESS")
+                         "HIGH", dest.stat().st_size, granted="LOSSLESS")
 
         p._reclaim_download_duplicates()
 
@@ -823,13 +825,13 @@ class TestDownloadingSomethingAlreadyCached:
         """A restore can already be audible by the time the sweep runs, and
         the sweep must not cause the very hiccup the per-download drop
         avoids. Same deferral, same retry."""
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
         dest = downloads.destination(downloads.track_metadata(_track()), ".m4a")
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(_mp4())
         downloads.record(42, dest.relative_to(downloads.download_dir()),
-                         "LOSSLESS", dest.stat().st_size, granted="LOSSLESS")
+                         "HIGH", dest.stat().st_size, granted="LOSSLESS")
         p._current_track = _track()
 
         p._reclaim_download_duplicates()
@@ -844,13 +846,13 @@ class TestDownloadingSomethingAlreadyCached:
         download the user dragged to the trash is not a download, and
         `_local_source` falls back to the cached copy then — reclaiming it
         would delete the one copy that still plays."""
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
         dest = downloads.destination(downloads.track_metadata(_track()), ".m4a")
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(_mp4())
         downloads.record(42, dest.relative_to(downloads.download_dir()),
-                         "LOSSLESS", dest.stat().st_size, granted="LOSSLESS")
+                         "HIGH", dest.stat().st_size, granted="LOSSLESS")
         dest.unlink()                        # deleted by hand, index left stale
 
         p._reclaim_download_duplicates()
@@ -863,7 +865,7 @@ class TestDownloadingSomethingAlreadyCached:
         the drop wanted (the reading `clear()` gives FileNotFoundError), and
         keeping it recreates the exact entry-with-no-file the drop cleans up
         when it *sees* it."""
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
         real = player_mod.cached_audio_path
 
@@ -883,7 +885,7 @@ class TestDownloadingSomethingAlreadyCached:
         download, and with the setting off nothing else (`reconcile` early
         returns, no cache write ever sweeps) will ever reclaim them. The
         drop is gated on evidence, not on the setting."""
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         cached = self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
         p._cache = MetadataCache(songs=False)     # the "n" answer: files kept
         track = _track()
@@ -895,7 +897,7 @@ class TestDownloadingSomethingAlreadyCached:
         # No promotion with the setting off, so the bytes come off the wire
         patch_get(monkeypatch, player_mod, lambda *a, **k: _FakeStream(_mp4()))
 
-        assert _download(p, "LOSSLESS")["state"] == "done"
+        assert _download(p, "HIGH")["state"] == "done"
 
         assert not cached.exists(), \
             "cache_songs off left the unreachable duplicate for ever"
@@ -904,17 +906,17 @@ class TestDownloadingSomethingAlreadyCached:
     def test_the_recorded_tier_is_the_one_that_was_granted(self, monkeypatch):
         p = self._player_expecting_no_network(monkeypatch)
         self._cached(p._cache, 42, "LOSSLESS", body=_mp4())
-        _download(p, "LOSSLESS")
+        _download(p, "HIGH")
         entry = downloads.load_index()["42"]
         assert entry["granted"] == "LOSSLESS"
-        assert entry["quality"] == "LOSSLESS"
+        assert entry["quality"] == "HIGH"
 
     def test_a_lower_cached_tier_is_never_promoted(self, monkeypatch):
-        """Cached HIGH does not satisfy a HIRES download. Silently installing
+        """A cached 320k copy does not satisfy a MAX download. Silently installing
         the wrong quality in someone's music folder is worse than re-fetching
         — `.m4a` is AAC on a device-flow session and FLAC on a PKCE one, and
         the names are identical."""
-        p = _player(quality="HIRES")
+        p = _player(quality="MAX")
         self._cached(p._cache, 42, "HIGH", body=_mp4())
         calls = []
         p._download_track = _track()
@@ -926,7 +928,7 @@ class TestDownloadingSomethingAlreadyCached:
         patch_get(monkeypatch, player_mod,
                   lambda *a, **k: _FakeStream(_mp4()))
 
-        job = _download(p, "HIRES")
+        job = _download(p, "MAX")
 
         assert job["state"] == "done", job.get("error")
         assert calls, "it promoted a lower-quality file instead of fetching"
@@ -934,7 +936,7 @@ class TestDownloadingSomethingAlreadyCached:
     def test_a_cached_file_of_unknown_tier_is_never_promoted(self, monkeypatch):
         """Everything cached before the tracker existed has no tier. Unknown
         must never be read as "the tier you asked for"."""
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         directory = cache_mod.audio_dir()
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "42.m4a").write_bytes(_mp4())
@@ -948,12 +950,12 @@ class TestDownloadingSomethingAlreadyCached:
                     is_bts=True, get_urls=lambda: ["https://cdn/x.mp4"])))
         patch_get(monkeypatch, player_mod, lambda *a, **k: _FakeStream(_mp4()))
 
-        _download(p, "LOSSLESS")
+        _download(p, "HIGH")
 
         assert calls, "an unknown tier was treated as a match"
 
     def test_a_cached_entry_whose_file_is_gone_falls_through(self, monkeypatch):
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         self._cached(p._cache, 42, "LOSSLESS", body=_mp4()).unlink()
         calls = []
         p._download_track = _track()
@@ -964,7 +966,7 @@ class TestDownloadingSomethingAlreadyCached:
                     is_bts=True, get_urls=lambda: ["https://cdn/x.mp4"])))
         patch_get(monkeypatch, player_mod, lambda *a, **k: _FakeStream(_mp4()))
 
-        _download(p, "LOSSLESS")
+        _download(p, "HIGH")
 
         assert calls, "the tracker was trusted over the disk"
 
@@ -1185,7 +1187,7 @@ class TestDownloadsAreNotTheCache:
         kept = root / "Artist" / "Album" / "01 Kept.m4a"
         kept.parent.mkdir(parents=True)
         kept.write_bytes(b"d" * (4 * 1024 ** 2))
-        downloads.record(11, kept.relative_to(root), "LOSSLESS", kept.stat().st_size)
+        downloads.record(11, kept.relative_to(root), "HIGH", kept.stat().st_size)
 
         audio = cache_mod.audio_dir()
         audio.mkdir(parents=True)
@@ -1536,13 +1538,13 @@ class TestReFetchingEverything:
     """
 
     def _library(self, downloaded=(), cached=()):
-        p = _player(quality="HIRES")
+        p = _player(quality="MAX")
         root = downloads.download_dir()
         for tid, granted in downloaded:
             path = root / "A" / "B" / f"{tid:02d} T.m4a"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"music")
-            downloads.record(tid, path.relative_to(root), "HIGH", 5,
+            downloads.record(tid, path.relative_to(root), "MEDIUM", 5,
                              granted=granted)
         for tid, granted in cached:
             directory = cache_mod.audio_dir()
@@ -1595,7 +1597,7 @@ class TestReFetchingEverything:
         assert started == [], "it started before it asked"
 
         rendered = _rendered(p)
-        assert "Upgrade 1 song to HIRES?" in rendered
+        assert "Upgrade 1 song to MAX?" in rendered
         assert "About" in rendered, "it did not say how much it would fetch"
 
     def test_any_other_key_is_a_true_no_op(self, monkeypatch):
@@ -1621,18 +1623,18 @@ class TestReFetchingEverything:
         p = self._library(downloaded=[(1, "HI_RES_LOSSLESS")])
         p._mode = p.MODE_SETTINGS
         p._handle_key("R")
-        assert "Nothing is below HIRES" in _rendered(p)
+        assert "Nothing is below MAX" in _rendered(p)
 
     # ── it only ever moves upwards ──
     #
     # Comparing `granted != wanted` made [R] a *downgrade* button: set the
-    # quality to HIGH with a lossless library and it re-fetched every song as
+    # quality to MEDIUM (320k AAC) with a lossless library and it re-fetched every song as
     # AAC, one request each, and reported it as success.
 
     def test_a_lower_setting_never_downgrades_what_is_on_disk(self):
         p = self._library(downloaded=[(1, "HI_RES_LOSSLESS")],
                           cached=[(2, "LOSSLESS")])
-        p._quality_name = "HIGH"
+        p._quality_name = "MEDIUM"
         plan = p._refetch_candidates()
         assert plan["downloads"] == [], "it would have re-fetched hi-res as AAC"
         assert plan["cache"] == [], "it would have re-fetched lossless as AAC"
@@ -1640,7 +1642,7 @@ class TestReFetchingEverything:
 
     def test_an_equal_tier_is_not_an_upgrade(self):
         p = self._library(downloaded=[(1, "LOSSLESS")])
-        p._quality_name = "LOSSLESS"
+        p._quality_name = "HIGH"
         assert p._refetch_candidates()["downloads"] == []
 
     def test_the_target_is_capped_by_what_tidal_will_serve(self):
@@ -1778,7 +1780,7 @@ class TestReFetchingEverything:
         p._start_refetch_job()
         assert _wait_for(lambda: (p._refetch_job or {}).get("done", 0) >= 1, 5)
         rendered = p._build_settings_display().plain
-        assert "Re-fetching at HIRES" in rendered
+        assert "Re-fetching at MAX" in rendered
         assert "/4" in rendered
         assert "[Esc]" in rendered
         p._cancel_refetch()
@@ -1800,7 +1802,7 @@ class TestReFetchingEverything:
                     is_bts=True, get_urls=lambda: [server.url("/hires.mp4")]))
             p.session.track = lambda tid: real
 
-            p._refetch_one("cache", "42", "HIRES", p._refetch_gen)
+            p._refetch_one("cache", "42", "MAX", p._refetch_gen)
 
             landed = cache_mod.cached_audio_path(42)
             assert landed is not None
@@ -1821,7 +1823,7 @@ class TestReFetchingEverything:
                     is_bts=True, get_urls=lambda: [server.url("/hires.mp4")]))
             p.session.track = lambda tid: real
 
-            p._refetch_one("download", "42", "HIRES", p._refetch_gen)
+            p._refetch_one("download", "42", "MAX", p._refetch_gen)
 
             landed = downloads.path_for(42)
             assert landed is not None and landed.exists()
@@ -1862,7 +1864,7 @@ def _downloaded(track_id=42, granted="LOSSLESS", body=b"downloaded bytes"):
     path = root / "Daft Punk" / "Random Access Memories" / "08 Get Lucky.m4a"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(body)
-    downloads.record(track_id, path.relative_to(root), "LOSSLESS", len(body),
+    downloads.record(track_id, path.relative_to(root), "HIGH", len(body),
                      granted=granted)
     return path
 
@@ -1916,8 +1918,8 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
         time.sleep(0.05)
 
     def test_a_download_below_the_setting_plays_from_disk_for_free(self, monkeypatch):
-        """The bug, in one case: downloaded at LOSSLESS, app set to HI-RES."""
-        p = self._player_offline("HIRES", monkeypatch)
+        """The bug, in one case: downloaded at CD quality, app set to MAX."""
+        p = self._player_offline("MAX", monkeypatch)
         path = _downloaded(granted="LOSSLESS")
         calls = []
 
@@ -1943,7 +1945,7 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
 
     def test_the_bytes_played_are_the_downloaded_bytes(self, monkeypatch):
         """The path is only a claim; the file behind it is the audio."""
-        p = self._player_offline("HIRES", monkeypatch)
+        p = self._player_offline("MAX", monkeypatch)
         _downloaded(granted="LOW", body=b"the file he downloaded")
 
         self._play(p, self._streaming_track([]))
@@ -1955,7 +1957,7 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
     def test_the_prefetch_does_not_spend_a_request_either(self, monkeypatch):
         """The URL would be fetched moments before `_play_track` threw it
         away — the same wasted request, one track earlier."""
-        p = self._player_offline("HIRES", monkeypatch)
+        p = self._player_offline("MAX", monkeypatch)
         _downloaded(track_id=43, granted="HIGH")
         calls = []
         upcoming = self._streaming_track(calls, tid=43)
@@ -1974,7 +1976,7 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
     def test_a_download_deleted_by_hand_falls_through_to_the_network(self):
         """The index still claims it; the disk decides. Unchanged by the new
         rule, and the reason `path_for` stats the file every time."""
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         p._cache = MetadataCache(songs=True)
         p.audio = _RecordingAudio()
         _downloaded(granted="LOSSLESS").unlink()
@@ -1991,7 +1993,7 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
         cache is machine-owned and disposable, so a stale tier there is worth
         one request; a download is the user's file and is not ours to replace.
         Same player, same tier, opposite answers."""
-        p = _player(quality="HIRES")
+        p = _player(quality="MAX")
         p._cache = MetadataCache(songs=True)
         p.audio = _RecordingAudio()
         directory = cache_mod.audio_dir()
@@ -2008,7 +2010,7 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
     def test_nothing_on_these_paths_writes_to_the_music_folder(self, monkeypatch):
         """Playing is reading. The one file in the folder is the one the test
         put there, before and after."""
-        p = self._player_offline("HIRES", monkeypatch)
+        p = self._player_offline("MAX", monkeypatch)
         _downloaded(granted="LOW")
         root = downloads.download_dir()
         before = sorted(str(f.relative_to(root)) for f in root.rglob("*")
@@ -2022,36 +2024,36 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
                                    "08 Get Lucky.m4a"]
 
     def test_the_player_says_what_it_is_really_playing(self, monkeypatch):
-        """Honesty in the interface. A badge reading HI-RES over a LOSSLESS
+        """Honesty in the interface. A badge reading MAX over a HIGH
         download is the same kind of claim as a quality menu offering tiers
         TIDAL never served. It says the tier the file holds and where the
         file came from — on the status line it was already drawing, so
         nothing is toasted once per track of a downloaded album."""
-        p = self._player_offline("HIRES", monkeypatch)
+        p = self._player_offline("MAX", monkeypatch)
         _downloaded(granted="LOSSLESS")
 
         self._play(p, self._streaming_track([]))
         text = _rendered(p)
 
-        assert "LOSSLESS · downloaded" in text
-        assert "HI-RES" not in text, "it claimed the tier of the setting"
+        assert "16/44.1 FLAC · downloaded" in text
+        assert "24/192" not in text, "it claimed the tier of the setting"
 
     def test_an_unrecorded_tier_claims_nothing(self, monkeypatch):
         """A download adopted before the index recorded tiers. "We do not
         know" is an honest badge; the setting's label would not be."""
-        p = self._player_offline("HIRES", monkeypatch)
+        p = self._player_offline("MAX", monkeypatch)
         _downloaded(granted=None)
 
         self._play(p, self._streaming_track([]))
         text = _rendered(p)
 
         assert "downloaded" in text
-        assert "HI-RES" not in text
+        assert "24/192" not in text
 
     def test_a_streamed_track_still_shows_the_setting(self):
         """The badge is not a permanent takeover — the setting is the truth
         again the moment the bytes come off the network."""
-        p = _player(quality="LOSSLESS")
+        p = _player(quality="HIGH")
         p._cache = MetadataCache(songs=False)
         p.audio = _RecordingAudio()
         _downloaded(granted="HIGH")
@@ -2062,7 +2064,7 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
 
         text = _rendered(p)
         assert "downloaded" not in text
-        assert "LOSSLESS" in text
+        assert "16/44.1 FLAC" in text
 
 
 class TestSettingsShowsTheFolder:
@@ -2114,7 +2116,7 @@ class TestSeeingAndRemovingWhatYouHave:
         path = root / artist / album / f"{tid:02d} {name}{ext}"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
-        downloads.record(tid, path.relative_to(root), "LOSSLESS", len(data),
+        downloads.record(tid, path.relative_to(root), "HIGH", len(data),
                          granted=granted)
         return path
 
@@ -2142,13 +2144,13 @@ class TestSeeingAndRemovingWhatYouHave:
     def test_the_list_shows_title_artist_tier_and_size(self):
         self._download(7, artist="Fleetwood Mac", album="Rumours",
                        name="Dreams", ext=".m4a", data=b"x" * 4096,
-                       granted=HeadlessTidalPlayer.QUALITY_MAP["HIGH"])
+                       granted=HeadlessTidalPlayer.QUALITY_MAP["MEDIUM"])
         text = self._list(self._open(_player()))
         assert "Dreams" in text
         assert "Fleetwood Mac" in text
         # The tier TIDAL *granted*, not the one that was asked for — the
-        # record above asked LOSSLESS and was handed 320k AAC
-        assert "HIGH" in text and "LOSSLESS" not in text
+        # record above asked HIGH (FLAC) and was handed 320k AAC
+        assert "MEDIUM" in text and "HIGH" not in text
         # Bytes on this disk, so no `~`
         assert "4.0 KB" in text
         assert "~" not in text
