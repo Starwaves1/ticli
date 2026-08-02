@@ -35,8 +35,8 @@ class TestCLIHelp:
         assert result.exit_code == 0
         assert "low" in result.output.lower()
         assert "high" in result.output.lower()
-        assert "lossless" in result.output.lower()
-        assert "hires" in result.output.lower()
+        assert "medium" in result.output.lower()
+        assert "max" in result.output.lower()
 
 
 class TestCLISubprocess:

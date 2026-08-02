@@ -834,6 +834,13 @@ unchanged by playing. 1365 in the suite.
 
 ---
 
+*(The two sections that used to close this file — "in flight: responsive
+layout" and "specified, not built: downloads, eviction" — are stale: all three
+shipped between 2026-07-25 and 2026-07-30. See DECISIONS.md for the built
+state; corrected 2026-08-02 under the "fix what is now wrong" rule.)*
+
+---
+
 ## 2026-08-02
 
 ### The state file can no longer crash startup by being a JSON list
@@ -1171,26 +1178,86 @@ list with junk elements → the str-only list, capped at 200). Verified red
 first with the src change stashed at f9a38e8: artists=5 fails with the exact
 TypeError inside `CachedTrack`, the dict history with the unhashable-slice
 TypeError, duration "long" rides the shim uncoerced and the display builder
-crash was reproduced directly. 1441 in the suite.
+crash was reproduced directly. 1441 in the suite (before the merge with the
+tier-renaming work below; the merged suite's count is in ai/README.md).
 
-## In flight at time of writing
+---
 
-- **Responsive narrow-width layout + `v` volume overlay** — width-derived
-  progress bar (currently a fixed 50 columns, which wraps catastrophically when
-  narrow), hotkey hints that never split a `[key] label` pair, artwork sizing
-  on width as well as height, and a volume overlay on `v` replacing the footer.
+## 2026-08-02 — quality tiers renamed to TIDAL's own: LOW / MEDIUM / HIGH / MAX
 
-## Specified, not built
+Owner decision, from a screenshot of the official app's quality screen (Low
+96k · High 16-bit/44.1 · Max up to 24-bit/192): ticli's tier names must match
+TIDAL's player, with the 320k AAC rung — which the app files under Low's
+bitrate dropdown rather than naming — surfaced as **MEDIUM**. The old names
+were tidalapi's wire values; the README had documented the pre-`5dd12c3` v1
+scheme ever since and contradicted itself ("HIGH — lossless FLAC" beside
+"LOSSLESS — 16-bit FLAC"), which is what prompted the whole change.
 
-- **Downloads.** Fully researched. `d` opens a download screen; quality picker
-  as a single column with the cursor pre-placed on the current setting;
-  hovering shows "download now" and a size estimate. Files land in
-  `~/Music/Ticli`, tagged and organized, exempt from eviction. Size estimates
-  cost zero requests (duration × bitrate; −0.3% to −2.1% error on AAC — note
-  FLAC is variable-bitrate, so this needs recalibration).
-- **Play-count-tiered eviction.** The owner's design: a point per play, evict
-  the oldest among the tracks with the fewest plays. Rationale: a 4-hour binge
-  on a new playlist must not evict long-term staples, which pure LRU does. His
-  refinements: stamp `time.time()` ourselves rather than trusting filesystem
-  `atime` (which `relatime` makes ~daily-granular), run only when song caching
-  is enabled, and exempt downloads entirely.
+**Research first** (Opus 5 subagent, read-only): tidalapi 0.8.11's `Quality`
+enum values *are* the wire protocol (`media.py` puts them straight into the
+`audioquality` query param), and every load-bearing comparison in ticli
+already ran in wire spelling on both sides — `QUALITY_RANK`, `granted`, the
+cache tracker's tier. Nothing compares a ticli name to a persisted value. So
+the ticli names could move freely, and did:
+
+- `QUALITY_CHOICES` → `["LOW", "MEDIUM", "HIGH", "MAX"]`; `QUALITY_MAP`,
+  `QUALITY_LABELS`, `QUALITY_MEANINGS`, `NOMINAL_BITRATE` re-keyed. Default
+  `LOSSLESS` → `HIGH` (same stream, new name).
+- **Config v5** with `QUALITY_V4_RENAMES` — copied from the v1 precedent, and
+  it chains: a v1 file's "LOW" (which streamed 320k) → v2 "HIGH" → v5
+  "MEDIUM", same bytes throughout. Skipping this would have been silent
+  corruption both ways: saved "HIRES" coerces to the default (a downgrade)
+  and saved "HIGH" keeps its spelling while quadrupling its data use.
+- **The one dangerous collision is "HIGH"** — 320k AAC in the old scheme,
+  16-bit FLAC in the new. Saved configs are disambiguated by the version
+  number. The CLI has no version, so `--quality HIGH` takes the new meaning
+  and says so on stderr every use; `LOSSLESS`/`HIRES` are accepted as
+  aliases and corrected out loud. Rejected: hard-erroring on HIGH (breaks
+  every old script over a naming preference; the collision is one-signed —
+  better audio, never worse).
+- **Badge = the tier's own name**, as the app badges tracks. Rejected: a
+  format badge ("24/192"), because MAX's real resolution varies per master
+  and a 24/192 claim over a 24/48 file is the class of lie WORKING-RULES
+  bans. `QUALITY_LABELS` is an identity map now but stays as the seam.
+  The settings-ladder badge suppression heuristic went with it.
+- The gate note translates the ceiling through `_tier_label` — "TIDAL sends
+  MEDIUM instead", not the wire spelling.
+- Legacy asked-names in `downloads.json` are translated **at read time**
+  (one dict lookup at the single display fallback); the index is never
+  rewritten. `INDEX_VERSION` and `CACHE_VERSION` deliberately untouched — a
+  bump discards the download index / the granted tiers, orphaning the whole
+  library for a display string.
+- Deleted the duplicate `--quality` click definition in `player.py`'s
+  `main()` (it had already drifted from cli.py's); it delegates now.
+
+**Tests: 1403 pass** (1365 at the last entry). The rename forced every
+fixture to declare its vocabulary — asked-name slots (`_download(p, tier)`,
+`_player(quality=...)`) moved, wire slots (`granted=`, `note_cached`,
+`session.audio_quality` asserts) stayed. The shared fixture default
+`_player(quality="HIGH")` changed *meaning* (320k → FLAC), which three
+estimate tests had to follow. `test_download_queue.py:446` still asserts a
+"HIGH" ask sends "LOSSLESS" on the wire — the bridge, now visibly a bridge.
+
+**Both READMEs rewritten** (root + `src/`, the PyPI long-description — easy
+to miss). Quality and login are now documented from the code: device flow =
+AAC-only, PKCE = the only flow TIDAL streams FLAC to, `u` upgrades in place.
+Hotkeys condensed to one player table + one per-screen extras table. mpv is
+the documented player throughout — owner: *"MPV pog yes. Dropped ff"*.
+
+**Not done, on purpose:** ffplay's code path is untouched — the drop is
+docs-level; removing the fallback (volume clamping, seek-by-respawn, tests)
+was not asked for and is recorded as an open question in DECISIONS.md. And
+nothing was probed live: whether this account's MAX really returns 24/192
+remains unverified, as the research doc already said.
+
+### Same day, follow-up — the badge shows formats after all
+
+The tier-name badge lasted one review: Garrett wants formats — *"even if
+sometimes it falls back to a slightly different quality"*, i.e. he accepts
+that MAX's `24/192 FLAC` label is the tier's nominal ceiling rather than the
+master's real resolution, which was the exact honesty concern that had
+argued for names. Owner's call, recorded as such. `QUALITY_LABELS` became
+`96k AAC / 320k AAC / 16/44.1 FLAC / 24/192 FLAC`, the settings ladder shows
+the format beside each name again (70 columns for all four, inside the
+80-column budget), and the gate note now reads "TIDAL sends 320k AAC
+instead". Five rendered-screen assertions moved with it. 1403 still pass.

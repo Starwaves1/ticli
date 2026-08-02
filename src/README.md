@@ -12,7 +12,7 @@ Works on **macOS** and **Linux**.
 │  ▶ ♥ Arlo Parks - Sophie                               │
 │     Super Sad Generation                               │
 │     1:47 ━━━━━━━━●━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3:28    │
-│     Queue: 3/12  LOSSLESS                              │
+│     Queue: 3/12  16/44.1 FLAC                          │
 │     Next: Cola • Arlo Parks                            │
 │                                                        │
 │  [space] play/pause  [n/→] next  [←] prev             │
@@ -33,19 +33,20 @@ Works on **macOS** and **Linux**.
 - **Mini mode** — Condensed single-line display
 - **Session restore** — Picks up where you left off
 - **Lossless & Hi-Res** — Stream up to 24-bit/192kHz FLAC
+- **Downloads** — Keep tracks in your own music folder, tagged
 - **Secure auth** — OAuth tokens stored in your OS keychain
 
 ## Install
 
-Requires Python 3.10+ and [ffmpeg](https://ffmpeg.org).
+Requires Python 3.10+ and [mpv](https://mpv.io).
 
 ```bash
 # macOS
-brew install ffmpeg python3
+brew install mpv
 pip install tidal-cli
 
 # Ubuntu / Debian
-sudo apt install ffmpeg python3-pip
+sudo apt install mpv python3-pip
 pip install tidal-cli
 ```
 
@@ -66,11 +67,15 @@ On first run you'll get a URL to authorize with your TIDAL account. After that, 
 ### Quality
 
 ```bash
-ticli --quality HIRES      # 24-bit hi-res FLAC
-ticli --quality LOSSLESS   # 16-bit FLAC
-ticli --quality HIGH       # lossless FLAC (default)
-ticli --quality LOW        # 320kbps
+ticli --quality MAX     # FLAC, up to 24-bit/192 kHz
+ticli --quality HIGH    # FLAC, 16-bit/44.1 kHz — the default
+ticli --quality MEDIUM  # AAC 320 kbps
+ticli --quality LOW     # AAC 96 kbps
 ```
+
+The names follow TIDAL's own app. FLAC (`HIGH` and `MAX`) requires the PKCE
+sign-in: `ticli --login-flow pkce`, or press `u` on the settings page later.
+The old spellings `LOSSLESS` and `HIRES` still work as aliases.
 
 ### Keybindings
 
@@ -110,11 +115,11 @@ ticli --quality LOW        # 320kbps
 
 ## How it works
 
-Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate and fetch audio stream URLs. Audio is played through [ffplay](https://ffmpeg.org/ffplay.html). The TUI is built with [Rich](https://github.com/Textualize/rich).
+Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate and fetch audio stream URLs. Audio is played through [mpv](https://mpv.io). The TUI is built with [Rich](https://github.com/Textualize/rich).
 
 ```
 ┌─────────┐     OAuth      ┌───────────┐    stream URL    ┌───────────┐
-│  Ticli  │ ──────────────► │  TIDAL    │ ──────────────►  │  ffplay   │
+│  Ticli  │ ──────────────► │  TIDAL    │ ──────────────►  │    mpv    │
 │  (TUI)  │ ◄────────────── │  API      │                  │           │
 └─────────┘    metadata     └───────────┘                  └───────────┘
 ```
@@ -124,7 +129,7 @@ Ticli uses [tidalapi](https://github.com/tamland/python-tidal) to authenticate a
 - macOS or Linux
 - Python 3.10+
 - TIDAL Premium subscription
-- ffmpeg
+- mpv
 
 ## Credits
 

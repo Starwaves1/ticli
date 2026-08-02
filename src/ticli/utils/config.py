@@ -24,14 +24,19 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 CONFIG_DIR = Path.home() / ".config" / "ticli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
-# Ascending, and named exactly like tidalapi's Quality values so the setting
-# name, the stream label and what TIDAL actually sends can't drift apart.
-QUALITY_CHOICES = ["LOW", "HIGH", "LOSSLESS", "HIRES"]
+# Ascending, and named the way TIDAL's own player names its tiers — Low /
+# High / Max, plus the 320k AAC rung TIDAL files under Low's bitrate dropdown,
+# surfaced here as MEDIUM. These are ticli's names, *not* tidalapi's wire
+# values: QUALITY_MAP in player.py is the single translation between the two,
+# and QUALITY_RANK plus every persisted `granted`/tracker tier stay in
+# tidalapi's spelling. Do not "re-align" these names to tidalapi — three of
+# the four differ on purpose, and the difference is load-bearing.
+QUALITY_CHOICES = ["LOW", "MEDIUM", "HIGH", "MAX"]
 
 # What each tier actually streams. Sourced from tidalapi: Quality.low_96k /
 # low_320k are AAC (media.py parses their DASH codecs as mp4a.40.5 / mp4a.40.2),
@@ -40,9 +45,9 @@ QUALITY_CHOICES = ["LOW", "HIGH", "LOSSLESS", "HIRES"]
 # doesn't pin its ceiling, so the wording stays deliberately open.
 QUALITY_MEANINGS = {
     "LOW": "AAC ~96 kbps, lossy",
-    "HIGH": "AAC ~320 kbps, lossy",
-    "LOSSLESS": "FLAC 16-bit/44.1 kHz, CD quality",
-    "HIRES": "FLAC above CD, hi-res where the master allows",
+    "MEDIUM": "AAC ~320 kbps, lossy (TIDAL's Low at 320k)",
+    "HIGH": "FLAC 16-bit/44.1 kHz, CD quality",
+    "MAX": "FLAC above CD, up to 24-bit/192 kHz",
 }
 
 # v1 called every tier one step below what it actually streamed (its "LOW" asked
@@ -50,6 +55,14 @@ QUALITY_MEANINGS = {
 # downgraded saved configs, so v1 values are lifted to the name that keeps the
 # same stream. Applied once, on load; the next save stamps version 2.
 QUALITY_V1_RENAMES = {"LOW": "HIGH", "HIGH": "LOSSLESS"}
+
+# v4 named the tiers after tidalapi's wire values (LOW/HIGH/LOSSLESS/HIRES);
+# v5 renames them to match TIDAL's own player. Same streams, new names, so
+# every saved value is lifted to the name that keeps the same audio and the
+# rename is inaudible. "LOW" is absent because old LOW and new LOW are both
+# 96k. The v1 block above runs first, so a v1 config chains: its "LOW" (which
+# streamed 320k) becomes "HIGH" there and "MEDIUM" here — still 320k.
+QUALITY_V4_RENAMES = {"HIGH": "MEDIUM", "LOSSLESS": "HIGH", "HIRES": "MAX"}
 
 # v2 kept one three-way cache setting; v3 splits it into the two independent
 # things it was always describing — an index of your lists, and the tracks
@@ -69,7 +82,7 @@ SETTINGS_SPEC: list[dict] = [
         "key": "quality",
         "label": "Quality",
         "kind": "choice",
-        "default": "LOSSLESS",
+        "default": "HIGH",
         "choices": QUALITY_CHOICES,
         "value_desc": QUALITY_MEANINGS,
         "desc": "Stream quality. Applies from the next track. --quality overrides it for one run.",
@@ -256,6 +269,16 @@ def _migrate(cfg: dict) -> dict:
         columns = cfg.pop("progress_bar_width", None)
         if isinstance(columns, (int, float)) and not isinstance(columns, bool):
             cfg["progress_bar_max"] = int(columns)
+    if version < 5:
+        # The tidalapi-style tier names give way to TIDAL's own. Value-
+        # preserving like v1: without this, a saved "HIRES" would coerce to
+        # the default (a silent downgrade) and a saved "HIGH" would keep its
+        # spelling but change its meaning from 320k AAC to FLAC — a silent
+        # 4x data increase. The version number is what disambiguates the two
+        # meanings of "HIGH"; nothing else can.
+        quality = cfg.get("quality")
+        if isinstance(quality, str):
+            cfg["quality"] = QUALITY_V4_RENAMES.get(quality.upper(), quality)
     cfg["version"] = CONFIG_VERSION
     return cfg
 

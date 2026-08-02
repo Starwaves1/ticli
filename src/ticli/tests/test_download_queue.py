@@ -437,10 +437,10 @@ class TestEachBatchKeepsItsOwnTier:
                 lambda *a, **k: (time.sleep(0.12), real(*a, **k))[1])
 
             p._download_tracks = tracks[:2]
-            p._start_bulk_download_job("LOSSLESS")
+            p._start_bulk_download_job("HIGH")
             assert _wait_for(lambda: p._download_run is not None, 5)
             p._download_tracks = tracks[2:]
-            p._start_bulk_download_job("HIRES")
+            p._start_bulk_download_job("MAX")
 
             _finished(p)
             assert asked[1] == "LOSSLESS" and asked[2] == "LOSSLESS"
@@ -511,7 +511,7 @@ class TestOnlyOnePacedResolverEverRuns:
     either was measured at, and not a rate anybody chose."""
 
     def test_a_refetch_will_not_start_while_a_download_is_running(self):
-        p = _player(quality="HIRES")
+        p = _player(quality="MAX")
         p._download_job = {"state": "running", "bulk": True, "tracks": 3,
                            "done": 0, "failed": 0,
                            "slots": p._new_download_slots()}
@@ -522,7 +522,7 @@ class TestOnlyOnePacedResolverEverRuns:
 
     def test_a_download_will_not_start_while_a_refetch_is_running(self):
         p = _player()
-        p._refetch_job = {"state": "running", "tier": "HIRES", "done": 0,
+        p._refetch_job = {"state": "running", "tier": "MAX", "done": 0,
                           "total": 4, "failed": 0}
         p._download_tracks = [_track(1), _track(2)]
         p._download_track = p._download_tracks[0]
@@ -599,7 +599,7 @@ class TestTheSettingsPageSaysWhatIsDownloading:
         slots = p._new_download_slots()
         slots[0].update(state="running", samples=(4 * 1024 * 1024,))
         slots[1].update(state="running", samples=(4.3 * 1024 * 1024,))
-        job = {"state": "running", "bulk": True, "tier": "LOSSLESS",
+        job = {"state": "running", "bulk": True, "tier": "HIGH",
                "track_id": None, "tracks": 18, "done": 3, "failed": 0,
                "slots": slots, "error": "", "labels": ("OutRun",),
                "estimate": 0}
@@ -655,10 +655,10 @@ class TestTheSettingsPageSaysWhatIsDownloading:
         """A re-fetch is this page's own job and [Esc] here is what stops it,
         so it is never displaced. (They cannot both run.)"""
         p = self._running()
-        p._refetch_job = {"state": "running", "tier": "HIRES", "done": 1,
+        p._refetch_job = {"state": "running", "tier": "MAX", "done": 1,
                           "total": 4, "failed": 0}
         page = p._build_settings_display().plain
-        assert "Re-fetching at HIRES" in page
+        assert "Re-fetching at MAX" in page
 
     def test_it_costs_no_row_at_eighty_by_twentyfour(self):
         p = self._running()
