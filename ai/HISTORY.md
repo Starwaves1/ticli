@@ -834,6 +834,46 @@ unchanged by playing. 1365 in the suite.
 
 ---
 
+## 2026-08-02
+
+### The state file can no longer crash startup by being a JSON list
+
+`~/.config/ticli/player_state.json` containing `[]` — valid JSON, wrong shape —
+crashed `_restore_state` with an `AttributeError`: it caught only
+`JSONDecodeError`/`OSError` around `json.loads` and then called `.get()` on
+whatever parsed. Every other loader in the codebase (`load_config`,
+`cache._load`, `cache._load_tracker`, `downloads.load_index`, even
+`_remember_last_playlist` three screens up in the same file) has the
+`isinstance(data, dict)` guard and honors "missing or corrupt → defaults,
+never raises". This one reader missed it.
+
+The fix is one method, `HeadlessTidalPlayer._read_state_dict()`: read
+`STATE_FILE`, return the dict, or `{}` for missing/`OSError`/
+`JSONDecodeError`/`UnicodeDecodeError`/non-dict JSON — the same contract,
+stated in its docstring. All three readers (`_restore_state`,
+`_merge_position_into_saved_state`, `_remember_last_playlist`) now go through
+it, each keeping its exact prior semantics: restore over an empty dict returns
+before spawning the fetch thread, the position merge finding no `track_ids`
+writes nothing (a `[]` file stays byte-for-byte `[]` — asserted), and the
+playlist pin still starts from `{}` and heals the file into a dict. The method
+is deliberately the *single* place state is read, mirroring
+`_write_state_file` on the write side — a later change serializes access
+around this pair, and a test can monkeypatch it trivially.
+
+**Rejected:** pasting the `isinstance` guard into each reader inline — three
+copies of the contract is how one of them went missing in the first place, and
+it leaves no seam for the planned serialization. Also rejected: folding any
+pacing or locking in now; later stages own that, this commit is the guard
+alone.
+
+Six tests (`TestNonDictStateFile`), asserting the observable thing: a `[]`
+file and a bare-string file leave the queue unattached and cost **exactly 0**
+`track()` fetches on a counting fake session; a following `_save_state`
+writes a well-formed dict that a second player restores cleanly, round-tripped
+through the real file; the pin lands over a `[]` file and the file is a dict
+afterwards. Verified red first: the three crash tests fail with the exact
+`AttributeError` when the fix is stashed. 1404 in the suite.
+
 ## In flight at time of writing
 
 - **Responsive narrow-width layout + `v` volume overlay** — width-derived

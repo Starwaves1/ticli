@@ -270,6 +270,115 @@ class TestTogglePlayResume:
         assert p._seeks == [0]
 
 
+class _CountingSession(_FakeSession):
+    """Fake session that counts every track() fetch."""
+
+    def __init__(self, tracks):
+        super().__init__(tracks)
+        self.track_calls = 0
+
+    def track(self, tid):
+        self.track_calls += 1
+        return super().track(tid)
+
+
+class TestNonDictStateFile:
+    """A state file that is valid JSON but not a dict used to crash startup:
+    _restore_state only caught JSONDecodeError/OSError around json.loads, then
+    called .get() on whatever parsed. The contract everywhere else is
+    'missing or corrupt -> defaults, never raises' — this held it to that."""
+
+    def _patch_state_paths(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(player_mod, "STATE_DIR", tmp_path)
+        state_file = tmp_path / "player_state.json"
+        monkeypatch.setattr(player_mod, "STATE_FILE", state_file)
+        return state_file
+
+    def _player_with_counting_session(self):
+        p = HeadlessTidalPlayer()
+        p.session = _CountingSession([_fake_track(1), _fake_track(2), _fake_track(3)])
+        return p
+
+    def test_a_list_state_file_neither_crashes_restore_nor_spends_requests(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        state_file.write_text("[]")
+
+        p = self._player_with_counting_session()
+        p._restore_state()  # must not raise
+        time.sleep(0.2)  # a wrongly-spawned fetch thread would land in here
+
+        assert p._queue == []
+        assert p._current_track is None
+        assert p.session.track_calls == 0
+
+    def test_a_bare_string_state_file_reads_the_same_as_a_missing_one(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        state_file.write_text('"not a dict"')
+
+        p = self._player_with_counting_session()
+        p._restore_state()  # must not raise
+        time.sleep(0.2)
+
+        assert p._queue == []
+        assert p._current_track is None
+        assert p.session.track_calls == 0
+
+    def test_a_save_after_a_bad_file_writes_a_dict_a_second_player_restores(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        state_file.write_text("[]")
+
+        p = self._player_with_counting_session()
+        p._restore_state()
+        p._current_track = _fake_track(2)
+        p._play_offset = 12.0
+        p._save_state()
+
+        saved = json.loads(state_file.read_text())
+        assert isinstance(saved, dict)
+        assert saved["track_ids"] == [2]
+        assert saved["position"] == 12.0
+
+        fresh = _make_player()  # next run, same (healed) state file
+        fresh._restore_state()
+        assert _wait_for(lambda: fresh._current_track is not None)
+        assert fresh._current_track.id == 2
+        assert fresh._play_offset == 12.0
+        assert fresh._playing is False
+
+    def test_pinning_a_playlist_over_a_non_dict_file_lands_and_heals_it(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        state_file.write_text("[]")
+
+        p = _make_player()
+        p._remember_last_playlist(types.SimpleNamespace(id="uuid-Mix B"))
+
+        saved = json.loads(state_file.read_text())
+        assert isinstance(saved, dict)
+        assert saved["last_playlist_id"] == "uuid-Mix B"
+        assert p._last_playlist_id == "uuid-Mix B"
+
+    def test_position_merge_over_a_non_dict_file_writes_nothing(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+        state_file.write_text("[]")
+
+        p = _make_player()
+        p._current_track = _fake_track(2)
+        p._play_offset = 77.0
+        p._merge_position_into_saved_state()  # no usable track_ids -> no-op
+
+        assert state_file.read_text() == "[]"  # byte-for-byte untouched
+
+    def test_position_merge_with_no_file_still_writes_nothing(self, tmp_path, monkeypatch):
+        state_file = self._patch_state_paths(monkeypatch, tmp_path)
+
+        p = _make_player()
+        p._current_track = _fake_track(2)
+        p._play_offset = 77.0
+        p._merge_position_into_saved_state()
+
+        assert not state_file.exists()
+
+
 class TestSaveStateHardening:
     def _patch_state_paths(self, monkeypatch, tmp_path):
         monkeypatch.setattr(player_mod, "STATE_DIR", tmp_path)

@@ -2532,12 +2532,31 @@ class HeadlessTidalPlayer:
         os.chmod(tmp, 0o600)
         os.replace(tmp, STATE_FILE)
 
-    def _merge_position_into_saved_state(self):
-        """Refresh only the position in the saved file, if the track matches."""
-        if self._current_track is None or not STATE_FILE.exists():
-            return
+    def _read_state_dict(self) -> dict:
+        """Read the state file as a dict. Missing or corrupt → {}, never raises.
+
+        Same contract as load_config and the cache loaders: a file that is
+        absent, unreadable, undecodable, or valid JSON that is not a dict all
+        read as empty. This is the single place player state is read — every
+        reader goes through it (writers through _write_state_file), so a later
+        change can serialize access here, and a test can monkeypatch it.
+        """
         try:
             data = json.loads(STATE_FILE.read_text())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.debug("Unusable player state, starting empty: %s", e)
+            return {}
+        if not isinstance(data, dict):
+            logger.debug("Player state is not a dict, starting empty")
+            return {}
+        return data
+
+    def _merge_position_into_saved_state(self):
+        """Refresh only the position in the saved file, if the track matches."""
+        if self._current_track is None:
+            return
+        try:
+            data = self._read_state_dict()
             ids = data.get("track_ids", [])
             idx = data.get("queue_index", 0)
             if ids and 0 <= idx < len(ids) and ids[idx] == self._current_track.id:
@@ -2564,14 +2583,7 @@ class HeadlessTidalPlayer:
         if not pid:
             return
         self._last_playlist_id = pid
-        data = {}
-        try:
-            if STATE_FILE.exists():
-                loaded = json.loads(STATE_FILE.read_text())
-                if isinstance(loaded, dict):
-                    data = loaded
-        except (json.JSONDecodeError, OSError) as e:
-            logger.debug("Failed to read state before pinning playlist: %s", e)
+        data = self._read_state_dict()
         data["last_playlist_id"] = pid
         try:
             self._write_state_file(data)
@@ -2625,11 +2637,8 @@ class HeadlessTidalPlayer:
 
     def _restore_state(self):
         """Restore queue and search history from previous session."""
-        if not STATE_FILE.exists():
-            return
-        try:
-            data = json.loads(STATE_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
+        data = self._read_state_dict()
+        if not data:
             return
         self._search_history = data.get("search_history", [])[:200]
         self._last_playlist_id = data.get("last_playlist_id") or None
