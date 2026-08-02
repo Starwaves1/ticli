@@ -907,3 +907,15 @@ docs-level; removing the fallback (volume clamping, seek-by-respawn, tests)
 was not asked for and is recorded as an open question in DECISIONS.md. And
 nothing was probed live: whether this account's MAX really returns 24/192
 remains unverified, as the research doc already said.
+
+### Same day, follow-up — the badge shows formats after all
+
+The tier-name badge lasted one review: Garrett wants formats — *"even if
+sometimes it falls back to a slightly different quality"*, i.e. he accepts
+that MAX's `24/192 FLAC` label is the tier's nominal ceiling rather than the
+master's real resolution, which was the exact honesty concern that had
+argued for names. Owner's call, recorded as such. `QUALITY_LABELS` became
+`96k AAC / 320k AAC / 16/44.1 FLAC / 24/192 FLAC`, the settings ladder shows
+the format beside each name again (70 columns for all four, inside the
+80-column budget), and the gate note now reads "TIDAL sends 320k AAC
+instead". Five rendered-screen assertions moved with it. 1403 still pass.

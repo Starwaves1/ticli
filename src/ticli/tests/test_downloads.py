@@ -2035,8 +2035,8 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
         self._play(p, self._streaming_track([]))
         text = _rendered(p)
 
-        assert "HIGH · downloaded" in text
-        assert "MAX" not in text, "it claimed the tier of the setting"
+        assert "16/44.1 FLAC · downloaded" in text
+        assert "24/192" not in text, "it claimed the tier of the setting"
 
     def test_an_unrecorded_tier_claims_nothing(self, monkeypatch):
         """A download adopted before the index recorded tiers. "We do not
@@ -2048,7 +2048,7 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
         text = _rendered(p)
 
         assert "downloaded" in text
-        assert "MAX" not in text
+        assert "24/192" not in text
 
     def test_a_streamed_track_still_shows_the_setting(self):
         """The badge is not a permanent takeover — the setting is the truth
@@ -2064,7 +2064,7 @@ class TestADownloadedTrackIsNeverUpgradedBehindYourBack:
 
         text = _rendered(p)
         assert "downloaded" not in text
-        assert "HIGH" in text
+        assert "16/44.1 FLAC" in text
 
 
 class TestSettingsShowsTheFolder:

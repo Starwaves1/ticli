@@ -812,7 +812,7 @@ class TestGatingOnThePage:
         # Still listed — a hidden option looks like a missing feature
         assert "HIGH and MAX" in page
         assert "isn't served" in page
-        assert "TIDAL sends MEDIUM instead" in page
+        assert "TIDAL sends 320k AAC instead" in page
 
     def test_the_page_points_at_the_fix_when_the_chosen_tier_is_gated(self, token_file):
         page = self._settings_page(granted="HIGH")._build_settings_display().plain

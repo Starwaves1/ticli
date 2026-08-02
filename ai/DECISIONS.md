@@ -284,12 +284,14 @@ migration renames saved values (the v1 precedent, reused); `LOSSLESS`/`HIRES`
 live on as CLI aliases; `--quality HIGH` — the one spelling that changed
 meaning — announces its new meaning on stderr each use.
 
-Sub-decision, made without him and easy to flip: the **now-playing badge
-shows the tier name** (`MAX`, `HIGH · downloaded`), matching how the app
-badges tracks. The alternative — a format badge like `24/192` — was rejected
-because MAX's real resolution varies per master and the badge would overclaim
-on a 24/48 file. If he prefers the format there, `QUALITY_LABELS` in
-player.py is the one seam to change.
+Sub-decision, initially made without him as tier-name badges, **overturned by
+Garrett the same day**: *"I'd like formats even if sometimes it falls back to
+a slightly different quality."* The badge is now the stream format —
+`96k AAC / 320k AAC / 16/44.1 FLAC / 24/192 FLAC` — with the overclaim risk
+on MAX (a nominal 24/192 label over a master that is really 24/48) accepted
+by him explicitly. `QUALITY_LABELS` in player.py is the single seam, and the
+settings ladder shows the format beside each tier name again (70 columns for
+all four, still inside the page's 80-column budget).
 
 ## The README documents mpv only (Garrett, 2026-08-02)
 

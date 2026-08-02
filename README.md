@@ -12,7 +12,7 @@ Works on **macOS** and **Linux**.
 │  ▶ ♥ Arlo Parks - Sophie                               │
 │     Super Sad Generation                               │
 │     1:47 ━━━━━━━━●━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3:28    │
-│     Queue: 3/12  HIGH                                  │
+│     Queue: 3/12  16/44.1 FLAC                          │
 │     Next: Cola • Arlo Parks                            │
 │                                                        │
 │  [space] play/pause  [←/→] prev/next  [s] search       │

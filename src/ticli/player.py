@@ -1959,17 +1959,18 @@ class HeadlessTidalPlayer:
         "tidal_playlists": ("playlists",),
     }
 
-    # The badge is the tier's own name, exactly as TIDAL's app badges tracks.
-    # Deliberately not the stream format: "24/192" over a MAX track whose
-    # master is really 24/48 would be a claim about bytes we haven't seen,
-    # while the tier name only claims what was asked and granted — which is
-    # known. (An identity map today, but it is the one seam where a format
-    # badge could go, and _tier_label reads it.)
+    # The badge is the stream's format — the owner's call (2026-08-02): "I'd
+    # like formats even if sometimes it falls back to a slightly different
+    # quality." The drift he is accepting sits in MAX, whose label is the
+    # tier's nominal ceiling: the master decides the real resolution, and a
+    # 24/192 badge over a 24/48 file is a promise being quoted, not a
+    # measurement. The AAC rates are effectively exact, and 16/44.1 is what
+    # HIGH always is.
     QUALITY_LABELS = {
-        "LOW": "LOW",
-        "MEDIUM": "MEDIUM",
-        "HIGH": "HIGH",
-        "MAX": "MAX",
+        "LOW": "96k AAC",
+        "MEDIUM": "320k AAC",
+        "HIGH": "16/44.1 FLAC",
+        "MAX": "24/192 FLAC",
     }
 
     def __init__(self, quality: Optional[str] = None, login_flow: Optional[str] = None):
@@ -4231,6 +4232,12 @@ class HeadlessTidalPlayer:
                 # feature, where a dimmed one explains itself
                 gated = self._quality_unavailable(choice)
                 content.append(choice, style="dim" if gated else ("bold cyan" if on else "dim"))
+                # The format beside the name, now that the two say different
+                # things
+                short = self.QUALITY_LABELS.get(choice, "")
+                if short and short != choice:
+                    content.append(
+                        f" {short}", style="dim" if gated else ("cyan" if on else "dim"))
             content.append_text(self._build_quality_gate_note())
         # A --quality flag beats the saved value for this run without changing it
         if self._quality_name != self.config.get("quality"):
