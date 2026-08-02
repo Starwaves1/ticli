@@ -2396,3 +2396,176 @@ class TestSeeingAndRemovingWhatYouHave:
         assert "Delete Come On! Feel the Illinoise! from your music folder?" in text
         # The part that says how to answer must never be the part that is cut
         assert "y to confirm, any other key to cancel" in text
+
+
+def _run_together(jobs, timeout=30.0):
+    """Start every job on its own thread, wait for all of them, re-raise.
+
+    Same shape as test_cache's helper, for the same reason: a failure inside
+    a thread is otherwise a printed traceback and a green test, and a writer
+    still alive after the timeout is a deadlock, not a race.
+    """
+    errors = []
+
+    def wrap(job):
+        def run():
+            try:
+                job()
+            except BaseException as e:  # noqa: BLE001 - re-raised below
+                errors.append(e)
+        return run
+
+    threads = [threading.Thread(target=wrap(job), daemon=True) for job in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout)
+    alive = [t for t in threads if t.is_alive()]
+    assert not alive, \
+        f"{len(alive)} index writer(s) never finished — a deadlock, not a race"
+    if errors:
+        raise errors[0]
+
+
+def _widen_the_window(monkeypatch, pause=0.002):
+    """Hold every index read open for a moment, so the race is certain.
+
+    The losing interleave is a thread switch between `_mutate_index`'s load
+    and its save. That window is real — the bulk runner's writer thread
+    records a finished download while [x] deletes another on the UI thread —
+    but far too narrow for a test to land on by throwing threads at it.
+    Sleeping inside `load_index` makes the scheduler's worst case happen
+    every run instead of once in a thousand: without the lock every overlap
+    loses a writer's edit and the assertions below fail flat; with it the
+    second writer waits at the door and the sleep only slows the test down.
+
+    Patched on the module, which is where `_mutate_index` looks it up, so
+    the sleep lands inside the locked cycle.
+    """
+    original = downloads.load_index
+
+    def slow_load():
+        tracks = original()
+        time.sleep(pause)
+        return tracks
+
+    monkeypatch.setattr(downloads, "load_index", slow_load)
+
+
+class TestIndexWritesAreSerialized:
+    """`record` and `remove` are both load-modify-save over downloads.json,
+    and they run on different threads: the bulk runner's single writer
+    thread commits finished downloads while the downloads list's [x] runs
+    `remove` on the UI thread, reachable the whole time a run is going. The
+    runner's one-thread-calls-the-callables design serializes the runner
+    against itself and nothing else — `_index_lock` is what serializes the
+    pair.
+
+    Losing the race one way resurrects a deleted row, which is mostly
+    harmless because every read stats the disk. The other way is not: a
+    just-finished download's row vanishes, the file sits in the music folder
+    unindexed, shows as not downloaded, and would be re-downloaded — an
+    orphan in the one tier where nothing may clean up. Timing tests, so they
+    are written to fail rather than flake: fixed work per thread, a widened
+    window, and assertions on the exact final bytes of the real index file
+    and the real files under a tmp download root.
+    """
+
+    def _file(self, tid, name, data=b"a" * 64):
+        root = downloads.download_dir()
+        path = root / "Fleetwood Mac" / "Rumours" / f"{tid:02d} {name}.m4a"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def _rows_on_disk(self):
+        data = json.loads(downloads.index_file().read_text())
+        assert data["version"] == downloads.INDEX_VERSION
+        return data["tracks"]
+
+    def _record_beside_remove(self, monkeypatch, record_starts_first):
+        """One finished download recorded beside one [x] delete. Both orders
+        lose without the lock — remove saving last erases the fresh row,
+        record saving last resurrects the deleted one — and the final file
+        must show neither."""
+        doomed = self._file(2, "Gold Dust Woman")
+        root = downloads.download_dir()
+        downloads.record(2, doomed.relative_to(root), "HIGH",
+                         doomed.stat().st_size)
+        fresh = self._file(1, "Dreams")
+        _widen_the_window(monkeypatch)
+
+        def commit():
+            downloads.record(1, fresh.relative_to(root), "HIGH",
+                             fresh.stat().st_size)
+
+        def delete():
+            assert downloads.remove(2) is True
+
+        jobs = [commit, delete] if record_starts_first else [delete, commit]
+        _run_together(jobs)
+
+        rows = self._rows_on_disk()
+        assert "1" in rows, \
+            "a just-finished download's row was erased by the delete"
+        assert rows["1"]["path"] == str(fresh.relative_to(root))
+        assert "2" not in rows, "the deleted row came back"
+        assert not doomed.exists()
+        assert fresh.read_bytes() == b"a" * 64
+
+    def test_a_record_landing_beside_a_delete_keeps_both_outcomes(self, monkeypatch):
+        self._record_beside_remove(monkeypatch, record_starts_first=True)
+
+    def test_the_same_pair_the_other_way_round_loses_nothing_either(self, monkeypatch):
+        self._record_beside_remove(monkeypatch, record_starts_first=False)
+
+    def test_a_hammer_of_concurrent_records_keeps_every_row(self, monkeypatch):
+        """Four threads recording distinct tracks at once. Unlocked, every
+        overlap keeps only the later writer's whole dict, so most of the
+        rows never reach the file; the final file must hold all of them."""
+        root = downloads.download_dir()
+        rounds, lanes = 10, 4
+        paths = {}
+        for lane in range(lanes):
+            for n in range(rounds):
+                tid = lane * 100 + n
+                paths[tid] = self._file(tid, f"Song {tid}", data=b"x" * (tid + 1))
+        _widen_the_window(monkeypatch)
+
+        def writer(lane):
+            def job():
+                for n in range(rounds):
+                    tid = lane * 100 + n
+                    downloads.record(tid, paths[tid].relative_to(root),
+                                     "HIGH", tid + 1)
+            return job
+
+        _run_together([writer(lane) for lane in range(lanes)])
+
+        rows = self._rows_on_disk()
+        assert set(rows) == {str(tid) for tid in paths}, \
+            "a concurrent record's row never made it to the file"
+        for tid, path in paths.items():
+            assert rows[str(tid)]["path"] == str(path.relative_to(root))
+            assert rows[str(tid)]["bytes"] == tid + 1
+
+    def test_record_and_remove_hold_the_lock_across_the_save(self, monkeypatch):
+        """Structural: every write reaches `_save_index` with `_index_lock`
+        held, so a new writer that bypassed `_mutate_index` fails here
+        rather than one run in a thousand."""
+        held = []
+        original = downloads._save_index
+
+        def guarded(tracks):
+            held.append(downloads._index_lock.locked())
+            original(tracks)
+
+        monkeypatch.setattr(downloads, "_save_index", guarded)
+        path = self._file(1, "Dreams")
+        downloads.record(1, path.relative_to(downloads.download_dir()),
+                         "HIGH", 64)
+        assert downloads.remove(1) is True
+        assert held == [True, True], \
+            "a writer reached _save_index without holding _index_lock"
+        assert self._rows_on_disk() == {}
+        assert not path.exists()

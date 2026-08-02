@@ -63,8 +63,9 @@ rewritten to remove ffmpeg entirely.
   nothing inside it may call another lock-taking function (plain `Lock` is
   not reentrant — restructure into unlocked `_locked` halves instead).
   Precedents: the cache tracker's `_tracker_lock` (2026-07-27), the player
-  state's `_state_lock` (2026-08-02). Cross-*process* races over these files
-  remain accepted, as before.
+  state's `_state_lock` (2026-08-02), the download index's `_index_lock`
+  (2026-08-02). Cross-*process* races over these files remain accepted, as
+  before.
 - Generation counters are the established pattern for "a result landed after
   the thing it was for went away" (`_search_gen`, `_play_gen`,
   `_download_gen`, `_artwork_request`).

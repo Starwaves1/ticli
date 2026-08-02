@@ -57,6 +57,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -249,6 +250,13 @@ def destination(meta: dict, ext: str) -> Path:
 
 # ── the index ──
 
+# Serializes the index's two writers, `record` and `remove`, which really do
+# overlap: the bulk runner's writer thread records finished downloads while
+# the downloads list's [x] delete runs `remove` on the UI thread. Held only
+# inside `_mutate_index`, across one whole load-modify-save cycle, and taken
+# exactly once — the leaf-lock convention `_tracker_lock` set in cache.py.
+_index_lock = threading.Lock()
+
 
 def load_index() -> dict:
     """Track id (as a string) → record. Missing or corrupt reads as empty."""
@@ -263,6 +271,9 @@ def load_index() -> dict:
 
 
 def _save_index(tracks: dict) -> None:
+    # Reached only through `_mutate_index`, so `_index_lock` is already held.
+    # Temp + `os.replace`: the file is replaced whole, never edited in place,
+    # which is what keeps the lock-free readers below correct.
     try:
         cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = index_file()
@@ -274,9 +285,43 @@ def _save_index(tracks: dict) -> None:
         logger.debug("Could not write the download index: %s", e)
 
 
+def _mutate_index(change) -> None:
+    """Read the index, let `change` edit a private copy, save it.
+
+    The one read-modify-write cycle in this module, and the only thing that
+    takes `_index_lock` — both writers funnel through it so that "load" and
+    "save" cannot be prised apart by another thread. They can be: `record`
+    runs on the bulk runner's writer thread while `remove` runs on the UI
+    thread, and unlocked, the loser's stale load erases the winner's edit —
+    one way a deleted row is resurrected (harmless, every read stats the
+    disk), the other way a just-finished download's row vanishes and a real
+    file in the music folder shows as not downloaded and would be fetched
+    again. The lock is held across the *whole* cycle, the read included,
+    because the stale read is what loses the other writer's update.
+
+    `change` mutates the dict it is handed and may return False for "nothing
+    moved", which skips the write entirely. A leaf by construction: nothing
+    reachable from `change` takes another lock. `remove`'s single unlink
+    happens inside the cycle — one syscall on one exact path is not the
+    directory walk the tracker keeps outside its lock — so the row and the
+    file cannot disagree about a delete that raced a record.
+
+    Reads (`load_index`, `path_for`, `present`, `usage`) stay lock-free and
+    stay right: `_save_index` replaces the file whole and every load parses
+    a fresh dict, so a reader sees some complete generation of the index,
+    never a torn one.
+    """
+    with _index_lock:
+        tracks = dict(load_index())
+        if change(tracks) is False:
+            return
+        _save_index(tracks)
+
+
 def record(track_id, relpath: Path, quality: str, size: int,
            granted=None) -> None:
-    """Remember a finished download. Whole-dict replacement, no locks.
+    """Remember a finished download. Whole-dict replacement, serialized
+    against `remove` by `_mutate_index`'s lock.
 
     Two tiers are recorded and they are not the same thing. `quality` is the
     tier the **user asked for** (`LOW`/`HIGH`/`LOSSLESS`/`HIRES`, the settings
@@ -289,12 +334,14 @@ def record(track_id, relpath: Path, quality: str, size: int,
     """
     if track_id is None:
         return
-    tracks = dict(load_index())
-    tracks[str(track_id)] = {
-        "path": str(relpath), "quality": quality, "granted": granted,
-        "bytes": int(size), "at": time.time(),
-    }
-    _save_index(tracks)
+
+    def change(tracks):
+        tracks[str(track_id)] = {
+            "path": str(relpath), "quality": quality, "granted": granted,
+            "bytes": int(size), "at": time.time(),
+        }
+
+    _mutate_index(change)
 
 
 def _entry_path(entry):
@@ -430,21 +477,30 @@ def remove(track_id) -> bool:
     downloaded" is exactly what the caller asked for. A file that is really
     there and cannot be unlinked leaves the row alone, so the interface keeps
     saying the true thing.
+
+    The whole of it — pop, unlink, save — runs inside `_mutate_index`'s
+    cycle, so a `record` landing from the bulk runner's thread while this
+    runs on the UI thread can neither resurrect the deleted row nor have its
+    own row erased by this call's stale read.
     """
     key = str(track_id)
-    tracks = dict(load_index())
-    entry = tracks.pop(key, None)
-    if entry is None:
-        return False
-    path = _entry_path(entry)
-    if path is not None:
-        try:
-            path.unlink()
-        except OSError as e:
-            logger.debug("Could not delete the download %s: %s", path, e)
+    outcome = {"removed": False}
+
+    def change(tracks):
+        entry = tracks.pop(key, None)
+        if entry is None:
             return False
-    _save_index(tracks)
-    return True
+        path = _entry_path(entry)
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError as e:
+                logger.debug("Could not delete the download %s: %s", path, e)
+                return False  # the file is really there: keep the row too
+        outcome["removed"] = True
+
+    _mutate_index(change)
+    return outcome["removed"]
 
 
 # ── estimates ──

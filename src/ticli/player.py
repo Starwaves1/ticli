@@ -1073,9 +1073,12 @@ class _PacedRun:
 
         A finished fetch hands back a `record` callable rather than writing
         the download index itself: `downloads.record` is a read-modify-write
-        of one JSON file, and three of those at once lose rows. This thread
-        is the only one that ever calls them, and the only one that reads or
-        writes `_written`.
+        of one JSON file, and three of those at once used to lose rows. The
+        index now holds `downloads._index_lock` across that cycle — it has
+        to, because the UI thread's [x] delete overlaps a run no matter what
+        this thread does — so the lock is the guarantee and this thread is
+        the design: commits stay in landing order, off the fetch workers,
+        and this is still the only thread that reads or writes `_written`.
         """
         results = self.results[:]
         for _ok, _message, record in results[self._written:]:
@@ -7097,8 +7100,10 @@ class HeadlessTidalPlayer:
 
         `record=False` hands the index write back to the caller as
         `plan["record"]`, because `downloads.record` is a read-modify-write of
-        one JSON file and three of those at once lose rows. The bulk runner
-        takes that callable and runs it on its own single thread.
+        one JSON file and three at once belong on one thread. The bulk runner
+        takes that callable and runs it on its own single thread; the index's
+        own `_index_lock` is what makes the cycle safe against the UI
+        thread's delete, which no arrangement of these threads could be.
         """
         track_id = plan["track_id"]
         final = None

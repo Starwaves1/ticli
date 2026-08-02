@@ -1038,6 +1038,63 @@ call structure explicit — the tracker precedent chose leaf discipline), and
 locking `_restore_state`'s read (it is not a read-modify-write; a lock there
 buys nothing and puts a disk read behind a writer). 1419 in the suite.
 
+### Download index writes are serialized — the third of the family
+
+`downloads.json` was the file WORKING-RULES' lock rule already named as next
+("general enough to cover the downloads index when it joins"), and it had
+joined: `record` and `remove` are both `load_index` → mutate → `_save_index`
+with nothing holding them apart. The bulk runner's careful design — every
+`record` callable runs on its own single writer thread (`_PacedRun._flush`) —
+serializes the runner against *itself* and nothing else, and since 9b51224
+the downloads list's `[x]` runs `remove` on the UI thread, reachable while a
+run is going. Losing the race one way resurrects a deleted row, which is
+mostly harmless because every read stats the disk. The other way a
+just-finished download's row vanishes: the file exists in `~/Music/Ticli`
+but is unindexed, shows as not downloaded, and would be re-downloaded — an
+orphan in the one tier where nothing may clean up.
+
+Same cure as its siblings (d5316e7, the player state): a module-level
+`_index_lock` and `_mutate_index(change)` mirroring `_mutate_tracker`, the
+lock held across the whole load-copy-change-save cycle — the read included,
+because the stale read is what loses the other writer's update — with
+`change` returning False for "nothing moved" to skip the write. `remove`'s
+single unlink happens *inside* the cycle: one syscall on one exact path is
+not the directory walk the tracker keeps outside its lock, and moving it out
+would re-open a window where the row and the file disagree. Semantics are
+preserved exactly — row gone + True when the file was already missing, row
+kept + False when a real file cannot be unlinked. Reads (`load_index`,
+`path_for`, `present`, `usage`) stay lock-free: the file is replaced whole
+and every load parses a fresh dict. The runner's single-thread commit design
+stays untouched — it still keeps commits ordered and off the fetch workers —
+but the lock is the guarantee now, not the scheduler, and the comments in
+player.py say so instead of claiming the thread alone was the defence.
+
+Measured: with the lock neutered (`nullcontext`, restructure kept), all four
+new tests fail flat five runs out of five — the record-beside-remove pair
+ends with the fresh row erased from the file in both start orders, and a
+four-thread hammer of 40 distinct `record`s leaves **7 rows of 40** in the
+final file. With the lock, green every run; also verified red with the whole
+src change stashed.
+
+4 tests (`TestIndexWritesAreSerialized` in test_downloads.py), siblings of
+`TestTrackerWritesAreSerialized` down to the technique: `_run_together`
+re-raises thread errors and calls a still-alive thread a deadlock,
+`_widen_the_window` sleeps inside `load_index` so the losing interleave
+happens every run. All assert the final bytes of the real `downloads.json`
+and real files under a tmp download root: record-beside-remove in both
+orders (new row present, deleted row gone, deleted file unlinked), the
+hammer (all 40 rows with their exact paths and byte counts), and a
+structural test that both writers reach `_save_index` holding `_index_lock`.
+
+Out of scope, same rule as the tracker's and the state file's: the
+cross-*process* race over `downloads.json` remains accepted. Rejected:
+locking the readers (nothing to gain — the file is replaced whole — and it
+would put a disk read behind the UI thread's writer), and having `remove`
+unlink outside the lock (the tracker precedent is about directory *walks*;
+splitting one exact unlink from its row's removal is what a torn delete
+looks like). WORKING-RULES' precedent list now names `_index_lock` alongside
+its two siblings. 1423 in the suite.
+
 ## In flight at time of writing
 
 - **Responsive narrow-width layout + `v` volume overlay** — width-derived
