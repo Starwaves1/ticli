@@ -979,6 +979,65 @@ restored shim resolves and starts. Verified red first with the player.py
 change stashed: the record restores fail, the 429 halt fails, the record
 mirror is a KeyError, the radio test fails 0 == 1. 1415 in the suite.
 
+### Player state writes are serialized, the tracker fix's sibling
+
+`player_state.json` had the same disease d5316e7 cured in the cache tracker:
+several read-modify-write writers on different threads with nothing holding
+them apart. `_save_state` runs on the monitor thread every 10 seconds and on
+the main thread at shutdown; `_merge_position_into_saved_state` runs under it
+while a restore is pending; `_remember_last_playlist` runs on the
+add-to-playlist background thread. Each reads the file (or the in-memory
+fields), edits, and replaces the file whole — so an autosave landing between
+the pin's read and write was clobbered by the stale copy the pin had read
+(fresh queue and position gone from disk; a crash before the next autosave
+loses up to 10 seconds of session), and the reverse erased the pin the user
+had just watched a toast confirm.
+
+The fix reads as the tracker's sibling on purpose. One `threading.Lock`
+(`_state_lock`) held across each *complete* load-modify-save cycle — the read
+included, because the stale read is what loses the other writer's update; a
+lock around the write alone would fix nothing. It is a leaf taken exactly
+once per cycle: `_save_state`'s restore-pending branch used to call
+`_merge_position_into_saved_state`, and a plain Lock is not reentrant, so the
+merge (and the full save) split into unlocked `_locked` halves with the lock
+taken in the public wrappers — the shape `_mutate_tracker` set. Reads
+(`_restore_state`, any bare `_read_state_dict`) stay lock-free and stay
+right: `_write_state_file`'s temp+rename replaces the file whole, so a reader
+sees one generation of it, never a torn one. WORKING-RULES' blanket "No
+locks" bullet was factually stale since d5316e7 and now states the refined
+convention: in-memory reads never locked, a multi-writer load-modify-save
+cycle over one on-disk JSON file always is (tracker, player state — and
+general enough to cover the downloads index when it joins).
+
+Measured: with the lock neutered (restructure kept, `nullcontext` for the
+lock), both race tests fail flat five runs out of five with the exact
+lost-update symptoms — the pin's stale read resurrects a previous session's
+`track_ids [9]` over the fresh `[1, 2]`, and the merge's `position 77.0`
+rolls back to `42.5`. With the lock, green every run. Also verified red with
+the whole player.py change stashed.
+
+4 tests (`TestStateWritesAreSerialized` in test_resume.py), siblings of
+test_cache.py's `TestTrackerWritesAreSerialized` down to the technique:
+`_run_together` re-raises thread errors and calls a still-alive thread a
+deadlock, `_widen_the_window` sleeps inside `_read_state_dict` so the losing
+interleave happens every run instead of once in a thousand (the pin test adds
+an Event so the autosave provably lands inside the pin's window). All assert
+the final bytes of the real file: pin beside autosave keeps both; merge
+beside pin keeps both; shutdown beside a monitor save — both routed through
+the restore-pending merge branch, the one where a reentrant acquire would
+deadlock — finishes and leaves a well-formed file carrying one write's whole
+truth; and a structural test that every path reaching `_write_state_file`
+(full save, merge, pin, and the merge reached through `_save_state`) already
+holds `_state_lock`.
+
+Out of scope, same rule as the tracker's: the cross-*process* race — two
+ticli instances sharing one state file — remains accepted; the loser loses
+that process's most recent save and the file stays well-formed either way.
+Also rejected: an RLock (would paper over a double-acquire instead of making
+call structure explicit — the tracker precedent chose leaf discipline), and
+locking `_restore_state`'s read (it is not a read-modify-write; a lock there
+buys nothing and puts a disk read behind a writer). 1419 in the suite.
+
 ## In flight at time of writing
 
 - **Responsive narrow-width layout + `v` volume overlay** — width-derived

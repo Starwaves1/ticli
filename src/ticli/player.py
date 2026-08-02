@@ -2010,6 +2010,25 @@ class HeadlessTidalPlayer:
         self._playing = False
         self._play_start_time: Optional[float] = None
         self._play_offset: float = 0
+        # Serializes every load-modify-save cycle over player_state.json.
+        # The writers are on different threads — `_save_state` on the monitor
+        # thread every 10s and on the main thread at shutdown,
+        # `_merge_position_into_saved_state` under it while a restore is
+        # pending, `_remember_last_playlist` on the add-to-playlist thread —
+        # and each one reads the file (or in-memory fields), edits, and writes
+        # the whole file back. Unlocked, a writer that reads before another's
+        # write and writes after it erases that write: an autosave landing
+        # inside `_remember_last_playlist`'s cycle lost the fresh queue and
+        # position, the reverse lost the playlist pin. Same shape as the cache
+        # tracker's `_tracker_lock` (utils/cache.py): a leaf lock held only
+        # across one whole cycle, taken exactly once per cycle — nothing
+        # inside it may call another lock-taking state function, which is why
+        # `_save_state` reaches the merge through its unlocked `_locked` half.
+        # Reads (`_restore_state`, bare `_read_state_dict` callers) stay
+        # lock-free, and stay right: `_write_state_file` replaces the file
+        # whole (temp + rename), so a reader sees one generation of it, never
+        # a torn one.
+        self._state_lock = threading.Lock()
         self._liked_ids: set = set()
         # Track radio: a fetch is in flight, and when the last one started
         self._radio_fetching = False
@@ -2534,7 +2553,12 @@ class HeadlessTidalPlayer:
         threading.Thread(target=_run, daemon=True).start()
 
     def _write_state_file(self, state: dict):
-        """Atomically write the state file (temp + rename, never torn)."""
+        """Atomically write the state file (temp + rename, never torn).
+
+        Every caller is a load-modify-save cycle holding `_state_lock` — the
+        atomic rename keeps a *reader* from seeing a torn file, but only the
+        lock keeps a concurrent *writer* from erasing this one's changes.
+        """
         STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state))
@@ -2547,8 +2571,12 @@ class HeadlessTidalPlayer:
         Same contract as load_config and the cache loaders: a file that is
         absent, unreadable, undecodable, or valid JSON that is not a dict all
         read as empty. This is the single place player state is read — every
-        reader goes through it (writers through _write_state_file), so a later
-        change can serialize access here, and a test can monkeypatch it.
+        reader goes through it (writers through _write_state_file), and a test
+        can monkeypatch it. Deliberately lock-free: pure readers like
+        `_restore_state` see one whole generation of the file (writes go
+        through an atomic rename), so only the writers' read-modify-write
+        cycles need `_state_lock`, and they take it around their whole cycle
+        rather than in here.
         """
         try:
             data = json.loads(STATE_FILE.read_text())
@@ -2562,6 +2590,17 @@ class HeadlessTidalPlayer:
 
     def _merge_position_into_saved_state(self):
         """Refresh only the position in the saved file, if the track matches."""
+        with self._state_lock:
+            self._merge_position_into_saved_state_locked()
+
+    def _merge_position_into_saved_state_locked(self):
+        """The read-modify-write itself; the caller holds `_state_lock`.
+
+        Split from the public wrapper because `_save_state` needs the merge
+        *inside* its own locked cycle and a plain Lock is not reentrant — the
+        lock is taken exactly once per cycle, in the wrapper or in
+        `_save_state`, never here.
+        """
         if self._current_track is None:
             return
         try:
@@ -2592,21 +2631,38 @@ class HeadlessTidalPlayer:
         if not pid:
             return
         self._last_playlist_id = pid
-        data = self._read_state_dict()
-        data["last_playlist_id"] = pid
-        try:
-            self._write_state_file(data)
-        except OSError as e:
-            logger.debug("Failed to persist last-used playlist: %s", e)
+        # The whole read-modify-write under _state_lock: an autosave landing
+        # between this read and this write would otherwise be clobbered by
+        # the stale copy read here, losing the fresh queue and position.
+        with self._state_lock:
+            data = self._read_state_dict()
+            data["last_playlist_id"] = pid
+            try:
+                self._write_state_file(data)
+            except OSError as e:
+                logger.debug("Failed to persist last-used playlist: %s", e)
 
     def _save_state(self):
-        """Save queue and playback state to disk for next session."""
-        # If the restore never finished attaching the queue, our in-memory
-        # state is incomplete — a full save would shrink the good file. Still
-        # refresh the position in case the user played the restored track.
-        if self._restore_pending and not self._queue:
-            self._merge_position_into_saved_state()
-            return
+        """Save queue and playback state to disk for next session.
+
+        The whole build-and-write runs under `_state_lock`, so a playlist pin
+        or position merge on another thread cannot land between reading the
+        in-memory fields and replacing the file — and cannot itself be erased
+        by this save straddling *its* cycle.
+        """
+        with self._state_lock:
+            # If the restore never finished attaching the queue, our in-memory
+            # state is incomplete — a full save would shrink the good file.
+            # Still refresh the position in case the user played the restored
+            # track — through the unlocked half, since the lock is already
+            # held here and is not reentrant.
+            if self._restore_pending and not self._queue:
+                self._merge_position_into_saved_state_locked()
+                return
+            self._save_state_locked()
+
+    def _save_state_locked(self):
+        """The full build-and-write; the caller holds `_state_lock`."""
         try:
             queue = self._queue
             queue_index = self._queue_index

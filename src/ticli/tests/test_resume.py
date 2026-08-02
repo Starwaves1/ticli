@@ -12,6 +12,7 @@ purpose.
 """
 
 import json
+import threading
 import time
 import types
 
@@ -742,3 +743,208 @@ class TestLegacyRestoreIsFrugal:
         assert p.session.track_calls == 1  # only the current track, ever
         assert p._queue == []  # nothing attached over the user's new queue
         assert p._toast == ""  # stood down quietly — nothing went wrong
+
+
+def _run_together(jobs, timeout=30.0):
+    """Start every job on its own thread, wait for all of them, re-raise.
+
+    Same shape as test_cache.py's: a failure inside a thread is otherwise a
+    printed traceback and a green test, and a deadlock — the failure mode a
+    non-reentrant lock invites — is otherwise a wedged suite instead of an
+    assertion.
+    """
+    errors = []
+
+    def wrap(job):
+        def run():
+            try:
+                job()
+            except BaseException as e:  # noqa: BLE001 - re-raised below
+                errors.append(e)
+        return run
+
+    threads = [threading.Thread(target=wrap(job), daemon=True) for job in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout)
+    alive = [t for t in threads if t.is_alive()]
+    assert not alive, \
+        f"{len(alive)} state writer(s) never finished — a deadlock, not a race"
+    if errors:
+        raise errors[0]
+
+
+def _widen_the_window(p, pause=0.25):
+    """Hold every state-file read open for a moment, so the race is certain.
+
+    The losing interleave is a thread switch between `_read_state_dict` and
+    `_write_state_file` inside one writer's cycle — a window microseconds
+    wide, which a test cannot land on by throwing threads at it
+    (test_cache.py's lesson: with the lock taken out, the naive version
+    passes every run). Sleeping inside the read makes the scheduler's worst
+    case happen every time: another writer's whole cycle fits inside the
+    pause. With the lock, the pause only makes the test slower — the second
+    writer waits at the door.
+    """
+    original = p._read_state_dict
+
+    def slow_read():
+        data = original()
+        time.sleep(pause)
+        return data
+
+    p._read_state_dict = slow_read
+    return p
+
+
+class TestStateWritesAreSerialized:
+    """One player, one player_state.json, and every writer on its own thread.
+
+    `_save_state` runs on the monitor thread every 10 seconds and again on the
+    main thread at shutdown; `_merge_position_into_saved_state` runs under it
+    while a restore is pending; `_remember_last_playlist` runs on the
+    add-to-playlist background thread. Each is a load-modify-save over the
+    same file, so unlocked they erase each other's cycles wholesale: an
+    autosave landing inside the pin's read-write gap is clobbered by the
+    stale read (fresh queue and position lost), the reverse loses the pin.
+    `_state_lock` holds each whole cycle apart — the sibling of the cache
+    tracker's `_tracker_lock` and of test_cache.py's
+    TestTrackerWritesAreSerialized.
+
+    Timing tests, so written to fail rather than flake: assertions are on the
+    final bytes of the real file, and the windows are widened so the losing
+    interleave happens every run without the lock.
+    """
+
+    def _patch(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(player_mod, "STATE_DIR", tmp_path)
+        state_file = tmp_path / "player_state.json"
+        monkeypatch.setattr(player_mod, "STATE_FILE", state_file)
+        return state_file
+
+    def test_a_playlist_pin_beside_an_autosave_loses_neither(self, tmp_path, monkeypatch):
+        """The pin's cycle reads the file, sleeps, writes — and the autosave's
+        whole full save runs inside that gap. Unlocked, the pin writes back
+        its stale copy and the session's fresh queue and position vanish from
+        disk; the event makes that ordering certain rather than probable."""
+        state_file = self._patch(monkeypatch, tmp_path)
+        # A previous session's file: what the pin's stale read would resurrect
+        _write_state(state_file, track_ids=[9], queue_index=0, position=1.0)
+        p = _make_player()
+        p._queue = [_fake_track(1), _fake_track(2)]
+        p._queue_index = 1
+        p._current_track = p._queue[1]
+        p._play_offset = 55.0
+
+        pin_has_read = threading.Event()
+        original = p._read_state_dict
+
+        def slow_read():
+            data = original()
+            pin_has_read.set()
+            time.sleep(0.25)  # the autosave's whole cycle fits in here
+            return data
+
+        p._read_state_dict = slow_read
+
+        def pin():
+            p._remember_last_playlist(types.SimpleNamespace(id="pl-9"))
+
+        def autosave():
+            assert pin_has_read.wait(5.0), "the pin never read the file"
+            p._save_state()
+
+        _run_together([pin, autosave])
+
+        saved = json.loads(state_file.read_text())
+        assert saved["track_ids"] == [1, 2], \
+            "the pin's stale read erased the fresh queue"
+        assert saved["queue_index"] == 1
+        assert saved["position"] == 55.0
+        assert saved["last_playlist_id"] == "pl-9", "the autosave erased the pin"
+
+    def test_a_position_merge_beside_a_playlist_pin_keeps_both(self, tmp_path, monkeypatch):
+        """Both writers read the same file; both reads are held open, so both
+        happen before either write. Unlocked, whichever write lands second
+        undoes the first — the position rolls back or the pin vanishes."""
+        state_file = self._patch(monkeypatch, tmp_path)
+        _write_state(state_file)  # track_ids [1,2,3], index 1, position 42.5
+        p = _make_player()
+        p._current_track = _fake_track(2)  # matches ids[1], so the merge writes
+        p._play_offset = 77.0
+        _widen_the_window(p)
+
+        def merge():
+            p._merge_position_into_saved_state()
+
+        def pin():
+            p._remember_last_playlist(types.SimpleNamespace(id="pl-9"))
+
+        _run_together([merge, pin])
+
+        saved = json.loads(state_file.read_text())
+        assert saved["position"] == 77.0, \
+            "the pin's stale read rolled the position back"
+        assert saved["last_playlist_id"] == "pl-9", "the merge erased the pin"
+        assert saved["track_ids"] == [1, 2, 3]
+
+    def test_shutdown_beside_a_monitor_save_neither_deadlocks_nor_tears(self, tmp_path, monkeypatch):
+        """[q] runs _shutdown → _save_state on the main thread while the
+        monitor thread's 10-second autosave may be mid-cycle. With a restore
+        still pending, both saves reach the merge *inside* their locked cycle
+        — the branch where a reentrant acquire would deadlock, which
+        _run_together's join timeout turns into a failure instead of a wedged
+        suite. The file must end well-formed, whole, and carrying one write's
+        whole truth."""
+        state_file = self._patch(monkeypatch, tmp_path)
+        _write_state(state_file)
+        p = _make_player()
+        p._restore_pending = True
+        p._queue = []
+        p._current_track = _fake_track(2)
+        p._play_offset = 33.0
+        p.audio = types.SimpleNamespace(get_time_pos=lambda: 61.5,
+                                        stop=lambda: None)
+        _widen_the_window(p)
+
+        _run_together([p._save_state, p._shutdown], timeout=10.0)
+
+        saved = json.loads(state_file.read_text())
+        assert saved["track_ids"] == [1, 2, 3], "the merge shrank the file"
+        assert saved["queue_index"] == 1
+        # 33.0 is the monitor's read, 61.5 the position mpv answered at [q];
+        # either whole answer is fine, a mixture or a crash is not
+        assert saved["position"] in (33.0, 61.5)
+
+    # ── the lock is taken exactly once per cycle ──
+
+    def test_every_state_write_happens_under_the_lock(self, tmp_path, monkeypatch):
+        """The lock is only worth anything if nothing writes around it: every
+        path that replaces the file — the full save, the merge, the pin, and
+        the merge reached through _save_state's restore-pending branch — must
+        already hold `_state_lock` when it reaches `_write_state_file`."""
+        self._patch(monkeypatch, tmp_path)
+        p = _make_player()
+        p._queue = [_fake_track(2)]
+        p._queue_index = 0
+        p._current_track = p._queue[0]
+
+        held = []
+        real_write = p._write_state_file
+
+        def checked(state):
+            held.append(p._state_lock.locked())
+            real_write(state)
+
+        p._write_state_file = checked
+
+        p._save_state()  # the full save
+        p._merge_position_into_saved_state()  # the position merge
+        p._remember_last_playlist(types.SimpleNamespace(id="pl-9"))  # the pin
+        p._restore_pending = True  # and the merge reached through
+        p._queue = []  # _save_state's restore-pending branch
+        p._save_state()
+
+        assert len(held) == 4, "a writer skipped the file, or wrote it twice"
+        assert all(held), "a state write happened outside _state_lock"

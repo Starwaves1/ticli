@@ -49,9 +49,22 @@ rewritten to remove ffmpeg entirely.
   cause of input lag; `get_url()` on the UI thread froze the interface on
   every track start.
 - **Daemon threads only.**
-- **No locks. GIL-reliant.** Assign whole objects; never mutate a shared list
-  in place. This convention is consistent across the codebase — follow it
-  rather than introducing locking.
+- **Reads are lock-free. GIL-reliant.** Assign whole objects; never mutate a
+  shared list in place. A reader then sees some generation of the object (or
+  of a whole-replaced file), never a torn one — never put a lock in front of
+  a shared in-memory read. This half of the old blanket "no locks" rule is
+  still absolute.
+- **A multi-writer load-modify-save cycle over one on-disk JSON file is the
+  exception: it gets a leaf lock.** Whole-object assignment cannot stop two
+  threads' read-edit-write cycles over the same file from erasing each
+  other, so the *whole* cycle — read included, since the stale read is what
+  loses the other writer's update — is held behind one `threading.Lock`.
+  The lock is a leaf: held only across the cycle, taken exactly once, and
+  nothing inside it may call another lock-taking function (plain `Lock` is
+  not reentrant — restructure into unlocked `_locked` halves instead).
+  Precedents: the cache tracker's `_tracker_lock` (2026-07-27), the player
+  state's `_state_lock` (2026-08-02). Cross-*process* races over these files
+  remain accepted, as before.
 - Generation counters are the established pattern for "a result landed after
   the thing it was for went away" (`_search_gen`, `_play_gen`,
   `_download_gen`, `_artwork_request`).

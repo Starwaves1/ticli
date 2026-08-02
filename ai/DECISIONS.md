@@ -340,7 +340,10 @@ explicitly acceptable. Do not add levers chasing it.
 
 - `src/ticli/player.py` (~1450 LOC) is the whole app; modes PLAYER/SEARCH/
   BROWSE/QUEUE/PLAYLISTS, Rich Live at 4fps, daemon threads for network,
-  no locks (GIL-reliant; assign whole objects, never mutate shared lists).
+  lock-free reads via whole-object assignment (GIL-reliant; never mutate
+  shared lists). Since 2026-07-27 a multi-writer load-modify-save cycle over
+  one on-disk JSON file gets a leaf lock — cache tracker, then player state
+  (2026-08-02); see WORKING-RULES.
 - State already persists to `~/.config/ticli/player_state.json` (queue ids,
   index, position, search history) — resume feature mostly needs restore-side
   work.
