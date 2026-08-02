@@ -5,9 +5,10 @@ resume feature, mpv newly active as backend. Ranked, deduped findings.
 
 STATUS 2026-07-24 (same day): items 1–5, 7, 8 (atomic writes), 9 FIXED —
 20/20 tests pass, IPC ack + time-pos validated against a live mpv. Still
-open: #6 (restore index stability on fetch failure), #8's multi-instance
-lockfile, #10 (_space_held swallow), #11 (get_url on UI thread — fold into
-the responsiveness/caching roadmap item).
+open: #6 (restore index stability on fetch failure — 2026-08-02: legacy
+id-only files exclusively, see inline), #8's multi-instance lockfile,
+#10 (_space_held swallow), #11 (get_url on UI thread — fold into the
+responsiveness/caching roadmap item).
 
 ## Confirmed root causes
 
@@ -60,6 +61,12 @@ the responsiveness/caching roadmap item).
    position never set if the current-track fetch fails.
    Fix: keep indices stable (placeholder/dict); set `_play_offset`
    independently of current fetch success; retry current.
+   *2026-08-02: mooted for any file this build has saved — the record-format
+   restore makes no fetches at all, so nothing can drop. Still true only for
+   a pre-upgrade id-only file, where a non-rate-limit failure drops that
+   track and shifts indices; a rate limit now ends the whole restore (no
+   attach, toast) instead of shifting past it. Deliberately left: the legacy
+   path is one save away from extinction.*
 
 7. **Quit-save suppressed during restore discards a new position** (listen 30s
    after fast relaunch, quit before restore finishes → old position kept).

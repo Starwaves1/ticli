@@ -841,6 +841,270 @@ state; corrected 2026-08-02 under the "fix what is now wrong" rule.)*
 
 ---
 
+## 2026-08-02
+
+### The state file can no longer crash startup by being a JSON list
+
+`~/.config/ticli/player_state.json` containing `[]` — valid JSON, wrong shape —
+crashed `_restore_state` with an `AttributeError`: it caught only
+`JSONDecodeError`/`OSError` around `json.loads` and then called `.get()` on
+whatever parsed. Every other loader in the codebase (`load_config`,
+`cache._load`, `cache._load_tracker`, `downloads.load_index`, even
+`_remember_last_playlist` three screens up in the same file) has the
+`isinstance(data, dict)` guard and honors "missing or corrupt → defaults,
+never raises". This one reader missed it.
+
+The fix is one method, `HeadlessTidalPlayer._read_state_dict()`: read
+`STATE_FILE`, return the dict, or `{}` for missing/`OSError`/
+`JSONDecodeError`/`UnicodeDecodeError`/non-dict JSON — the same contract,
+stated in its docstring. All three readers (`_restore_state`,
+`_merge_position_into_saved_state`, `_remember_last_playlist`) now go through
+it, each keeping its exact prior semantics: restore over an empty dict returns
+before spawning the fetch thread, the position merge finding no `track_ids`
+writes nothing (a `[]` file stays byte-for-byte `[]` — asserted), and the
+playlist pin still starts from `{}` and heals the file into a dict. The method
+is deliberately the *single* place state is read, mirroring
+`_write_state_file` on the write side — a later change serializes access
+around this pair, and a test can monkeypatch it trivially.
+
+**Rejected:** pasting the `isinstance` guard into each reader inline — three
+copies of the contract is how one of them went missing in the first place, and
+it leaves no seam for the planned serialization. Also rejected: folding any
+pacing or locking in now; later stages own that, this commit is the guard
+alone.
+
+Six tests (`TestNonDictStateFile`), asserting the observable thing: a `[]`
+file and a bare-string file leave the queue unattached and cost **exactly 0**
+`track()` fetches on a counting fake session; a following `_save_state`
+writes a well-formed dict that a second player restores cleanly, round-tripped
+through the real file; the pin lands over a `[]` file and the file is a dict
+afterwards. Verified red first: the three crash tests fail with the exact
+`AttributeError` when the fix is stashed. 1404 in the suite.
+
+### Session restore stopped spending one request per saved track
+
+The worst remaining API burst in production was the launch path. `_save_state`
+wrote the queue as bare ids, so `_restore_state` could only rebuild it by
+calling `session.track(tid)` for every saved id — serially, unpaced,
+swallowing every failure including 429s (`except Exception: pass` per track),
+and fetching on after the user had moved on. A queue that is a whole playlist
+(`self._queue = list(self._browse_tracks)`) made that hundreds of unpaced
+requests at every launch — the shape of ai/INCIDENTS #1, fired by opening the
+app.
+
+**Measured: a saved N-track queue cost N `track()` requests at every launch;
+it now costs 0.** The codebase already had the answer in record-shaped rows.
+`_save_state` writes `"tracks": [track_record(t) …]` next to the ids (the
+single-current-track fallback mirrors it), and `_restore_state` builds
+`CachedTrack` shims from them and attaches queue, index and current
+**synchronously** — run() calls it before the UI loop starts, so there is no
+thread and no `_restore_pending` latch on this path, and full saves stay
+enabled. The current track appears paused at its saved position exactly as
+before (same `1 <= position < duration - 2` clamp, never autoplay), and
+`_play_track`'s existing `_resolve_track` swap fetches the real track — one
+request — when a track is actually played. A save straight after a restore is
+lossless: the shims flatten back through `track_record` unchanged, asserted
+through the real file. `"track_ids"` stays in the file on purpose — it is
+what every pre-record build reads, so a downgrade still resumes.
+
+The legacy path (a file with only ids — every pre-upgrade file) still fetches
+on a daemon thread, but frugally and obediently now:
+
+- **Paced.** At least `REFETCH_MIN_INTERVAL` (2.0 s) between request
+  *starts* — the bulk jobs' floor, reusing the constant. The sleep is one
+  module function, `_restore_sleep`, so tests fake the wait and still prove
+  the floor was asked for (each recorded gap ≈ 2.0 s) with no real
+  two-second sleeps in the suite, and there is no module state to leak.
+- **Stops dead on a block.** Any exception `_looks_rate_limited` recognises
+  ends the whole restore: no further requests, no attach, latch left set (so
+  full saves stay suppressed and the file keeps the whole queue), and a
+  toast in the bulk job's words — "TIDAL is rate-limiting — restore stopped.
+  Nothing will be retried." Measured in the test: a 429 on the 2nd fetch
+  means exactly 2 requests ever.
+- **Stands down when superseded.** `self.running and self._restore_pending`
+  is re-checked before each fetch, *after* the pacing wait (the widest
+  window), so a radio started mid-restore stops the fetching itself, not
+  just the attach — and quietly, because nothing went wrong.
+
+The legacy path retires itself: the first full save of a session writes
+records next to the ids.
+
+**Consumer audit**, since `_current_track` and queue rows can now be shims
+until played: the display builders (player, mini, queue, up-next, browse,
+artist) are getattr/hasattr-based and want exactly the shim's fields;
+artwork's `cover_id_of` already documents answering None for cached rows (no
+art until played, same as cached browse rows); like-toggle, add-to-playlist,
+`_merge_position_into_saved_state` and `_download_mark` use only `.id`;
+download targeting resolves in `_download_plan`, prefetch in
+`_maybe_prefetch_next`, playback in `_play_track`. **One real gap: track
+radio.** `_start_track_radio` called `track.get_track_radio` directly, which
+a shim does not have — a caught AttributeError presenting as an untrue
+"Radio unavailable" toast. It resolves first now, the established pattern.
+(The window existed before this change — `_current_track` is briefly a
+cached row right after playing one — but a record restore made it
+indefinite.)
+
+What was *not* done, and why:
+
+- **No cap on the saved queue size.** With zero requests there is nothing to
+  cap; a 500-track queue is ~60 KB of JSON.
+- **Rejected pacing-only for the new format.** Pacing N launch requests
+  still spends N requests on a list the user may never touch, and at 2 s a
+  track a 300-track queue would take ten minutes to finish attaching.
+  Records make the whole question disappear.
+- **Left BUGS #6's queue-shift wart on the legacy path.** A non-rate-limit
+  failure still drops that track and shifts indices there. Records moot it
+  for every file this build writes, and the legacy path is one save away
+  from extinction — placeholder machinery for it would be dead code in a
+  week. (Status corrected inline in the BUGS file.)
+
+Adapted deliberately: `test_a_save_after_a_bad_file_writes_a_dict_a_second_
+player_restores` now exercises the record path — its intent (heal, then
+restore) is format-independent — and the id-only fixtures elsewhere in
+test_resume.py now pin the legacy path, which is still real for pre-upgrade
+files.
+
+One hardening note: the record path runs synchronously with no thread-level
+catch-all around it, so the fields it does arithmetic on (`queue_index`,
+`position`, the record's `duration`) are type-checked and read as their
+defaults when corrupt — the same "never raises" contract the non-dict state
+file fix set, which the legacy path only met by accident of its thread's
+`except`.
+
+11 new tests (10 in test_resume.py, 1 in test_radio.py), all counting fake
+sessions and real state files: a record file restores queue, index, title,
+duration, artist and position with **exactly 0** `track()` calls, then play
+resolves **exactly once**; a live queue round-trips through the file with 0
+requests and the bytes still carry `track_ids`; save → restore → save leaves
+the file's queue identical; corrupt record fields read as defaults, not a
+crash; an unusable "tracks" entry falls back to the id fetch; a legacy
+file's fetch gaps each ask for the full 2.0 s floor; a 429 on the 2nd fetch
+makes exactly 2 calls ever, attaches nothing, keeps the latch, shows the
+toast, and the suppressed save keeps the file whole; a supersede landing
+inside the pacing wait stops after 1 call with no toast; radio from a
+restored shim resolves and starts. Verified red first with the player.py
+change stashed: the record restores fail, the 429 halt fails, the record
+mirror is a KeyError, the radio test fails 0 == 1. 1415 in the suite.
+
+### Player state writes are serialized, the tracker fix's sibling
+
+`player_state.json` had the same disease d5316e7 cured in the cache tracker:
+several read-modify-write writers on different threads with nothing holding
+them apart. `_save_state` runs on the monitor thread every 10 seconds and on
+the main thread at shutdown; `_merge_position_into_saved_state` runs under it
+while a restore is pending; `_remember_last_playlist` runs on the
+add-to-playlist background thread. Each reads the file (or the in-memory
+fields), edits, and replaces the file whole — so an autosave landing between
+the pin's read and write was clobbered by the stale copy the pin had read
+(fresh queue and position gone from disk; a crash before the next autosave
+loses up to 10 seconds of session), and the reverse erased the pin the user
+had just watched a toast confirm.
+
+The fix reads as the tracker's sibling on purpose. One `threading.Lock`
+(`_state_lock`) held across each *complete* load-modify-save cycle — the read
+included, because the stale read is what loses the other writer's update; a
+lock around the write alone would fix nothing. It is a leaf taken exactly
+once per cycle: `_save_state`'s restore-pending branch used to call
+`_merge_position_into_saved_state`, and a plain Lock is not reentrant, so the
+merge (and the full save) split into unlocked `_locked` halves with the lock
+taken in the public wrappers — the shape `_mutate_tracker` set. Reads
+(`_restore_state`, any bare `_read_state_dict`) stay lock-free and stay
+right: `_write_state_file`'s temp+rename replaces the file whole, so a reader
+sees one generation of it, never a torn one. WORKING-RULES' blanket "No
+locks" bullet was factually stale since d5316e7 and now states the refined
+convention: in-memory reads never locked, a multi-writer load-modify-save
+cycle over one on-disk JSON file always is (tracker, player state — and
+general enough to cover the downloads index when it joins).
+
+Measured: with the lock neutered (restructure kept, `nullcontext` for the
+lock), both race tests fail flat five runs out of five with the exact
+lost-update symptoms — the pin's stale read resurrects a previous session's
+`track_ids [9]` over the fresh `[1, 2]`, and the merge's `position 77.0`
+rolls back to `42.5`. With the lock, green every run. Also verified red with
+the whole player.py change stashed.
+
+4 tests (`TestStateWritesAreSerialized` in test_resume.py), siblings of
+test_cache.py's `TestTrackerWritesAreSerialized` down to the technique:
+`_run_together` re-raises thread errors and calls a still-alive thread a
+deadlock, `_widen_the_window` sleeps inside `_read_state_dict` so the losing
+interleave happens every run instead of once in a thousand (the pin test adds
+an Event so the autosave provably lands inside the pin's window). All assert
+the final bytes of the real file: pin beside autosave keeps both; merge
+beside pin keeps both; shutdown beside a monitor save — both routed through
+the restore-pending merge branch, the one where a reentrant acquire would
+deadlock — finishes and leaves a well-formed file carrying one write's whole
+truth; and a structural test that every path reaching `_write_state_file`
+(full save, merge, pin, and the merge reached through `_save_state`) already
+holds `_state_lock`.
+
+Out of scope, same rule as the tracker's: the cross-*process* race — two
+ticli instances sharing one state file — remains accepted; the loser loses
+that process's most recent save and the file stays well-formed either way.
+Also rejected: an RLock (would paper over a double-acquire instead of making
+call structure explicit — the tracker precedent chose leaf discipline), and
+locking `_restore_state`'s read (it is not a read-modify-write; a lock there
+buys nothing and puts a disk read behind a writer). 1419 in the suite.
+
+### Download index writes are serialized — the third of the family
+
+`downloads.json` was the file WORKING-RULES' lock rule already named as next
+("general enough to cover the downloads index when it joins"), and it had
+joined: `record` and `remove` are both `load_index` → mutate → `_save_index`
+with nothing holding them apart. The bulk runner's careful design — every
+`record` callable runs on its own single writer thread (`_PacedRun._flush`) —
+serializes the runner against *itself* and nothing else, and since 9b51224
+the downloads list's `[x]` runs `remove` on the UI thread, reachable while a
+run is going. Losing the race one way resurrects a deleted row, which is
+mostly harmless because every read stats the disk. The other way a
+just-finished download's row vanishes: the file exists in `~/Music/Ticli`
+but is unindexed, shows as not downloaded, and would be re-downloaded — an
+orphan in the one tier where nothing may clean up.
+
+Same cure as its siblings (d5316e7, the player state): a module-level
+`_index_lock` and `_mutate_index(change)` mirroring `_mutate_tracker`, the
+lock held across the whole load-copy-change-save cycle — the read included,
+because the stale read is what loses the other writer's update — with
+`change` returning False for "nothing moved" to skip the write. `remove`'s
+single unlink happens *inside* the cycle: one syscall on one exact path is
+not the directory walk the tracker keeps outside its lock, and moving it out
+would re-open a window where the row and the file disagree. Semantics are
+preserved exactly — row gone + True when the file was already missing, row
+kept + False when a real file cannot be unlinked. Reads (`load_index`,
+`path_for`, `present`, `usage`) stay lock-free: the file is replaced whole
+and every load parses a fresh dict. The runner's single-thread commit design
+stays untouched — it still keeps commits ordered and off the fetch workers —
+but the lock is the guarantee now, not the scheduler, and the comments in
+player.py say so instead of claiming the thread alone was the defence.
+
+Measured: with the lock neutered (`nullcontext`, restructure kept), all four
+new tests fail flat five runs out of five — the record-beside-remove pair
+ends with the fresh row erased from the file in both start orders, and a
+four-thread hammer of 40 distinct `record`s leaves **7 rows of 40** in the
+final file. With the lock, green every run; also verified red with the whole
+src change stashed.
+
+4 tests (`TestIndexWritesAreSerialized` in test_downloads.py), siblings of
+`TestTrackerWritesAreSerialized` down to the technique: `_run_together`
+re-raises thread errors and calls a still-alive thread a deadlock,
+`_widen_the_window` sleeps inside `load_index` so the losing interleave
+happens every run. All assert the final bytes of the real `downloads.json`
+and real files under a tmp download root: record-beside-remove in both
+orders (new row present, deleted row gone, deleted file unlinked), the
+hammer (all 40 rows with their exact paths and byte counts), and a
+structural test that both writers reach `_save_index` holding `_index_lock`.
+
+Out of scope, same rule as the tracker's and the state file's: the
+cross-*process* race over `downloads.json` remains accepted. Rejected:
+locking the readers (nothing to gain — the file is replaced whole — and it
+would put a disk read behind the UI thread's writer), and having `remove`
+unlink outside the lock (the tracker precedent is about directory *walks*;
+splitting one exact unlink from its row's removal is what a torn delete
+looks like). WORKING-RULES' precedent list now names `_index_lock` alongside
+its two siblings. 1423 in the suite.
+
+
+---
+
 ## 2026-08-02 — quality tiers renamed to TIDAL's own: LOW / MEDIUM / HIGH / MAX
 
 Owner decision, from a screenshot of the official app's quality screen (Low
