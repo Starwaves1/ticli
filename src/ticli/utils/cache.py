@@ -216,6 +216,18 @@ def clear_artwork() -> int:
 # and an id to resolve with when the user acts on it. Anything that needs
 # the real thing (a stream URL, a playlist edit) resolves through the
 # session first — see HeadlessTidalPlayer._resolve_track.
+#
+# The shims are also where the "corrupt → defaults, never raises" contract
+# for records lives. Two consumers build rows straight from machine-written
+# JSON through these constructors — the metadata index here and the saved
+# player state (player._restore_state) — and the second runs synchronously
+# at launch with no catch-all around it, so a corrupt field that merely
+# *rode along* would crash either the restore or the first frame that
+# renders it. The contract sits in the one place both import rather than
+# being copied per caller (three copies of a contract is how one goes
+# missing — see the guarded state reader's history), so: any json-decodable
+# record yields a shim whose every field has its documented type, with
+# wrong-typed fields reading as their defaults.
 
 
 class _Named:
@@ -225,32 +237,65 @@ class _Named:
         self.name = name
 
 
+def _clean_str(value):
+    """A non-empty str, or None. Anything else is corruption, not a value."""
+    return value if isinstance(value, str) and value else None
+
+
+def _clean_number(value):
+    """An int or float, or 0. bool is excluded on purpose: True is a number
+    to isinstance, but a duration of True is corruption, not one second."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return 0
+
+
 class CachedTrack:
-    """A track as far as a list row is concerned."""
+    """A track as far as a list row is concerned.
+
+    Guaranteed typed, whatever the record held: `name` a non-empty str
+    (else "?"), `duration` an int or float (else 0), `artists` a list of
+    `_Named` built from the record's non-empty str elements only — a number
+    in an artists list is corruption, not an artist — and `album` a `_Named`
+    or None. `id` alone is kept verbatim: it is only compared and resolved,
+    never rendered or done arithmetic on. Never raises.
+    """
 
     cached = True
     __slots__ = ("id", "name", "duration", "artists", "album")
 
     def __init__(self, record: dict):
+        if not isinstance(record, dict):
+            record = {}
         self.id = record.get("id")
-        self.name = record.get("name") or "?"
-        self.duration = record.get("duration") or 0
-        self.artists = [_Named(n) for n in record.get("artists") or []]
-        album = record.get("album")
+        self.name = _clean_str(record.get("name")) or "?"
+        self.duration = _clean_number(record.get("duration"))
+        artists = record.get("artists")
+        self.artists = [_Named(n)
+                        for n in (artists if isinstance(artists, list) else [])
+                        if isinstance(n, str) and n]
+        album = _clean_str(record.get("album"))
         self.album = _Named(album) if album else None
 
 
 class CachedPlaylist:
-    """A playlist as far as the playlists list is concerned."""
+    """A playlist as far as the playlists list is concerned.
+
+    Same guarantee as CachedTrack: `name` a non-empty str (else "?"),
+    `num_tracks` an int or float (else 0), `creator` a `_Named` or None,
+    `editable` a plain bool, `id` verbatim. Never raises.
+    """
 
     cached = True
     __slots__ = ("id", "name", "num_tracks", "creator", "editable")
 
     def __init__(self, record: dict):
+        if not isinstance(record, dict):
+            record = {}
         self.id = record.get("id")
-        self.name = record.get("name") or "?"
-        self.num_tracks = record.get("num_tracks") or 0
-        creator = record.get("creator")
+        self.name = _clean_str(record.get("name")) or "?"
+        self.num_tracks = _clean_number(record.get("num_tracks"))
+        creator = _clean_str(record.get("creator"))
         self.creator = _Named(creator) if creator else None
         self.editable = bool(record.get("editable"))
 

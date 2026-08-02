@@ -450,6 +450,78 @@ class TestCorruptCache:
         assert cache.get_playlists()[0].name == "Morning"
 
 
+class TestCorruptRecordFields:
+    """The shim constructors are where "corrupt → defaults, never raises"
+    lives for records: two consumers (the metadata index and the saved player
+    state) build rows straight from machine-written JSON through them, and
+    the restore runs synchronously at launch with no catch-all — so a corrupt
+    field must neither raise here nor ride onward to crash the first frame
+    that renders it. Asserted on the resulting values and types, not just on
+    "no raise"."""
+
+    def test_a_non_list_artists_field_reads_as_no_artists(self):
+        row = CachedTrack({"id": 1, "duration": 200, "artists": 5})
+        assert row.artists == []
+        assert row.duration == 200  # the good fields survive the bad one
+        assert row.id == 1
+
+    def test_non_string_artist_elements_are_dropped_not_stringified(self):
+        # A number in an artists list is corruption, not an artist — "5"
+        # on screen would be a value that isn't real
+        row = CachedTrack({"id": 1, "artists": [5, "X", ""]})
+        assert [a.name for a in row.artists] == ["X"]
+
+    def test_a_wrong_typed_duration_reads_as_zero(self):
+        row = CachedTrack({"id": 1, "name": "Track 1", "duration": "long"})
+        assert row.duration == 0
+        assert row.name == "Track 1"
+
+    def test_a_boolean_duration_is_corruption_not_a_number(self):
+        # bool passes isinstance(int); a duration of True must still read 0
+        assert CachedTrack({"id": 1, "duration": True}).duration == 0
+
+    def test_a_real_fractional_duration_is_kept(self):
+        assert CachedTrack({"id": 1, "duration": 200.5}).duration == 200.5
+
+    def test_a_non_string_name_reads_as_the_placeholder(self):
+        assert CachedTrack({"id": 1, "name": 5}).name == "?"
+
+    def test_a_non_string_album_reads_as_none(self):
+        assert CachedTrack({"id": 1, "album": 7}).album is None
+
+    def test_nested_junk_yields_a_fully_typed_shim(self):
+        row = CachedTrack({"id": 1, "name": ["x"], "duration": {"n": 1},
+                           "artists": {"not": "a list"}, "album": ["y"]})
+        assert (row.id, row.name, row.duration, row.artists, row.album) \
+            == (1, "?", 0, [], None)
+
+    def test_the_id_is_kept_verbatim_whatever_it_is(self):
+        # Only ever compared and resolved, so it passes through untouched
+        assert CachedTrack({"id": "uuid-x"}).id == "uuid-x"
+
+    def test_a_non_dict_record_yields_an_all_defaults_shim(self):
+        row = CachedTrack("not a record at all")
+        assert (row.id, row.name, row.duration, row.artists, row.album) \
+            == (None, "?", 0, [], None)
+
+    def test_a_playlist_record_gets_the_same_treatment(self):
+        row = CachedPlaylist({"id": "p1", "name": 5, "num_tracks": "many",
+                              "creator": 7, "editable": "yes"})
+        assert row.id == "p1"
+        assert row.name == "?"
+        assert row.num_tracks == 0
+        assert row.creator is None
+        assert row.editable is True  # bool(...) as ever: truthy, never a raise
+
+    def test_a_playlist_boolean_num_tracks_reads_as_zero(self):
+        assert CachedPlaylist({"id": "p1", "num_tracks": True}).num_tracks == 0
+
+    def test_a_non_dict_playlist_record_yields_an_all_defaults_shim(self):
+        row = CachedPlaylist([1, 2, 3])
+        assert (row.id, row.name, row.num_tracks, row.creator, row.editable) \
+            == (None, "?", 0, None, False)
+
+
 class TestBudget:
     def _audio_file(self, size, name="7"):
         """A file named the way AudioPlayer names one — eviction only ever
