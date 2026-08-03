@@ -7,18 +7,8 @@ Ticli connects directly to TIDAL's API using your premium account. No desktop ap
 Works on **macOS** and **Linux**.
 
 ```
-╭──────────────────────── Ticli ────────────────────────╮
-│                                                        │
-│  ▶ ♥ Arlo Parks - Sophie                               │
-│     Super Sad Generation                               │
-│     1:47 ━━━━━━━━●━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3:28    │
-│     Queue: 3/12  16/44.1 FLAC                          │
-│     Next: Cola • Arlo Parks                            │
-│                                                        │
-│  [space] play/pause  [←/→] prev/next  [s] search       │
-│  [v] volume  [t] tiny  [m] more  [h] hide              │
-│                                                        │
-╰────────────────────────────────────────────────────────╯
+<img width="1350" height="1082" alt="image" src="https://github.com/user-attachments/assets/93aaa46d-7340-4fc2-8e07-26f7dd287ddd" />
+
 ```
 
 ## Features
