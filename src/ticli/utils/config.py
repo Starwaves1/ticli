@@ -73,10 +73,6 @@ CACHE_MODE_V2_SPLIT = {
     "FULL": (True, True),
 }
 
-# The budget was in MB until v3 and is in whole GB now. Only the unit the user
-# types changed — cache.py still does its arithmetic in bytes.
-BYTES_PER_GB = 1024 ** 3
-
 SETTINGS_SPEC: list[dict] = [
     {
         "key": "quality",
@@ -297,7 +293,6 @@ def load_config() -> dict:
 
     # Unknown keys ride along untouched so save_config can write them back
     cfg = dict(data)
-    cfg["version"] = data.get("version", CONFIG_VERSION)
     cfg = _migrate(cfg)
     # Read back out of cfg, not data — migration may have rewritten a value
     for spec in SETTINGS_SPEC:

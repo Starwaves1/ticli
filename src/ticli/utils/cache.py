@@ -345,6 +345,15 @@ def _dir_size(path: Path) -> int:
     return total
 
 
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write-then-rename so readers never see a half-written file. Callers
+    keep their own mkdir and their own idea of what a failed write means."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
 class MetadataCache:
     """The cache the player talks to.
 
@@ -427,11 +436,8 @@ class MetadataCache:
         self._index = entries
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-            path = index_file()
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"version": CACHE_VERSION, "entries": entries}))
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
+            _atomic_write_json(
+                index_file(), {"version": CACHE_VERSION, "entries": entries})
         except OSError as e:
             logger.debug("Failed to write metadata cache: %s", e)
             return
@@ -653,11 +659,8 @@ class MetadataCache:
         self._tracker = tracks
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-            path = tracker_file()
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"version": TRACKER_VERSION, "tracks": tracks}))
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
+            _atomic_write_json(
+                tracker_file(), {"version": TRACKER_VERSION, "tracks": tracks})
         except OSError as e:
             logger.debug("Could not write the cache tracker: %s", e)
 
@@ -685,8 +688,7 @@ class MetadataCache:
         """What the tracker knows about this track, or None."""
         if track_id is None:
             return None
-        record = self._load_tracker().get(str(track_id))
-        return record if isinstance(record, dict) else None
+        return self._load_tracker().get(str(track_id))
 
     def note_cached(self, track_id, ext: str, size: int, quality=None) -> None:
         """A track just landed in the cache directory.
@@ -703,8 +705,7 @@ class MetadataCache:
         key = str(track_id)
 
         def change(tracks):
-            previous = tracks.get(key) if isinstance(tracks.get(key), dict) else {}
-            record = dict(previous)
+            record = dict(tracks.get(key) or {})
             record.update({"ext": ext, "bytes": int(size or 0), "at": time.time()})
             if quality is not None:
                 record["quality"] = quality
@@ -901,8 +902,9 @@ class MetadataCache:
                     record = dict(record)
                     record["bytes"] = size
                     tracks[key] = record
-            return bool(counts["dropped"] or counts["adopted"]
-                        or tracks != before)
+            # dropped and adopted keys both change the dict, so this one
+            # comparison covers them and the bytes corrections alike
+            return tracks != before
 
         self._mutate_tracker(change)
         if counts["dropped"]:
@@ -1001,11 +1003,9 @@ class MetadataCache:
             entries.pop(key, None)
             self._index = entries
             try:
-                path = index_file()
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"version": CACHE_VERSION, "entries": entries}))
-                os.chmod(tmp, 0o600)
-                os.replace(tmp, path)
+                _atomic_write_json(
+                    index_file(),
+                    {"version": CACHE_VERSION, "entries": entries})
             except OSError:
                 break
             new_total = self.total_bytes()
