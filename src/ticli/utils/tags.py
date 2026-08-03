@@ -52,10 +52,6 @@ MP4_CONTAINERS = frozenset({
     b"moov", b"trak", b"mdia", b"minf", b"stbl", b"udta", b"edts", b"mvex",
 })
 
-# Boxes that pin bytes to an absolute position in the file. stco/co64 are
-# understood and patched; the rest are why a file can be refused.
-MP4_ABSOLUTE_OFFSETS = frozenset({b"tfhd", b"saio"})
-
 # ilst payload type indicators (the "well-known type" field of a `data` box).
 DATA_BINARY = 0
 DATA_UTF8 = 1

@@ -1615,6 +1615,17 @@ class AudioPlayer:
         self._play_start = time.time()
         self._paused = False
 
+    def _reap_process(self):
+        """Terminate the audio subprocess, escalating to kill after 2s.
+
+        Callers hold self._lock and decide what _process becomes afterwards.
+        """
+        self._process.terminate()
+        try:
+            self._process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+
     def pause(self):
         """Pause playback."""
         with self._lock:
@@ -1636,11 +1647,7 @@ class AudioPlayer:
                 elapsed = time.time() - self._play_start if self._play_start else 0
                 self._seek_offset += elapsed
                 self._play_start = None
-                self._process.terminate()
-                try:
-                    self._process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
+                self._reap_process()
                 self._process = None
                 self._paused = True
 
@@ -1789,11 +1796,7 @@ class AudioPlayer:
                 self._cache_file and os.path.exists(self._cache_file)) else self._current_url
             if not source:
                 return False
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
+            self._reap_process()
             self._process = subprocess.Popen(
                 self._ffplay_cmd(source, position),
                 stdout=subprocess.DEVNULL,
@@ -1839,11 +1842,7 @@ class AudioPlayer:
             # is what tells it to abandon itself and clean up its .part
             self._download_gen += 1
             if self._process and self._process.poll() is None:
-                self._process.terminate()
-                try:
-                    self._process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
+                self._reap_process()
                 self._process = None
             # A kept track is the whole point of having cached it; a scratch
             # copy existed only to resume this one, so it goes.
@@ -3543,14 +3542,15 @@ class HeadlessTidalPlayer:
 
     # ── Display builders ──
 
-    def _track_has_time_left(self, margin: float = 2.0) -> bool:
+    def _track_has_time_left(self) -> bool:
         """Whether the current track stopped early enough to be worth
         resuming. An unknown duration counts as "yes" — better one extra
-        respawn than a silently dropped track."""
+        respawn than a silently dropped track. Within 2s of the end counts
+        as finished."""
         duration = getattr(self._current_track, "duration", None) or 0
         if duration <= 0:
             return True
-        return self._get_position() < duration - margin
+        return self._get_position() < duration - 2.0
 
     def _maybe_count_play(self) -> None:
         """Give the playing track its point, once, when it has earned it.
@@ -3853,6 +3853,38 @@ class HeadlessTidalPlayer:
         about density; the window is a fact."""
         return max(1, min(self._page_size, self._fit.page_rows))
 
+    def _tab_row(self, order, labels, active, mark=None) -> Text:
+        """The '[Tab] label · label' row for a tabbed screen: every entry with
+        the active one lit, or — below the width that holds them all — the
+        active label alone with its place in the cycle. `mark(name)` (when
+        given) decides which entries get the answered-dot after their label;
+        the narrow form keeps the active entry's dot too."""
+        row = Text()
+        row.append("\n   [Tab]", style="bold")
+        for i, name in enumerate(order):
+            row.append("  " if i == 0 else " · ", style="dim")
+            row.append(labels[name],
+                       style="bold cyan" if name == active else "dim")
+            if mark is not None and mark(name):
+                row.append("·", style="dim cyan")
+        if cell_len(row.plain.lstrip("\n")) > self._fit.inner:
+            row = Text("\n   [Tab]", style="bold")
+            row.append(f"  {labels[active]}", style="bold cyan")
+            if mark is not None and mark(active):
+                row.append("·", style="dim cyan")
+            row.append(f"  ({order.index(active) + 1}/{len(order)})",
+                       style="dim")
+        return row
+
+    def _page_footer(self, content: Text, cursor: int, total: int, page: int):
+        """The 'Page X/Y' footer every paged list shows, when there is more
+        than one page. (The search screen keeps its own copy because it
+        appends the result count inside the same branch.)"""
+        if total > page:
+            page_num = (cursor // page) + 1
+            total_pages = (total + page - 1) // page
+            content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+
     def _build_search_display(self) -> Text:
         content = Text()
         content.append("   Search: ", style="bold yellow")
@@ -3869,26 +3901,9 @@ class HeadlessTidalPlayer:
         # active scope stands alone with its place in the cycle, which says the
         # same two things — which scope you are in, and that Tab moves through
         # more of them.
-        scopes = Text()
-        scopes.append("\n   [Tab]", style="bold")
-        for i, name in enumerate(self.SEARCH_FILTERS):
-            scopes.append("  " if i == 0 else " \u00b7 ", style="dim")
-            active = name == self._search_filter
-            scopes.append(
-                self.SEARCH_FILTER_LABELS[name],
-                style="bold cyan" if active else "dim")
-            if self._scope_answered(name):
-                scopes.append("\u00b7", style="dim cyan")
-        if cell_len(scopes.plain.lstrip("\n")) > self._fit.inner:
-            scopes = Text("\n   [Tab]", style="bold")
-            scopes.append(f"  {self.SEARCH_FILTER_LABELS[self._search_filter]}",
-                          style="bold cyan")
-            if self._scope_answered(self._search_filter):
-                scopes.append("\u00b7", style="dim cyan")
-            scopes.append(
-                f"  ({self.SEARCH_FILTERS.index(self._search_filter) + 1}"
-                f"/{len(self.SEARCH_FILTERS)})", style="dim")
-        content.append_text(scopes)
+        content.append_text(self._tab_row(
+            self.SEARCH_FILTERS, self.SEARCH_FILTER_LABELS,
+            self._search_filter, mark=self._scope_answered))
 
         if self._search_loading and not self._search_results:
             # A scope waiting for its first page. Not the same as one that came
@@ -4006,10 +4021,7 @@ class HeadlessTidalPlayer:
                 if track.artists:
                     content.append(f"  {track.artists[0].name}", style="dim")
                 content.append(f"  {format_time(track.duration)}", style="dim cyan")
-            if total > page:
-                page_num = (max(0, self._browse_cursor - 1) // page) + 1 if self._browse_cursor > 0 else 1
-                total_pages = (total + page - 1) // page
-                content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+            self._page_footer(content, max(0, self._browse_cursor - 1), total, page)
 
         return content
 
@@ -4023,22 +4035,9 @@ class HeadlessTidalPlayer:
         # something to point at. Narrower than the four tabs need, it says the
         # same thing about the one you are on and counts the rest — which is
         # the pair of facts, and is not "Suggesti…" cut off at the border.
-        tabs = Text()
-        tabs.append("\n   [Tab]", style="bold")
-        for i, key in enumerate(self.ARTIST_SECTIONS):
-            tabs.append("  " if i == 0 else " · ", style="dim")
-            active = key == self._artist_section
-            tabs.append(
-                self.ARTIST_SECTION_LABELS[key],
-                style="bold cyan" if active else "dim")
-        if cell_len(tabs.plain.lstrip("\n")) > self._fit.inner:
-            tabs = Text("\n   [Tab]", style="bold")
-            tabs.append(f"  {self.ARTIST_SECTION_LABELS[self._artist_section]}",
-                        style="bold cyan")
-            tabs.append(
-                f"  ({self.ARTIST_SECTIONS.index(self._artist_section) + 1}"
-                f"/{len(self.ARTIST_SECTIONS)})", style="dim")
-        content.append_text(tabs)
+        content.append_text(self._tab_row(
+            self.ARTIST_SECTIONS, self.ARTIST_SECTION_LABELS,
+            self._artist_section))
 
         record = self._artist_record()
         label = self.ARTIST_SECTION_LABELS[self._artist_section].lower()
@@ -4105,10 +4104,7 @@ class HeadlessTidalPlayer:
                 creator = getattr(obj, "creator", None)
                 if creator is not None and getattr(creator, "name", None):
                     content.append(f"  by {creator.name}", style="dim")
-        if total > page:
-            page_num = (cursor // page) + 1
-            total_pages = (total + page - 1) // page
-            content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+        self._page_footer(content, cursor, total, page)
 
         return content
 
@@ -4148,10 +4144,7 @@ class HeadlessTidalPlayer:
                     content.append(f"  {t_artist}", style="dim")
                 if t_dur:
                     content.append(f"  {t_dur}", style="dim cyan")
-            if total > page:
-                page_num = (self._queue_cursor // page) + 1
-                total_pages = (total + page - 1) // page
-                content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+            self._page_footer(content, self._queue_cursor, total, page)
         return content
 
     def _build_playlists_display(self) -> Text:
@@ -4186,10 +4179,7 @@ class HeadlessTidalPlayer:
                     content.append(f"  {num_tracks} tracks", style="dim cyan")
                 if creator:
                     content.append(f"  by {creator}", style="dim")
-            if total > page:
-                page_num = (self._playlists_cursor // page) + 1
-                total_pages = (total + page - 1) // page
-                content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+            self._page_footer(content, self._playlists_cursor, total, page)
         else:
             content.append("\n\n   No playlists found", style="dim")
 
@@ -4247,10 +4237,7 @@ class HeadlessTidalPlayer:
                 if i == 0 and self._last_playlist_id and str(
                         getattr(pl, "id", "") or "") == self._last_playlist_id:
                     content.append("  last used", style="dim")
-            if total > page:
-                page_num = (max(self._picker_cursor, 0) // page) + 1
-                total_pages = (total + page - 1) // page
-                content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+            self._page_footer(content, max(self._picker_cursor, 0), total, page)
         else:
             content.append("\n\n   No playlists you can edit", style="dim")
 
@@ -4608,10 +4595,7 @@ class HeadlessTidalPlayer:
             # No `~`: these are bytes on this disk, counted, not estimated
             content.append(f"  {downloads.format_bytes(row['bytes'])}",
                            style="dim cyan")
-        if total > page:
-            page_num = (self._downloads_cursor // page) + 1
-            total_pages = (total + page - 1) // page
-            content.append(f"\n\n   Page {page_num}/{total_pages}", style="dim")
+        self._page_footer(content, self._downloads_cursor, total, page)
         return content
 
     def _build_delete_download_confirm(self) -> Text:
@@ -5290,7 +5274,7 @@ class HeadlessTidalPlayer:
             return {}
         return job
 
-    def _download_status_row(self, job: dict, avail: int = 70) -> Text:
+    def _download_status_row(self, job: dict, avail: int) -> Text:
         """What the job is doing, in the button's place — it is the only thing
         on the box that changes. Running, done and failed read differently,
         in one line each."""
@@ -5497,8 +5481,7 @@ class HeadlessTidalPlayer:
                 break
             body, footer = self._compose(fit)
 
-        lines = body + footer
-        if len(lines) > fit.rows:
+        if len(body) + len(footer) > fit.rows:
             # The blank row between the pane and its footer says nothing, so
             # it goes before anything that does
             if body and not body[-1].plain.strip():
@@ -7395,32 +7378,29 @@ class HeadlessTidalPlayer:
         target = self._upgrade_target()
         plan = {"downloads": [], "cache": [], "skipped": 0, "unknown": 0,
                 "bytes": 0}
+
+        def classify(stored, key, size, bucket):
+            # The one statement of the policy, applied to both tiers
+            if stored not in QUALITY_RANK:
+                plan["unknown"] += 1
+            elif not self._is_upgrade(stored, target):
+                plan["skipped"] += 1
+            else:
+                bucket.append(key)
+                plan["bytes"] += int(size or 0)
+
         for key, entry in downloads.load_index().items():
             if downloads._entry_path(entry) is None:
                 continue  # deleted by hand: the disk decides
-            stored = entry.get("granted")
-            if stored not in QUALITY_RANK:
-                plan["unknown"] += 1
-                continue
-            if not self._is_upgrade(stored, target):
-                plan["skipped"] += 1
-                continue
-            plan["downloads"].append(key)
-            plan["bytes"] += int(entry.get("bytes") or 0)
+            classify(entry.get("granted"), key, entry.get("bytes"),
+                     plan["downloads"])
         if self._cache.keeps_audio:
             downloaded = set(plan["downloads"])
             for key, record in self._cache._load_tracker().items():
                 if key in downloaded:
                     continue  # the download tier covers it
-                stored = record.get("quality")
-                if stored not in QUALITY_RANK:
-                    plan["unknown"] += 1
-                    continue
-                if not self._is_upgrade(stored, target):
-                    plan["skipped"] += 1
-                    continue
-                plan["cache"].append(key)
-                plan["bytes"] += int(record.get("bytes") or 0)
+                classify(record.get("quality"), key, record.get("bytes"),
+                         plan["cache"])
         return plan
 
     def _start_refetch_job(self) -> None:

@@ -387,6 +387,19 @@ def _decode_dc_scan(data, pos, frame, scan, quant, dc_tables, ac_tables,
         comp["by"] = mcus_y * comp["v"]
         planes.append([0.0] * (comp["bx"] * comp["by"]))
 
+    # Tables and planes cannot change between MCUs, so resolve them once —
+    # for a 320x320 cover the scan loop below runs thousands of times
+    resolved = []
+    for index, (comp, dc_id, ac_id) in enumerate(scan):
+        dc_table = dc_tables.get(dc_id)
+        ac_table = ac_tables.get(ac_id)
+        if dc_table is None or (not skip_ac and ac_table is None):
+            raise ArtworkError("missing huffman table")
+        table = quant.get(comp["tq"])
+        if table is None:
+            raise ArtworkError("missing quantisation table")
+        resolved.append((index, comp, dc_table, ac_table, table, planes[index]))
+
     bits = _BitReader(data, pos)
     predictions = [0] * len(comps)
     for mcu in range(mcus_x * mcus_y):
@@ -394,15 +407,7 @@ def _decode_dc_scan(data, pos, frame, scan, quant, dc_tables, ac_tables,
             bits.restart()
             predictions = [0] * len(comps)
         mcu_row, mcu_col = divmod(mcu, mcus_x)
-        for index, (comp, dc_id, ac_id) in enumerate(scan):
-            dc_table = dc_tables.get(dc_id)
-            ac_table = ac_tables.get(ac_id)
-            if dc_table is None or (not skip_ac and ac_table is None):
-                raise ArtworkError("missing huffman table")
-            table = quant.get(comp["tq"])
-            if table is None:
-                raise ArtworkError("missing quantisation table")
-            plane = planes[index]
+        for index, comp, dc_table, ac_table, table, plane in resolved:
             for by in range(comp["v"]):
                 for bx in range(comp["h"]):
                     size = bits.decode(dc_table)

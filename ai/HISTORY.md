@@ -1261,3 +1261,67 @@ argued for names. Owner's call, recorded as such. `QUALITY_LABELS` became
 the format beside each name again (70 columns for all four, inside the
 80-column budget), and the gate note now reads "TIDAL sends 320k AAC
 instead". Five rendered-screen assertions moved with it. 1403 still pass.
+
+## 2026-08-03 — dead-code sweep and duplication cleanup
+
+### (this commit) Fifteen behavior-preserving reductions, adversarially verified
+
+A five-lens workflow (dead code and simplification, per module, plus a
+cross-module pass) produced 17 findings; every one went to an adversarial
+verifier told to refute it — grep the whole repo including string forms and
+`ai/`, read every call site, default to refuted. All 17 survived (one was a
+duplicate; one verdict was lost to a symbol-name mismatch in the harness and
+recovered from the journal). Of the 16 unique findings, 15 were applied and
+one declined. Net −24 lines, and each policy now stated once:
+
+- **Dead removals.** `tags.MP4_ABSOLUTE_OFFSETS` (never read; the refusal
+  logic in `_refuses_offsets` uses the byte literals, and must — its `tfhd`
+  check is flag-conditional while `saio` is not). `config.BYTES_PER_GB`
+  (shadowed by the live copy in cache.py that every reference, including all
+  test monkeypatches, resolves to). `load_config`'s version pre-seed line (a
+  proven no-op: `_migrate` uses the identical default and unconditionally
+  restamps). Unused `avail=70` default on `_download_status_row`; the
+  never-passed `margin` parameter of `_track_has_time_left` (the 2s is now in
+  the docstring instead of a dead knob).
+- **Duplication, player.py.** The terminate/wait(2s)/kill reap existed three
+  times → `_reap_process()` (callers keep deciding what `_process` becomes).
+  The "Page X/Y" footer existed six times → `_page_footer()` (search keeps
+  its own copy: it appends the result count inside the same branch). The
+  `[Tab]` row with its collapse-when-narrow fallback existed twice →
+  `_tab_row(order, labels, active, mark=)`, where `mark` is search's
+  answered-dot and the narrow form keeps the active entry's dot — output
+  byte-identical, which the rendered-screen tests confirm. The refetch
+  unknown/skipped/upgrade classification existed twice → one `classify`
+  closure. One redundant `body + footer` concatenation built only for its
+  `len()`.
+- **cache.py.** The atomic write-then-rename discipline existed three times
+  in one file (the third inline in `enforce_budget` to dodge `_save`'s
+  recursion) → module-level `_atomic_write_json`; callers keep their own
+  mkdir and their own idea of what a failed write means, so behavior is
+  unchanged. `reconcile`'s save-skip is now `tracks != before` — the counts
+  disjuncts were provably implied. `audio_record` and `note_cached` dropped
+  isinstance guards on tracker values that `_load_tracker` already filters
+  to dicts at the load boundary (the invariant `note_played` had relied on
+  all along).
+- **artwork.py.** `_decode_dc_scan` re-resolved huffman/quant tables and the
+  plane per MCU per component — loop-invariant, so ~1,600 MCUs × 3
+  components of redundant dict lookups per 320px cover. Hoisted once before
+  the loop; the missing-table errors still raise before any output exists
+  (a frame with zero MCUs is already rejected as "empty frame"), verified
+  byte-identical on both fixture JPEGs and the corrupt variants.
+
+**Declined, on purpose:** removing the `cols + ART_MARGIN <= width` conjunct
+in `art_size`. It is provably redundant *under today's constants* (verified
+exhaustively to width 1000), but only under them — `ART_WIDTH_SHARE` has been
+retuned before (0.4 → 0.6), and a future tune or a smaller `ART_SIZES` entry
+would silently make it load-bearing again. A guard whose truth depends on
+tuning stays.
+
+**Left alone as false positives** (vulture still flags them, each checked):
+the `signum` parameters (signal-handler signature), `_merge_position_into_saved_state`
+and `_stream_url` and `cached_usage` and `downloaded_count` (all called —
+vulture misses usage through locals/tests), `no_wrap`/`__defaults__` (Rich
+API and functools internals).
+
+Suite: 1,446 passed, 8 skipped — identical count before and after, three
+consecutive full runs.
