@@ -51,6 +51,7 @@ If you are an agent picking this project up, read in this order:
 | **[HISTORY.md](HISTORY.md)** | What happened, in order, with the reasoning behind each change. |
 | **[INCIDENTS.md](INCIDENTS.md)** | Five things that went wrong and what each one taught. The most useful file here. |
 | **[DECISIONS.md](DECISIONS.md)** | Product decisions locked by the owner, the roadmap, and specs for work not yet built. |
+| **[WORKFLOWS.md](WORKFLOWS.md)** | If you are about to run a multi-agent workflow here: what worked, what silently failed, read before authoring one. |
 | **[PR-SUMMARY.md](PR-SUMMARY.md)** | Draft material for the upstream pull request. |
 | `BUGS-2026-07-24-resume-trace.md` | 11 traced findings from a resume-bug investigation. Historical; most are fixed, status noted inline. |
 | `reference/download-research-2026-07-25.md` | 491 lines of live-probed TIDAL API research. Partly superseded — see the header note. |
