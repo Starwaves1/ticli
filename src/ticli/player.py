@@ -4847,15 +4847,17 @@ class HeadlessTidalPlayer:
     # ── The pane ──
 
     def _mode_hints(self) -> list:
-        """The footer's hints: what the screen offers, plus `[h] hide`.
+        """The footer's hints: what the screen offers, plus the `[h]` hint.
 
-        Two things live here rather than in the eight branches below, because
-        both are true of every screen at once and a copy per screen is how the
-        two of them would drift apart. Hidden is simply a footer with no hints
-        in it — the same answer the mini player gives — so everything
-        downstream (the blank row, the rows the body gets back, the crop)
-        follows from one empty list instead of from a flag threaded through
-        the layout.
+        On the player screen that hint is `[h] hide`; on a menu it is instead
+        `[h] player`, because there `h` dismisses the list and returns to the
+        now-playing screen rather than hiding a footer. Two things live here
+        rather than in the eight branches below, because both are true of every
+        screen at once and a copy per screen is how the two of them would drift
+        apart. Hidden is simply a footer with no hints in it — the same answer
+        the mini player gives — so everything downstream (the blank row, the
+        rows the body gets back, the crop) follows from one empty list instead
+        of from a flag threaded through the layout.
         """
         if self._footer_hidden:
             return []
@@ -4864,6 +4866,9 @@ class HeadlessTidalPlayer:
             # Last, after `back`: the footer reads as what this screen does,
             # then how to put the footer away
             hints.append(Hint("h", "hide", None, HIDE_HINT_RANK))
+        elif hints and self._can_exit_menu_to_player():
+            # Same slot on a menu, but `h` goes home rather than hiding
+            hints.append(Hint("h", "player", "player", HIDE_HINT_RANK))
         return hints
 
     def _screen_hints(self) -> list:
@@ -7932,13 +7937,24 @@ class HeadlessTidalPlayer:
         # early, and the volume overlay, which would otherwise swallow the key
         # that puts the footer back.
         #
+        # `h` means one of two things depending on where you are. On the player
+        # screen it hides the footer, tucking the controls away. On a list or
+        # menu screen it means the opposite direction of travel — dismiss the
+        # menu and drop back to the player (now-playing) screen; there is no
+        # footer worth hiding on a menu, and "take me home" is the useful thing
+        # `h` can do there. The two are mutually exclusive by screen, so only
+        # one of the branches below ever fires. Typing screens and overlays get
+        # neither: there `h` is the letter h, or the key belongs to a box.
+        #
         # Un-hiding does *not* consume the key: `s` restores the footer and
         # opens search, in that order, because a key that has to be pressed
         # twice is worse than a footer that came back a moment early. That is
         # the opposite of scrub focus, which consumes ←/→ deliberately — there
         # the two meanings are in competition and only one of them can win;
         # here nothing is competing, since `h` is the only key this feature
-        # binds and no screen binds it for anything else.
+        # binds and no screen binds it for anything else. (Un-hiding is a
+        # player-screen affair only, since that is the only screen the footer
+        # ever hides on now.)
         #
         # Any key that is not an arrow or the spacebar un-hides, including one
         # this mode does nothing with. The alternative — un-hide only on a key
@@ -7952,6 +7968,9 @@ class HeadlessTidalPlayer:
                 self._footer_hidden = False
         elif key == "h" and self._can_hide_footer():
             self._footer_hidden = True
+            return
+        elif key == "h" and self._can_exit_menu_to_player():
+            self._exit_to_player()
             return
 
         # Handle quit confirmation first
@@ -8064,6 +8083,16 @@ class HeadlessTidalPlayer:
         if self._current_track is not None:
             self._player_focus = True
 
+    def _exit_to_player(self) -> None:
+        """`h` from a menu: put the list away and show the player. The whole
+        navigation stack goes with it \u2014 this is "take me home", not one step
+        back \u2014 and the list state each screen keeps in its own attributes is
+        still there for [q]/[p]/[c] to reopen."""
+        self._mini_player = False
+        self._player_focus = False
+        self._mode = self.MODE_PLAYER
+        self._nav_history.clear()
+
     def _handle_focus_key(self, key: str) -> bool:
         """Keys that belong to the player while it has focus. True when the key
         was used up here.
@@ -8112,20 +8141,44 @@ class HeadlessTidalPlayer:
     def _can_hide_footer(self) -> bool:
         """Whether `h` means "put the controls away" right now.
 
-        The same three typing screens `v` stands down for — a search query, a
-        settings row, the picker's new-playlist name — because there `h` is the
-        letter h and typing it must type it. Plus two screens with no footer of
-        their own to hide: the mini player, which is one line by design, and
-        the volume overlay, which has taken the footer's rows and whose own
-        `←/→ adjust` is a control rather than a cheat-sheet. Hiding under the
-        overlay would be a change nobody can see until they close it.
+        Only on the player screen. Everywhere else `h` either types the
+        letter (a search query, a settings row, the picker's new-playlist
+        name) or dismisses the menu back to the player — see
+        _can_exit_menu_to_player. The mini player is one line by design and
+        the volume overlay has taken the footer's rows, so neither has a
+        footer to hide; the download box is modal and owns the key.
 
-        Only hiding is gated. Un-hiding is not: whatever screen you end up on,
-        the next thing that isn't an arrow or the spacebar brings it back.
+        Only hiding is gated. Un-hiding is not: whatever screen you end up
+        on, the next thing that isn't an arrow or the spacebar brings it
+        back.
         """
-        return (not self._mini_player
+        return (self._mode == self.MODE_PLAYER
+                and not self._mini_player
                 and not self._volume_open
-                and self._can_open_volume())
+                and not self._download_open)
+
+    def _can_exit_menu_to_player(self) -> bool:
+        """Whether `h` means "dismiss this menu and show the player" now.
+
+        Every list screen except the player itself, and never while a key
+        that is really the letter h is being typed — a search query, a
+        settings row mid-edit, the picker's new-playlist name. The overlays
+        (volume, the download box) and the mini player stand down for the
+        same reasons they do for hiding the footer, and a pending
+        confirmation keeps the key so `h` cannot answer a yes/no box by
+        accident.
+        """
+        if self._mode in (self.MODE_PLAYER, self.MODE_SEARCH):
+            return False
+        if self._mini_player or self._volume_open or self._download_open:
+            return False
+        if self._settings_edit is not None or self._picker_new_name is not None:
+            return False
+        if (self._quit_pending or self._logout_pending
+                or self._disable_songs_pending or self._clear_cache_pending
+                or self._refetch_pending or self._downloads_delete is not None):
+            return False
+        return True
 
     def _open_volume(self, from_focus: bool = False):
         """Open the overlay, recording whether the player had the arrows.
