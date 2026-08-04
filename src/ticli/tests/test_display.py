@@ -696,31 +696,37 @@ class TestHidingTheFooter:
         finally:
             h.live.stop()
 
-    @pytest.mark.parametrize("mode", [m for m in MODES
-                                      if m != HeadlessTidalPlayer.MODE_SEARCH])
-    def test_every_screen_with_a_footer_can_put_it_away(self, mode):
-        h = self._harness(mode=mode)
+    def test_the_player_screen_can_put_its_footer_away(self):
+        """The player is the one screen `h` hides the footer on now — every
+        other screen sends `h` back to the player instead (see
+        TestHFromAMenuShowsThePlayer). So the "puts it away" assertion belongs
+        to the player alone: press `h`, the hints leave the screen."""
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_PLAYER)
         try:
-            assert _hints_on_screen(h), (mode, "no footer to start with")
+            assert _hints_on_screen(h), "no footer to start with"
             self._press(h, "h")
-            assert _hints_on_screen(h) == [], (mode, _body(h))
-            h.assert_one_frame(f"hidden on {mode}")
+            assert _hints_on_screen(h) == [], _body(h)
+            h.assert_one_frame("hidden on the player")
         finally:
             h.live.stop()
 
     # ── what keeps it hidden ──
 
     def test_the_arrows_still_navigate_and_it_stays_hidden(self):
-        h = self._harness(mode=HeadlessTidalPlayer.MODE_QUEUE)
+        """The player is the only screen the footer hides on now, so the
+        hold-keys-keep-it-hidden rule is exercised there: ↑ hands the arrows to
+        the scrubber and ← moves the clock, both HIDE_HOLD_KEYS, neither
+        bringing the footer back."""
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_PLAYER)
         try:
             self._press(h, "h")
-            cursor = lambda: [r for r in _body(h) if "▸" in r][0]
-            first = cursor()
-            self._press(h, "\x1b[B")            # ↓
-            assert cursor() != first, "the arrow did nothing"
+            assert _hints_on_screen(h) == [], "did not hide"
+            self._press(h, "\x1b[A")            # ↑ focuses the scrubber
+            assert h.player._player_focus, "↑ did nothing"
             assert _hints_on_screen(h) == [], _body(h)
-            self._press(h, "\x1b[A")            # ↑
-            assert cursor() == first
+            h.player._play_offset = 60.0
+            self._press(h, "\x1b[D")            # ← seeks back
+            assert h.player._get_position() == 50.0, "the arrow did nothing"
             assert _hints_on_screen(h) == [], _body(h)
             h.assert_one_frame("still hidden")
         finally:
@@ -868,17 +874,18 @@ class TestHidingTheFooter:
     # ── the rows it frees, and the ones it doesn't cost ──
 
     def test_the_body_gets_the_rows_back(self):
-        """A short window shrinks the page to make room for the footer. With
-        the footer put away the rows go back to the list, which is the only
-        sane thing to spend them on."""
-        h = self._harness(width=80, height=20, mode=HeadlessTidalPlayer.MODE_QUEUE)
+        """A short window shrinks the page to make room for the footer. On the
+        player — the one screen the footer still hides on — the rows freed by
+        putting it away go back to what is playing rather than to a list, so
+        the honest claim here is that the hint rows are reclaimed and the frame
+        stays whole with the song still on it."""
+        h = self._harness(width=80, height=20, mode=HeadlessTidalPlayer.MODE_PLAYER)
         try:
-            rows = lambda: len([r for r in _body(h) if "Track number" in r])
-            before = rows()
-            assert before, _body(h)
+            assert _hints_on_screen(h), "no footer to start with"
             self._press(h, "h")
-            assert rows() > before, (before, rows())
-            h.assert_one_frame("more rows, no footer")
+            assert _hints_on_screen(h) == [], _body(h)
+            assert any("Satisfied" in r for r in _body(h)), _body(h)
+            h.assert_one_frame("rows reclaimed, no footer")
         finally:
             h.live.stop()
 
@@ -917,6 +924,127 @@ class TestHidingTheFooter:
         keys = [spec["key"] for spec in config_mod.SETTINGS_SPEC]
         assert keys, "the spec is empty — this test would pass on nothing"
         assert not [k for k in keys if "hid" in k or "footer" in k], keys
+
+
+# Every list/menu mode, the ones where `h` is "take me home" rather than
+# "hide" or the letter h. The player and search are deliberately absent: the
+# player hides its footer, search types the character.
+MENU_MODES = (
+    HeadlessTidalPlayer.MODE_BROWSE,
+    HeadlessTidalPlayer.MODE_ARTIST,
+    HeadlessTidalPlayer.MODE_QUEUE,
+    HeadlessTidalPlayer.MODE_PLAYLISTS,
+    HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
+    HeadlessTidalPlayer.MODE_SETTINGS,
+    HeadlessTidalPlayer.MODE_DOWNLOADS,
+)
+
+
+class TestHFromAMenuShowsThePlayer:
+    """`[h]` on a menu is the other half of the same key: where the player
+    screen hides its footer, a list dismisses itself and drops you back on the
+    now-playing screen. The whole navigation stack goes with it — this is "take
+    me home", not one step back — and the guards that keep `h` from hiding the
+    footer out from under a textbox keep it from jumping home from one too.
+    """
+
+    def _harness(self, width=100, height=30, mode=None, **attrs):
+        h = Harness(width=width, height=height, artwork=_art(width, height))
+        if mode is not None:
+            h.player._mode = mode
+        _fill_lists(h.player)
+        for name, value in attrs.items():
+            setattr(h.player, name, value)
+        h.start()
+        h.repaint()
+        return h
+
+    def _press(self, h, key):
+        h.player._handle_key(key)
+        h.repaint()
+
+    # ── it dismisses the menu and shows the player ──
+
+    @pytest.mark.parametrize("mode", MENU_MODES)
+    def test_h_dismisses_the_menu_and_shows_the_player(self, mode):
+        h = self._harness(mode=mode)
+        try:
+            assert h.player._mode == mode, "did not start on the menu"
+            self._press(h, "h")
+            assert h.player._mode == HeadlessTidalPlayer.MODE_PLAYER, (mode, _body(h))
+            # the now-playing screen is on screen, not just the mode flag flipped
+            assert any("Satisfied" in r for r in _body(h)), (mode, _body(h))
+            h.assert_one_frame(f"player after h on {mode}")
+        finally:
+            h.live.stop()
+
+    # ── the footer says which meaning `h` has here ──
+
+    def test_the_menu_footer_advertises_the_player(self):
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_PLAYLISTS)
+        try:
+            assert any("[h] player" in r for r in _body(h)), _body(h)
+            assert not any("[h] hide" in r for r in _body(h)), _body(h)
+        finally:
+            h.live.stop()
+
+    def test_the_player_footer_still_says_hide_not_player(self):
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_PLAYER)
+        try:
+            assert any("[h] hide" in r for r in _body(h)), _body(h)
+            assert not any("[h] player" in r for r in _body(h)), _body(h)
+        finally:
+            h.live.stop()
+
+    # ── the typing and overlay guards hold ──
+
+    def test_a_settings_row_being_edited_keeps_the_key(self):
+        """`h` mid-edit is the letter, so it must not jump home either — the
+        same guard that keeps it from hiding the footer keeps it here."""
+        numeric = [i for i, spec in enumerate(config_mod.SETTINGS_ROWS)
+                   if spec["kind"] == "int"]
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_SETTINGS,
+                          _settings_cursor=numeric[0], _settings_edit="12")
+        try:
+            self._press(h, "h")
+            assert h.player._mode == HeadlessTidalPlayer.MODE_SETTINGS, _body(h)
+        finally:
+            h.live.stop()
+
+    def test_the_new_playlist_name_keeps_the_key(self):
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST,
+                          _picker_new_name="")
+        try:
+            self._press(h, "h")
+            assert h.player._picker_new_name == "h", "the h was not typed"
+            assert h.player._mode == HeadlessTidalPlayer.MODE_ADD_TO_PLAYLIST, _body(h)
+        finally:
+            h.live.stop()
+
+    def test_a_pending_confirmation_keeps_the_key(self):
+        """A yes/no box has the key: `h` cannot answer it by accident, so it
+        neither confirms the delete nor jumps home — the mode stays put."""
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_DOWNLOADS,
+                          _downloads_delete={"id": "x", "name": "A cached song"})
+        try:
+            self._press(h, "h")
+            assert h.player._mode == HeadlessTidalPlayer.MODE_DOWNLOADS, _body(h)
+        finally:
+            h.live.stop()
+
+    # ── "take me home" clears the back-stack ──
+
+    def test_it_clears_the_navigation_stack(self):
+        """Not one step back: the whole stack goes, because home is home no
+        matter how many screens deep you were."""
+        h = self._harness(mode=HeadlessTidalPlayer.MODE_BROWSE)
+        try:
+            h.player._nav_history.append({"mode": HeadlessTidalPlayer.MODE_SEARCH})
+            self._press(h, "h")
+            assert h.player._mode == HeadlessTidalPlayer.MODE_PLAYER
+            assert h.player._nav_history == [], h.player._nav_history
+        finally:
+            h.live.stop()
 
 
 def _tab_rows(h):
