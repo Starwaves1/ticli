@@ -333,7 +333,8 @@ explicitly acceptable. Do not add levers chasing it.
   Opus 5s run in parallel — (1) ↑-at-top-of-list focuses player, ←/→ seek
   ±10s; (2) "+ new playlist" row in the picker + pin last-used playlist to
   top; (3) the three open bugs: restore index shift on fetch failure,
-  multi-instance state-file clobbering, `_space_held` swallowing a keypress
+  ~~multi-instance state-file clobbering~~ (**built 2026-08-07**, see the
+  single-instance section below), `_space_held` swallowing a keypress
   within 250ms of another.
 - **Opus 5 prompting** (learned 2026-07-24, saved to user memory): delete
   "verify your work" and "delegate more" instructions from agent prompts
@@ -347,8 +348,36 @@ explicitly acceptable. Do not add levers chasing it.
   trivial with mpv (IPC `seek N relative`); ffplay needs kill + restart from
   cache with `-ss` (machinery for that mostly exists in `_play_from_cache`).
 
+## Only one ticli at a time (2026-08-07 — **built**, owner confirmation pending)
+
+Built in response to the owner's report of "a primary song playing and another
+song playing at that same time", which has two causes; this closes the second.
+It also closes the multi-instance state clobbering he listed as an open bug on
+2026-07-24 (see Backlog, and BUGS-2026-07-24 item 8).
+
+**The decision that is his, not mine:** a second instance is **refused**, with
+a message naming the pid to go and quit. The alternative on the table was
+starting it read-only — no state saves — which would have fixed the clobbering
+and left the two-songs symptom entirely untouched, so it was not really an
+alternative for the reported bug. Refusing is nevertheless the stronger claim:
+it removes something that used to work, even if what it used to do was
+misbehave.
+
+Worth his answer on one thing specifically: **is a second window ever wanted
+for browsing while the first plays?** If so that is a distinct feature — an
+instance that never takes the audio backend and never writes state — rather
+than a loosening of this guard, and it should be built as such. Until he says
+otherwise, refusal stands.
+
+Not a decision, a property: the guard is best-effort by design. A filesystem
+that cannot take an advisory lock (NFS home directory) starts as it always
+did, because being locked out of your own music player by a guard is worse
+than the bug it guards against.
+
 ## Open questions
 
+- Whether a second ticli should ever be allowed for browsing-only — see the
+  single-instance section above; refusal is in place pending Garrett's call.
 - ~~mpv adoption~~ — **DECIDED: Garrett installed mpv 2026-07-24.** ticli
   auto-prefers it; ffplay remains the zero-extra-install fallback. Real
   pause/resume via IPC socket now active on his machine.

@@ -73,7 +73,7 @@ Work began 2026-07-24. Starting point: a player that worked but was, in the
 owner's words, clunky. Since then: real lossless audio, sub-2ms input latency,
 a UI that survives being resized, an on-disk cache with a tracker that decides
 what is worth keeping, and downloads to the user's own music folder. The test
-suite was 5 tests at the start and 1,467 as of 2026-08-07.
+suite was 5 tests at the start and 1,480 as of 2026-08-07.
 
 (Counts like that one go stale. If you notice a number here that no longer
 matches reality, correct it — see the section above.)

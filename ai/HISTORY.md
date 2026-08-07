@@ -1438,3 +1438,82 @@ Suite: 1,467 passed, 8 skipped. Verified stable — 25 consecutive runs of the
 new file, 6 of the timing-sensitive set (input_latency, buffering, seek,
 download_queue, bulk_downloads), 3 of the touched-area files, and 3 full runs,
 all green.
+
+---
+
+## 2026-08-07 — one ticli at a time
+
+The second route to "a primary song playing and another song playing at that
+same time": not a race inside one process (that was earlier today), but two
+ticli processes. Two instances were observed a minute apart on 2026-07-24 and
+written down as `BUGS-2026-07-24-resume-trace.md` item 8; the owner listed
+"multi-instance state-file clobbering" as one of three open bugs the same day.
+Nothing had stopped a second one from starting.
+
+**What two instances actually cost.** Both play, over each other, and neither
+can stop the other — the same symptom as the `play_url` seam, reached from
+outside. Both also write `~/.config/ticli/player_state.json`, and item 8's
+description of that had gone stale: the atomic write shipped in July, so they
+no longer *tear* the file, they take turns winning it. One sharper hazard did
+survive — `_write_state_file`'s temp path is `player_state.tmp`, fixed and
+therefore shared, so two instances write the same temp file and the loser's
+`os.replace` can fail outright, swallowed at debug level by
+`_save_state_locked`. All of it is moot once there is only one instance.
+
+**The fix.** `_take_instance_lock()` at the top of `run()`, before the audio
+backend, the login, the cache reconcile or the restore — a second instance
+must be refused before it opens anything shared, not after. An advisory
+`fcntl.flock` on `~/.config/ticli/instance.lock`, held for the life of the
+process because closing the descriptor is what releases it.
+
+**Deliberately not the pid lockfile item 8 proposed.** A pid file has to work
+out whether the pid in it is still alive, and it is wrong in both directions:
+it strands the app after a crash and it can match a recycled pid. The kernel
+releases an `flock` when the holder's last descriptor goes — including on
+SIGKILL, a closed terminal, a power cut — so there is no staleness to detect
+and no cleanup path to write. Verified with a real child process and a real
+SIGKILL rather than assumed, because the entire choice rests on it.
+
+**Refuses only on a positive answer.** No `fcntl`, an unwritable state
+directory, or a filesystem that will not take a lock (the NFS home directory
+case) all return "could not ask" and ticli starts exactly as before. A guard
+against an honest mistake must never become the thing that stops the owner
+playing his music, and the failure mode of getting this wrong — locked out
+with no recourse but deleting a file by hand — is worse than the bug.
+
+What the second instance sees, verified end to end with two real processes:
+
+    ticli is already running (pid 12410).
+    Only one copy can run at a time: two play over each other, and each one's
+    saved position overwrites the other's.
+    Quit the running copy first, or use the terminal it is in.
+
+**A near-miss worth recording.** The lock is the first thing `run()` writes,
+a handful of tests call `run()`, and one of them
+(`test_run_clamps_before_anything_plays`) redirects the config directory but
+not the state directory. So the first full-suite run after the guard landed
+created `~/.config/ticli/instance.lock` — in the owner's real config
+directory, which the testing rules forbid. Caught by checking rather than by
+assuming, and fixed where it belonged: `STATE_DIR` and `STATE_FILE` are now
+redirected suite-wide in `tests/conftest.py`, autouse, next to the
+`DOWNLOAD_ROOT` rail that has always been there. Per-test redirection had been
+correct for years and was still one new startup write away from being wrong.
+`test_the_suite_never_locks_the_owners_real_config_dir` is the tripwire.
+
+**Product decision the owner still owns.** A late instance is *refused*, not
+started read-only. Read-only would have fixed the state clobbering and left
+the two-songs symptom completely untouched, which is the symptom that prompted
+this. Refusing is the stronger claim and it is the one recorded in DECISIONS
+as needing his confirmation; if he wants a second window for browsing while
+the first plays, that is a different feature (a second instance that never
+takes the audio backend) rather than a loosening of this.
+
+**Not done.** The shared `player_state.tmp` path is untouched. With one
+instance it is unreachable, and giving it a per-pid name would be a fix to
+code that can no longer be reached by the thing it protects against — but it
+is the one piece of item 8 that would come back if the lock is ever weakened,
+and it is noted in the file rather than silently left.
+
+Suite: 1,467 → 1,480 (13 new; one asserts the conftest rail itself). Verified
+stable across 20 consecutive runs of both new files and three full runs, plus
+an end-to-end check with two real processes.

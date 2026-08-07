@@ -14,7 +14,8 @@ a multi-part fix is not done because its loudest symptom stopped.
 STATUS 2026-07-24 (same day): items 1–5, 7, 8 (atomic writes), 9 FIXED —
 20/20 tests pass, IPC ack + time-pos validated against a live mpv. Still
 open: #6 (restore index stability on fetch failure — 2026-08-02: legacy
-id-only files exclusively, see inline), #8's multi-instance lockfile,
+id-only files exclusively, see inline), ~~#8's multi-instance lockfile~~
+(closed 2026-08-07, see inline),
 #10 (_space_held swallow), #11 (get_url on UI thread — fold into the
 responsiveness/caching roadmap item).
 
@@ -92,6 +93,19 @@ responsiveness/caching roadmap item).
    ticli instance (fixed path, not per-pid; two instances observed 14:01 +
    14:02) → torn/overwritten JSON → silent restore-nothing.
    Fix: temp file + `os.replace`; pid lockfile or read-only for late instance.
+   **2026-08-07 — closed.** The atomic write shipped in July, which retired
+   the *torn* half; what was left was the *overwritten* half, and this
+   description overstated what remained — with `os.replace` in place two
+   instances no longer tear the file, they take turns winning it. (A sharper
+   version of the same hazard did survive and is also gone now: `.tmp` is one
+   fixed path too, so two instances write the same temp file and the loser's
+   `os.replace` can fail outright, swallowed at debug level by
+   `_save_state_locked`.) Closed by making the second instance not exist:
+   `_take_instance_lock()` in `run()`. Deliberately **not** the pid lockfile
+   proposed above — an advisory `flock` is released by the kernel when its
+   holder dies, so there is no staleness to detect and no recycled pid to get
+   wrong, which is the whole failure mode of pid files. It refuses only on a
+   positive answer; a filesystem that cannot lock (NFS) starts as before.
 
 9. **No signal handling.** SIGHUP/terminal-close skips run()'s finally: no
    state save, no audio.stop() (explains stale /tmp/ticli-mpv-75221.sock; mpv

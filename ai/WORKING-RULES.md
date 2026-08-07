@@ -69,8 +69,13 @@ rewritten to remove ffmpeg entirely.
   not reentrant — restructure into unlocked `_locked` halves instead).
   Precedents: the cache tracker's `_tracker_lock` (2026-07-27), the player
   state's `_state_lock` (2026-08-02), the download index's `_index_lock`
-  (2026-08-02). Cross-*process* races over these files remain accepted, as
-  before.
+  (2026-08-02). Cross-*process* races over these files are no longer left to
+  chance either, but the answer is not a lock per file: since 2026-08-07 an
+  advisory `flock` in `run()` means only one ticli runs at a time
+  (`_take_instance_lock`), so the second writer no longer exists. That guard
+  is best-effort by design — a filesystem that cannot take a lock lets the
+  run proceed — so these leaf locks remain load-bearing and none of them may
+  be removed on the strength of it.
 - **Hard: replacing an external resource is one critical section, not two.**
   Killing the old audio process and spawning the new one were two separate
   acquisitions of the same lock, and the instant between them let a second
@@ -137,8 +142,18 @@ days, and had never written a single byte to disk (see INCIDENTS #2). Assert:
   network calls
 
 Tests must not touch the real network, the owner's real cache directory, his
-token store, or `~/Music`. A loopback HTTP server on 127.0.0.1 is acceptable
-and already used.
+token store, `~/Music`, or `~/.config/ticli`. A loopback HTTP server on
+127.0.0.1 is acceptable and already used.
+
+**The rails for that live in `tests/conftest.py`, and anything new that writes
+at startup needs one there before it needs a test.** `DOWNLOAD_ROOT` and
+`STATE_DIR` are both redirected suite-wide, autouse, because the alternative
+is every future test remembering. The instance lock proved why: it was the
+first thing `run()` touches, a handful of tests call `run()`, one of them
+redirected the config but not the state, and the lock file duly appeared in
+the owner's real `~/.config/ticli` on the first full-suite run. Per-test
+redirection had been correct for years and was still one new startup write
+away from being wrong.
 
 **A flaky test is a bug until proven otherwise.** The one flaky test in this
 project turned out to be a genuine race in cache eviction, not timing noise.
