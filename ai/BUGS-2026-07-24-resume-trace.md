@@ -3,6 +3,14 @@
 Symptom: "Resume is malfunctioning / really buggy behavior" while testing the
 resume feature, mpv newly active as backend. Ranked, deduped findings.
 
+STATUS 2026-08-07: **item 4 was only two-thirds fixed and is now closed** —
+see the inline note on it, and INCIDENTS #7. Its third prescribed fix (the
+re-entrancy guard on the stop→Popen window itself) never shipped in July; the
+two that did only stopped the *monitor* from stepping into that window, and
+the window went on double-spawning mpv for two more weeks until the owner
+heard two songs at once. Treat the status line below as the cautionary case:
+a multi-part fix is not done because its loudest symptom stopped.
+
 STATUS 2026-07-24 (same day): items 1–5, 7, 8 (atomic writes), 9 FIXED —
 20/20 tests pass, IPC ack + time-pos validated against a live mpv. Still
 open: #6 (restore index stability on fetch failure — 2026-08-02: legacy
@@ -48,6 +56,13 @@ responsiveness/caching roadmap item).
    interleaving double-spawns mpv → orphaned process, double audio.
    Fix: re-entrancy guard / "changing track" flag; require 2 consecutive dead
    polls before advancing.
+   **2026-08-07 — fully closed.** The "changing track" flag (`_track_changing`)
+   and the two-dead-polls rule shipped on 2026-07-24 and hold; they are why the
+   skips-two-tracks half stayed fixed. The re-entrancy guard did not, so the
+   double-spawn half never was: `play_url` went on releasing `_lock` between
+   `stop()` and `Popen`. It is now one critical section (`_stop_locked` /
+   `_play_url_locked`), with a regression test that asserts no spawned process
+   is left alive but the current one. See INCIDENTS #7.
 
 5. **Position is wall-clock, never read from mpv.** `_play_start_time` is
    stamped at Popen, ~0.3–0.7s before audio actually starts (measured) →

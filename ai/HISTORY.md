@@ -1325,3 +1325,116 @@ API and functools internals).
 
 Suite: 1,446 passed, 8 skipped — identical count before and after, three
 consecutive full runs.
+
+---
+
+## 2026-08-07 — two songs at once: the kill/spawn seam in `play_url`
+
+The owner: *"there was a primary song playing and another song playing at that
+same time with the same client."* One process, two audible streams. Diagnosed
+by a five-lens workflow (process lifecycle, generation counters, initiation
+paths, monitor/auto-advance, resume/lock discipline), each report then handed
+to a refuter told to kill it and to check reachability and citation accuracy.
+All five lenses converged on the same mechanism and every refuter confirmed it
+— three by driving the real `AudioPlayer.play_url` with a faked `Popen` and
+watching two live processes come out.
+
+**The bug.** `play_url` did `self.stop()` — which takes `_lock`, reaps, sets
+`_process = None`, releases — and *then* `with self._lock:` around the `Popen`.
+Two starts landing inside one reap (a double-tap on `n`, which has no repeat
+window; `KEY_REPEAT_WINDOW` guards only the space bar) each reached the spawn,
+because the loser's `stop()` ran after `_process` was already None and so
+reaped nothing. `_process` is a single slot and the only handle anything uses,
+and mpv's IPC socket is one fixed path per pid that the last spawn takes over —
+so the orphan was not merely leaked, it was unreachable: deaf to the space bar,
+invisible to the UI, and still playing after `q`.
+
+**The fix.** `stop()` → lock-taking shell + unlocked `_stop_locked()`;
+`play_url` → shell + `_play_url_locked()`, which reaps and respawns inside one
+acquisition and returns `(have_kept, gen)` so the caller starts the download
+off the lock (that comment at the old `_start_download` call was load-bearing
+and still is). `_lock` is a plain non-reentrant `Lock`, so the unlocked
+`_locked` half is the only shape available — the one `seek_to` has always had,
+and the one WORKING-RULES already prescribed. Total time the lock is held is
+unchanged: the reap was always inside it. It is now one acquire/release pair
+instead of two.
+
+Two adjacent seams closed with it. `resume()`'s ffplay-without-cache path did
+`self._lock.release()` … `play_url(...)` … `self._lock.acquire()` by hand —
+the same window, reached by pressing space before the cache copy is ready.
+And `_reap_process` sent SIGKILL without a second `wait()`, so a backend that
+ignored SIGTERM for 2s became a zombie the moment the caller dropped the
+handle. `_stop_locked` also now clears `_process` when it finds it already
+exited: a dead handle there is not a process, it is a stale answer, and
+`failure()` reads it — a stream the backend had refused went on reporting its
+error after we had stopped the track.
+
+**Predicted, and half-fixed, two weeks ago.** `BUGS-2026-07-24-resume-trace.md`
+item 4 called this exactly — *"tighter interleaving double-spawns mpv →
+orphaned process, double audio"* — and prescribed three fixes. Two shipped and
+hold; both close the *monitor's* door onto the window rather than the window.
+Item 4 was marked FIXED anyway. That file and INCIDENTS #7 now record which
+third was outstanding.
+
+**Rejected**, each for a stated reason: debouncing `n` (does not close it —
+`_flush_seek` and media keys are keyboard-free entrants — and it would break
+the buffered-burst input path that makes held arrows scroll smoothly); a
+Player-level mutex around `_play_track` (would be held across `_stream_description`,
+a network round trip, violating both the leaf-lock rule and network-never-on-
+the-UI-thread, and it is not a leaf); a PID registry or `start_new_session` +
+`killpg` sweeps (new in-place-mutated shared state that must then be locked on
+every touch, a new process-group assumption, and it cleans up after the bug
+instead of preventing it); re-checking `_play_gen` just before the `Popen`
+(narrows, does not close — the two racing workers carry different,
+individually-current generations); shortening the reap (the window is the
+lock-release boundary, not the reap's duration).
+
+**Ruled out during diagnosis**, all with the guard that defeats each: the
+`_play_gen` read-modify-write being non-atomic (0 lost updates in 1.6M
+contended increments, and subsumed anyway); resume-on-launch autoplaying over
+a manual play (`_restore_state` contains no play call at all); the monitor
+auto-advancing on top of an in-flight change (`_track_changing` + two dead
+polls hold); prefetch pre-starting a decoder (it stores a URL string, never a
+`Popen`); radio queue extension; a completed download respawning the player; a
+wedged stderr pipe (`_open_stderr` is a truncated regular file, and says why);
+two `AudioPlayer` instances. Still open and not this bug: **two ticli
+processes** — `#8`'s multi-instance lockfile, which produces the same symptom
+with no race at all.
+
+**Tests: 1,453 → 1,467.** The new file asserts process *liveness*, not
+bookkeeping — every process ever spawned, except the one `_process` currently
+names, must have been terminated or killed. That distinction is the whole
+point: the suite already had 1,453 tests and none could see a leaked process,
+because every fake stood in for a player that cannot die (`_FakeProc` defines
+only `poll()`; `test_cache.py`'s `_Proc.poll()` returns `None` forever with
+`terminate()` as `pass`). One test runs the race against **real OS children**;
+pre-fix it reports *"pids still running that ticli can no longer stop:
+[12148] (ticli thinks it is playing 12149)"*.
+
+**Worth recording about the test itself.** The first version started two
+threads and hoped. It passed **25/25 against the unfixed code** — CPython locks
+are unfair, so the thread that releases barges and re-acquires before the
+parked waiter is even woken, and the scheduler essentially never lands in the
+seam (the diagnosis measured well under 1% of contended track changes, which is
+why this was a once-a-month bug that could not be reproduced on purpose). The
+committed version pins the interleaving instead of gambling on it: it stops the
+releasing thread from immediately re-taking the lock. Once kill and spawn are
+one acquisition, `play_url` no longer calls `stop()`, the hook is never
+invoked, and there is nothing to land in. A test that cannot fail against the
+broken code was not a weak test — it was not a test.
+
+**Not done.** Nothing was changed about `#8`'s multi-instance lockfile, which
+remains the other route to this symptom and should be asked about before
+assuming this fix covers a future sighting. `_play_from_cache` (`resume()`'s
+ffplay-with-cache path) still spawns without reaping; it was verified
+unreachable with a live process — `pause()` sets `_process = None` before
+`_paused = True` under one lock — so it was left alone rather than given a
+guard whose necessity nobody could demonstrate. The `_download_gen += 1` that
+both racing threads used to execute may have been able to make the winner's
+download abandon itself; with the race closed there is only one bump per track
+change, so the question is moot rather than answered.
+
+Suite: 1,467 passed, 8 skipped. Verified stable — 25 consecutive runs of the
+new file, 6 of the timing-sensitive set (input_latency, buffering, seek,
+download_queue, bulk_downloads), 3 of the touched-area files, and 3 full runs,
+all green.

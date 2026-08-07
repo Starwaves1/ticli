@@ -49,7 +49,7 @@ If you are an agent picking this project up, read in this order:
 |---|---|
 | **[WORKING-RULES.md](WORKING-RULES.md)** | The constraints. Read first — several are non-obvious and violating them has already caused real damage. |
 | **[HISTORY.md](HISTORY.md)** | What happened, in order, with the reasoning behind each change. |
-| **[INCIDENTS.md](INCIDENTS.md)** | Five things that went wrong and what each one taught. The most useful file here. |
+| **[INCIDENTS.md](INCIDENTS.md)** | Seven things that went wrong and what each one taught. The most useful file here. |
 | **[DECISIONS.md](DECISIONS.md)** | Product decisions locked by the owner, the roadmap, and specs for work not yet built. |
 | **[WORKFLOWS.md](WORKFLOWS.md)** | If you are about to run a multi-agent workflow here: what worked, what silently failed, read before authoring one. |
 | **[PR-SUMMARY.md](PR-SUMMARY.md)** | Draft material for the upstream pull request. |
@@ -73,7 +73,7 @@ Work began 2026-07-24. Starting point: a player that worked but was, in the
 owner's words, clunky. Since then: real lossless audio, sub-2ms input latency,
 a UI that survives being resized, an on-disk cache with a tracker that decides
 what is worth keeping, and downloads to the user's own music folder. The test
-suite was 5 tests at the start and 1,446 as of 2026-08-02.
+suite was 5 tests at the start and 1,467 as of 2026-08-07.
 
 (Counts like that one go stale. If you notice a number here that no longer
 matches reality, correct it — see the section above.)

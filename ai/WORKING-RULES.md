@@ -71,6 +71,24 @@ rewritten to remove ffmpeg entirely.
   state's `_state_lock` (2026-08-02), the download index's `_index_lock`
   (2026-08-02). Cross-*process* races over these files remain accepted, as
   before.
+- **Hard: replacing an external resource is one critical section, not two.**
+  Killing the old audio process and spawning the new one were two separate
+  acquisitions of the same lock, and the instant between them let a second
+  starter spawn a backend of its own and orphan the first — two songs playing
+  at once, the loser unreachable because `_process` is the only handle
+  anything uses (INCIDENTS #7). The general shape: when a single slot holds
+  the only reference to something that must be destroyed before its
+  replacement is created, the destroy and the create are one hold of the lock.
+  Releasing in between is a window in which the slot is empty and a spawn is
+  still owed, so a second caller finds nothing to clean up. Precedents:
+  `_play_url_locked` (2026-08-07) and `seek_to`, which always had it right.
+  A generation counter does not substitute — the two racing callers each
+  carried a currently-valid generation.
+- **Never hand the lock back by hand.** `resume()` did
+  `self._lock.release()` … call … `self._lock.acquire()` to reach a
+  lock-taking method; that is the same window as above, wearing a disguise.
+  A plain `Lock` is not reentrant, and the answer to that is always an
+  unlocked `_locked` half, never an unlock-and-hope.
 - Generation counters are the established pattern for "a result landed after
   the thing it was for went away" (`_search_gen`, `_play_gen`,
   `_download_gen`, `_artwork_request`).
@@ -124,6 +142,15 @@ and already used.
 
 **A flaky test is a bug until proven otherwise.** The one flaky test in this
 project turned out to be a genuine race in cache eviction, not timing noise.
+
+**Watch a new test fail against the unfixed code before you commit it.** Not a
+style preference — a regression test that cannot fail is not a weak test, it is
+not a test, and this project has now shipped that twice (INCIDENTS #2, #7). For
+a race, hoping the scheduler cooperates is not enough: the first version of the
+double-spawn test passed 25/25 against code with the bug fully present, because
+CPython locks are unfair and the releasing thread barges. Pin the interleaving
+so the failure is deterministic, and say in the test *why* the instrumentation
+is faithful to what the scheduler does on its own.
 
 ## Honesty in the interface
 

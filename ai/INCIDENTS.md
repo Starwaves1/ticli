@@ -1,6 +1,6 @@
 # Incidents
 
-Six things that went wrong, and what each changed. This is the highest-value
+Seven things that went wrong, and what each changed. This is the highest-value
 file in `ai/` — every rule in WORKING-RULES.md that matters came from one of
 these.
 
@@ -191,6 +191,65 @@ about a belief rather than about what was on disk.
 - Rule reinforced, and it is the generalizable one: **a test for a filename
   must obtain the filename from the code that writes it.** Where a test cannot
   do that, the constant belongs in one place that both sides import.
+
+---
+
+## 7. Two songs at once, from a bug we had already written down
+
+**What happened.** The owner: *"there was a primary song playing and another
+song playing at that same time with the same client."* One ticli process, two
+audible streams.
+
+`play_url` killed the old backend and spawned the new one under **two separate
+acquisitions** of `AudioPlayer._lock`: `self.stop()` — which takes the lock,
+reaps, sets `_process = None`, and *releases* — followed by `with self._lock:`
+around the `Popen`. Two track-starts arriving inside one reap each reached the
+spawn: the loser's `stop()` ran after the winner had already cleared
+`_process`, so its `if self._process and ... poll() is None` was false, it
+reaped nothing, and both processes ended up playing.
+
+**Why it was audible rather than merely untidy.** `_process` is a single slot
+and the only handle ticli keeps. Everything that stops, pauses, seeks or shuts
+down acts on it alone, and mpv's IPC socket is one fixed path per ticli pid
+that the last spawn takes over. So the orphan answered nothing: space bar
+silenced one stream and left the other going, the UI showed one track while two
+were audible, and `q` exited without touching it — the process outlived the app.
+
+**The part that stings.** This exact failure was traced and written down on
+2026-07-24, in `BUGS-2026-07-24-resume-trace.md` item 4: *"tighter interleaving
+double-spawns mpv → orphaned process, double audio."* It prescribed three
+fixes. Two shipped — `_track_changing` and the two-consecutive-dead-polls rule
+— and both close the **monitor's** door onto that window. The third, the
+re-entrancy guard on the window itself, did not. Item 4 was then marked FIXED
+at the top of that file, and the seam it was really about stayed open for two
+weeks. **A multi-part fix marked done because its visible symptom stopped is
+the failure mode here**; the file now records which third is outstanding.
+
+**Why no test caught it.** The suite had 1,453 tests and not one could see a
+leaked process. Every fake stood in for a player that cannot die:
+`test_player_controls.py`'s `_FakeProc` defines only `poll()` — no `terminate`,
+no `wait`, no `kill` — and `test_cache.py`'s `_Proc.poll()` returns `None`
+forever with `terminate()` as `pass`, so a killed process and a leaked one are
+indistinguishable. The assertions were about the spawned command line and about
+`_process` pointing at the newest spawn — which is true with the bug fully
+present. INCIDENTS #2 again, in the process domain: green tests over an
+invariant nothing was checking.
+
+**What changed.**
+- `_stop_locked()` and `_play_url_locked()`: the reap and the respawn are one
+  critical section. `resume()`'s hand-written `_lock.release()` / re-acquire
+  around `play_url` — the same seam by another door — went with it.
+- A regression file that asserts **process liveness, not bookkeeping**: every
+  process ever spawned, except the one `_process` currently names, must have
+  been terminated or killed. It runs against fakes that actually die, and once
+  against real OS children, where the pre-fix failure reads *"pids still
+  running that ticli can no longer stop: [12148]"*.
+- The lesson that generalizes past locks: **when a test cannot distinguish the
+  fixed code from the broken code, it is not a weak test, it is not a test.**
+  The first version of the concurrency test here started two threads and hoped;
+  it passed 25/25 against the unfixed code, because CPython locks are unfair
+  and the releasing thread barges before the parked one wakes. It had to be
+  made to fail on purpose before it was worth committing.
 
 ---
 
