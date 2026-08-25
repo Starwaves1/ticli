@@ -1585,6 +1585,82 @@ class TestReFetchingEverything:
         p.session.track = lambda tid: pytest.fail("counting resolved a track")
         assert p._refetch_candidates()["bytes"] == 10
 
+    # ── the playing track is playback's, not this job's ──
+
+    def test_the_playing_track_is_left_out_of_the_plan(self):
+        """Playback and the re-fetch stage as the same `{track_id}.part`, and
+        the playing track's below-tier copy is the one `_local_source` just
+        refused — playback is already fetching it at this very tier. Two
+        writers, one name; the job leaves it to the one that started."""
+        p = self._library(cached=[(1, "HIGH"), (2, "HIGH")])
+        p._current_track = _track(1)
+        plan = p._refetch_candidates()
+        assert plan["cache"] == ["2"]
+        assert plan["skipped"] == 1
+
+    def test_a_track_that_starts_playing_after_the_plan_is_skipped_at_fetch_time(
+            self):
+        """The plan is drawn once; the run takes minutes. A track that starts
+        playing in between must be skipped when its turn comes — before the
+        resolve, so the skip costs no API request either."""
+        p = self._library(cached=[(42, "HIGH")])
+        p._current_track = _track(42)
+        p.session.track = lambda tid: pytest.fail("the skip resolved the track")
+
+        p._refetch_one("cache", "42", "MAX", p._refetch_gen)
+
+        assert p._cache.audio_record(42)["quality"] == "HIGH", \
+            "the copy was touched"
+
+    def test_the_playing_tracks_download_is_not_skipped(self, monkeypatch):
+        """The music-folder half stages as `.ticli-{id}.part`, a different
+        name — so the guard is scoped to the cache kind and must not grow."""
+        p = self._library(downloaded=[(42, "HIGH")])
+        p._current_track = _track(42)
+        p.session.track = lambda tid: _track(42)
+        ran = []
+        monkeypatch.setattr(p, "_download_to_music",
+                            lambda real, tier, abandoned=None: ran.append(real.id))
+
+        p._refetch_one("download", "42", "MAX", p._refetch_gen)
+
+        assert ran == [42]
+
+    def test_the_refetch_claims_the_name_only_while_writing(self, monkeypatch):
+        """`AudioPlayer.refetch_writing` is what keeps playback's downloader
+        off the `.part` this job is filling — held for exactly the write,
+        released even when the fetch dies."""
+        p = self._library(cached=[(42, "HIGH")])
+        p.audio = player_mod.AudioPlayer("mpv", cache=p._cache)
+        p._download_stream_url = lambda real, tier: ("https://cdn/x.mp4", "MAX")
+        seen = []
+
+        def _fetch(sources, part, abandoned=None):
+            seen.append(p.audio.refetch_writing)
+            with open(part, "wb") as f:
+                f.write(b"new")
+            return ".m4a"
+
+        monkeypatch.setattr(player_mod, "fetch_to_file", _fetch)
+        p._refetch_into_cache(_track(42), "MAX", lambda: False)
+
+        assert seen == [42], "the name was not claimed during the write"
+        assert p.audio.refetch_writing is None, "the claim outlived the write"
+
+    def test_the_claim_is_released_when_the_fetch_fails(self, monkeypatch):
+        p = self._library(cached=[(42, "HIGH")])
+        p.audio = player_mod.AudioPlayer("mpv", cache=p._cache)
+        p._download_stream_url = lambda real, tier: ("https://cdn/x.mp4", "MAX")
+
+        def _die(sources, part, abandoned=None):
+            raise RuntimeError("connection lost")
+
+        monkeypatch.setattr(player_mod, "fetch_to_file", _die)
+        with pytest.raises(RuntimeError):
+            p._refetch_into_cache(_track(42), "MAX", lambda: False)
+
+        assert p.audio.refetch_writing is None
+
     # ── it asks first ──
 
     def test_nothing_happens_until_the_confirmation_is_answered(self, monkeypatch):
@@ -1854,7 +1930,7 @@ class _RecordingAudio:
         self.is_paused = False
 
     def play_url(self, url, seek=0, title="", cache_key=None, local=None,
-                 quality=None):
+                 quality=None, allow_cached=True):
         self.plays.append({"url": url, "local": local, "quality": quality})
 
 

@@ -736,6 +736,33 @@ class TestAudioRetention:
 
     # ── nothing kept when nothing was asked for ──
 
+    def test_the_download_stands_down_while_the_refetch_holds_the_name(
+            self, monkeypatch):
+        """Both writers stage as the same `{track_id}.part`, and two "wb"
+        handles on one name promote interleaved garbage — so a download for
+        the key the [R] re-fetch has claimed must refuse the way a full
+        cache does: stream only, and let the re-fetch deliver the file."""
+        calls = _fake_get(monkeypatch)
+        audio = self._audio()
+        audio.refetch_writing = 12
+
+        audio._start_download(URL, 12, audio._download_gen)
+        _settle()
+
+        assert _audio_files(pending=True) == [], "it wrote over the claim"
+        assert calls == [], "it fetched a copy it may not keep"
+
+    def test_a_claim_on_another_track_stops_nothing(self, monkeypatch):
+        _fake_get(monkeypatch)
+        audio = self._audio()
+        audio.refetch_writing = 99
+
+        audio._start_download(URL, 12, audio._download_gen)
+
+        assert _wait_for(lambda: _audio_files())
+        _settle()
+        assert [f.name for f in _audio_files()] == ["12.m4a"]
+
     def test_nothing_is_stored_with_song_caching_off(self, monkeypatch):
         calls = _fake_get(monkeypatch)
         _no_spawn(monkeypatch)
@@ -1643,8 +1670,9 @@ class _RecordingAudio:
         self.is_paused = False
 
     def play_url(self, url, seek=0, title="", cache_key=None, local=None,
-                 quality=None):
-        self.plays.append({"url": url, "local": local, "quality": quality})
+                 quality=None, allow_cached=True):
+        self.plays.append({"url": url, "local": local, "quality": quality,
+                           "allow_cached": allow_cached})
 
 
 def _streaming_track(tid, calls, quality="LOSSLESS", url="https://cdn/x.mp4"):
@@ -1819,6 +1847,71 @@ class TestReplayingAtAHigherQuality:
         _settle()
         assert not (stale / "12.m4a").exists(), "the old copy is still there"
         assert audio.cache.audio_record(12)["quality"] == "LOSSLESS"
+
+
+class TestTheRefusalSurvivesTheRealPlayer:
+    """The class above proves `_play_track` *decides* to re-fetch; this one
+    proves the decision survives `play_url`. The recording fake stops one
+    call short of the seam that broke (INCIDENTS #2's shape): play_url's own
+    stem lookup used to re-find the very file `_local_source` had refused, so
+    the freshly paid stream URL was discarded, the below-tier copy played,
+    and — because `have_kept` then held — the upgrade was never downloaded
+    either. Green tests, inert feature. So these run the real AudioPlayer
+    and assert on what the backend was handed and what lands on disk."""
+
+    def _player(self, quality="MAX"):
+        p = HeadlessTidalPlayer(quality=quality)
+        p.session = _FakeSession(latency=0)
+        p._cache = MetadataCache(songs=True)
+        p.audio = player_mod.AudioPlayer("mpv", cache=p._cache)
+        return p
+
+    def test_a_refused_copy_is_not_resurrected_by_the_stem_lookup(
+            self, monkeypatch):
+        _fake_get(monkeypatch)
+        procs = _no_spawn(monkeypatch)
+        p = self._player()
+        stale = _cached_file(p._cache, 12, quality="HIGH")
+
+        calls = []
+        p._play_track(_streaming_track(12, calls, url=URL))
+        assert _wait_for(lambda: procs)
+
+        assert calls == [12]
+        assert URL in procs[0].cmd, "the paid-for stream was discarded"
+        assert str(stale) not in procs[0].cmd, \
+            "the refused below-tier copy played anyway"
+
+    def test_the_upgrade_is_downloaded_over_the_old_copy(self, monkeypatch):
+        _fake_get(monkeypatch)
+        _no_spawn(monkeypatch)
+        p = self._player()
+        stale = _cached_file(p._cache, 12, quality="HIGH")
+
+        p._play_track(_streaming_track(12, [], url=URL))
+
+        assert _wait_for(lambda: stale.read_bytes() == BODY), \
+            "the below-tier copy was never replaced"
+        _settle()
+        assert p._cache.audio_record(12)["quality"] == "LOSSLESS", \
+            "the tracker still claims the old tier"
+
+    def test_an_acceptable_copy_still_plays_from_disk(self, monkeypatch):
+        """The other half of the contract, through the same real seam: a copy
+        `_local_source` accepted must still be the source, and no download
+        may start for it."""
+        calls = _fake_get(monkeypatch)
+        procs = _no_spawn(monkeypatch)
+        p = self._player(quality="LOW")
+        kept = _cached_file(p._cache, 12, quality="HI_RES_LOSSLESS")
+
+        p._play_track(_streaming_track(12, []))
+        assert _wait_for(lambda: procs)
+        _settle()
+
+        assert str(kept) in procs[0].cmd
+        assert calls == [], "a good copy still cost a download"
+        assert kept.read_bytes() == b"x" * 64, "the hi-res copy was rewritten"
 
 
 class TestPlaysAreCountedOnce:
