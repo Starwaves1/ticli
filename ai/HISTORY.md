@@ -1517,3 +1517,59 @@ and it is noted in the file rather than silently left.
 Suite: 1,467 → 1,480 (13 new; one asserts the conftest rail itself). Verified
 stable across 20 consecutive runs of both new files and three full runs, plus
 an end-to-end check with two real processes.
+
+---
+
+## 2026-08-25 — pre-release verification of the upstream PR
+
+No code changed. This entry records a review, because its result is that the
+fork should not be published to Homebrew in the state it is in, and the
+reasoning is worth more than the verdict.
+
+Upstream `odonald/ticli` PR #1 (`Starwaves1/ticli:main` → `odonald/ticli:main`,
+97 commits, ~35.9k added lines) was reviewed ahead of two decisions the owner
+was about to make: publish to Homebrew, and merge the fork upstream. Fourteen
+agents: seven area finders, a refute-by-default panel, a completeness critic,
+and a final reviewer that re-verified the survivors and wrote
+`reference/prerelease-verification-2026-08-25.md`. 34 raw findings → 32 unique
+→ 28 confirmed, 4 refuted.
+
+**Verdict: fix first for Homebrew, merge is fine.** Seven must-fixes. Three are
+release plumbing — PyPI already holds `tidal-cli` 1.0.2 from 2026-03-12 (the
+pre-fork March build), so the release as cut either 400s or ships March;
+`requires = ["setuptools>=64"]` cannot build `license = "MIT"` (PEP 639 needs
+77+, reproduced against 75.8.0); `__init__.py` says 1.0.0, a third version.
+Four are first-hour user harm: the re-fetch-at-higher-quality feature is inert
+because `_play_url_locked` re-finds the below-tier file `_local_source` just
+refused; holding `→` or `l` fans out at ~30 requests/second on the endpoint
+family from INCIDENTS #1, and on the like path those are account writes; a
+transient error at launch silently downgrades a PKCE login to device flow and
+writes `is_pkce: False` over the record; and at budget the cache can never
+take a new song, because `should_cache` counts the play in progress and
+`enforce_budget` does not.
+
+**The finding that indicts the rails, again.** `conftest.py` redirects
+`DOWNLOAD_ROOT` and `STATE_DIR` but not `cache.CACHE_DIR`. A monitor daemon
+thread outlives its test's monkeypatch and calls `note_played` after teardown
+restored the real path, so every suite run rewrites the runner's real
+`~/.cache/ticli/audio.json`. This was not argued into existence — three full
+suite runs during this review left a synthetic 24-play tracker in the
+reviewer's own home directory. That is the 2026-08-07 lesson one directory
+over: per-test redirection was correct until it wasn't, and the rails file is
+the only place a fix scales.
+
+**On the ceiling of this review.** Installing mpv 0.37.0 and ffmpeg 6.1.1 into
+the review container un-skipped the eight real-backend tests that a bare
+machine skips: 1,488 passed, 0 skipped. Both backends really played ticli's
+own hand-built HLS playlist off a real socket. Two of the eight failed first
+for a sandbox reason — no `/dev/snd`, so mpv exits 2 on AO init — and pass
+under `ao=null` / `SDL_AUDIODRIVER=dummy`. Worth knowing before someone files
+those two as bugs. What no container can reach is still the important half:
+live TIDAL, audible sound, and macOS. Half the report is a hand-check list for
+exactly that reason.
+
+**Rejected:** fixing anything in the same pass. Seven of these touch
+`player.py` and two of them (the tier fallback at 1646 and the `.part`
+collision at 1425/7647) must be closed together — fixing the first re-arms the
+second, which is only unreachable today *because* of the bug. That is a
+briefing for one author, not a side effect of a review.
