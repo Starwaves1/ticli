@@ -1272,6 +1272,13 @@ class AudioPlayer:
     - ffplay: kills process on pause, restarts from cached local file on resume
     """
 
+    # The track id whose cache copy the [R] re-fetch is writing right now,
+    # set by _refetch_into_cache around its fetch. Both writers stage as the
+    # same "{track_id}.part", so while this is set _start_download must not
+    # open that name too — see the check there. A class default rather than
+    # __init__ state so the claim reads as absent on any instance.
+    refetch_writing = None
+
     def __init__(self, player_cmd: str, volume: int = 100, cache=None):
         self.player_cmd = player_cmd
         # Shared MetadataCache — only consulted for where cached audio lives
@@ -1414,6 +1421,15 @@ class AudioPlayer:
             # is not a failure: the track streams exactly as it would with
             # song caching switched off, which is the behaviour this is
             # deliberately identical to.
+            base = None
+        writing = self.refetch_writing
+        if base is not None and writing is not None \
+                and str(cache_key) == str(writing):
+            # The [R] re-fetch is mid-file on this very track — both writers
+            # stage as the same "{track_id}.part", and two "wb" handles on
+            # one name promote interleaved garbage. Stand down the same way
+            # an admission refusal does: the track streams fine either way,
+            # and the re-fetch delivers the same file at the same tier.
             base = None
         keep = base is not None
         if not keep:
@@ -1591,7 +1607,8 @@ class AudioPlayer:
         return path
 
     def play_url(self, url: str, seek: float = 0, title: Optional[str] = None,
-                 cache_key=None, local: Optional[str] = None, quality=None):
+                 cache_key=None, local: Optional[str] = None, quality=None,
+                 allow_cached: bool = True):
         """Play an audio URL, stopping any current playback.
 
         With audio caching on, a track played before is already on disk, so
@@ -1605,10 +1622,19 @@ class AudioPlayer:
         it is verified at the moment of use rather than trusted — a file the
         user deleted by hand falls straight through to the network, which is
         the whole of "handled durably" on this path.
+
+        `allow_cached=False` says the caller already decided what on this disk
+        will do — whatever it chose arrives in `local` — so the cache must not
+        be consulted again here. This player has no notion of quality tiers;
+        `_local_source` does, and its refusal of a below-tier copy used to be
+        undone right here by the stem lookup, which re-found the refused file,
+        threw away the freshly paid stream URL, and — because `have_kept` then
+        held — never started the download that would have upgraded it. The
+        whole re-fetch-at-a-higher-tier path hangs on this flag.
         """
         with self._lock:
             have_kept, gen = self._play_url_locked(
-                url, seek, title, cache_key, local)
+                url, seek, title, cache_key, local, allow_cached)
         # Off the lock and off this thread: fetching the track must never hold
         # up the process that is playing it
         if not have_kept:
@@ -1616,7 +1642,8 @@ class AudioPlayer:
 
     def _play_url_locked(self, url: str, seek: float = 0,
                          title: Optional[str] = None, cache_key=None,
-                         local: Optional[str] = None):
+                         local: Optional[str] = None,
+                         allow_cached: bool = True):
         """play_url's body, for callers already holding self._lock.
 
         Kills the previous backend and spawns the new one inside a *single*
@@ -1644,7 +1671,7 @@ class AudioPlayer:
         self._seek_offset = seek
         self._play_start = time.time()
         kept = local if (local and os.path.exists(local)) else \
-            self._cached_audio_path(cache_key)
+            (self._cached_audio_path(cache_key) if allow_cached else None)
         # A track played before is already whole on disk: play the file and
         # never touch the network. Works on both backends, because only the
         # source path changes.
@@ -3081,8 +3108,14 @@ class HeadlessTidalPlayer:
                 # generation check, so the screen can never claim a tier for
                 # a track that is not the one playing.
                 self._playing_badge = badge
+                # allow_cached=False: `_local_source` above is the one decision
+                # about what on disk may play — a copy it accepted is in
+                # `local`, and one it refused (below the tier now selected)
+                # must not be re-found by the stem lookup inside play_url,
+                # or the refusal buys a stream URL that is then discarded.
                 self.audio.play_url(url, seek=seek, title=title, cache_key=real.id,
-                                    local=local, quality=granted)
+                                    local=local, quality=granted,
+                                    allow_cached=False)
                 if self._play_gen != gen:
                     return
                 self._playing = True
@@ -7532,9 +7565,21 @@ class HeadlessTidalPlayer:
                      plan["downloads"])
         if self._cache.keeps_audio:
             downloaded = set(plan["downloads"])
+            playing = str(self._current_track.id) \
+                if self._current_track is not None else None
             for key, record in self._cache._load_tracker().items():
                 if key in downloaded:
                     continue  # the download tier covers it
+                if playing is not None and str(key) == playing:
+                    # The playing track's upgrade belongs to playback: a
+                    # below-tier copy was refused by _local_source when it
+                    # started, so _start_download is already fetching it at
+                    # this tier — and the two writers share a staging name
+                    # ("{track_id}.part"), so this job must not touch it.
+                    # _refetch_one re-checks at fetch time for a track that
+                    # starts playing after this plan is drawn.
+                    plan["skipped"] += 1
+                    continue
                 classify(record.get("quality"), key, record.get("bytes"),
                          plan["cache"])
         return plan
@@ -7623,6 +7668,17 @@ class HeadlessTidalPlayer:
                 raise _DownloadSuperseded()
             return False
 
+        if kind == "cache" and self._current_track is not None \
+                and str(key) == str(self._current_track.id):
+            # The playing track is playback's to upgrade, not this job's:
+            # its below-tier copy was refused by _local_source when it
+            # started, so _start_download is (or was) fetching it at this
+            # very tier — and both writers stage as the same
+            # "{track_id}.part". _refetch_candidates already leaves it out
+            # of the plan; this catches the one that started playing after
+            # the plan was drawn. Checked before the resolve, so the skip
+            # costs no API request.
+            return
         real = self.session.track(int(key)) if str(key).isdigit() \
             else self.session.track(key)
         if real is None:
@@ -7649,9 +7705,17 @@ class HeadlessTidalPlayer:
         sources = stream_sources(url)
         if not sources:
             raise RuntimeError("stream named nothing to fetch")
-        ext = fetch_to_file(sources, part, abandoned=abandoned)
-        path = base + ext
-        os.replace(part, path)
+        # Claim the name before the first byte lands: should this track start
+        # playing mid-fetch, _start_download sees the claim and stands down
+        # instead of opening the same "{track_id}.part" — this writer's file
+        # is the upgrade either way.
+        self.audio.refetch_writing = track_id
+        try:
+            ext = fetch_to_file(sources, part, abandoned=abandoned)
+            path = base + ext
+            os.replace(part, path)
+        finally:
+            self.audio.refetch_writing = None
         self.audio._drop_other_copies(base, path)
         self._cache.note_cached(track_id, ext, os.path.getsize(path),
                                 quality=granted)

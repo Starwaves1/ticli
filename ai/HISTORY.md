@@ -1593,3 +1593,50 @@ work (`ModuleNotFoundError`; the editable finder points elsewhere — re-run
 requests they make; tidalapi's own token-refresh round trip is not separately
 throttled. Live-player control and an MCP layer were deferred by the owner's
 choice, not overlooked — see DECISIONS.
+
+## 2026-08-25 — the quality re-fetch was inert: play_url undid _local_source
+
+### `222d334` allow_cached, and the .part collision the fix re-armed
+
+Pre-release review finding #4 (`ai/reference/prerelease-verification-2026-08-25.md`,
+on the review branch): `_local_source` refuses a cached copy stored below the
+tier now selected and pays for a fresh stream URL — and `_play_url_locked`'s
+stem lookup (`_cached_audio_path`, no tier check) re-found the very file just
+refused, played it, and, because `have_kept` then held, never started the
+download either. Old HIGH file audible under a badge reading MAX, one
+playbackinfo request burned per play. The feature's four tests stopped at a
+recording fake, one call short of the seam — INCIDENTS #2's shape, again.
+
+The fix keeps the policy where it lives: `play_url` grows `allow_cached`, and
+`_play_track` passes False — its `_local_source` verdict is the one decision
+about what on disk may play (an accepted copy arrives in `local`). AudioPlayer
+still knows nothing about tiers. `resume()` and every other caller keep the
+default True.
+
+**The warning in the finding was real.** A refuted review finding — playback's
+`_start_download` and `[R]`'s `_refetch_into_cache` both staging as the same
+`{track_id}.part`, opened "wb" by both — was only unreachable *because* the
+feature was inert: playback's writer could never run for a track with any copy
+on disk. Fixing one re-armed the other, so both landed together, guarded from
+both sides because each direction has a race the other side cannot see:
+
+- The re-fetch leaves the playing track alone — out of the plan in
+  `_refetch_candidates` (counted as skipped) *and* re-checked at fetch time in
+  `_refetch_one`, before the resolve, for a track that starts playing after
+  the plan is drawn. Nothing is lost: playback is already fetching that track
+  at this very tier. Scoped to the cache kind; the music-folder half stages
+  as `.ticli-{id}.part`, a different name.
+- Playback stands down while the re-fetch holds the name —
+  `AudioPlayer.refetch_writing`, claimed for exactly the write and released
+  in a `finally`; `_start_download` treats a claimed key like an admission
+  refusal (stream only). A class default rather than `__init__` state,
+  because tests build bare AudioPlayers via `__new__`.
+
+**Rejected:** unique staging names per writer (`.part-{nonce}`) — a crashed
+download would leave a file `is_owned_audio` refuses to clean, and widening
+that predicate widens what ticli will ever delete.
+
+**Verified:** suite 1,505 → 1,515. The new tests drive the real AudioPlayer
+through `_play_track` and assert on what the backend was handed and what
+lands on disk — the recording fake now also records `allow_cached`, but the
+lesson stands that it must never again be the only witness.
