@@ -1674,3 +1674,35 @@ handled right — empty command plans, report-to-human, no invented verbs, no
 
 Suite 1,509 → 1,512; the new error-classification tests failed under
 mutation (classification collapsed to bare api_error) before restore.
+
+## 2026-08-30 — Spotify API research: can ticli grow a second service?
+
+No code. One document: `ai/reference/spotify-api-research-2026-08-30.md`.
+
+The owner raised the idea of supporting additional services, with the
+hypothesis that TIDAL's API is unusually friendly to third-party usage and
+Spotify may not be. A research pass against primary sources (Spotify's
+developer docs and announcements, the librespot repo, the terminal-client
+ecosystem) **confirmed the hypothesis**: no Spotify surface hands audio to a
+third-party process — official playback is DRM-gated or remote-controls an
+official client via Connect — and the platform has tightened monotonically
+since Nov 2024 (endpoint cuts; extended access closed to individuals May
+2025; dev-mode capped at 5 users with owner-held Premium in early 2026;
+refresh tokens now expiring after 6 months). The only real audio path is
+librespot: reverse-engineered, ToS-violating by its own README's admission,
+Ogg Vorbis ≤320 kbps, no route to Spotify's lossless tier. Downloads — a
+flagship ticli feature — are named as prohibited in Spotify's Developer
+Terms.
+
+Verdict recorded in the doc: a Spotify backend is either a Connect remote
+(ticli stops being a player) or a librespot frontend (real audio, against
+ToS, quality-capped). Neither reproduces ticli-on-TIDAL. One honest nuance
+also recorded: TIDAL's *official* developer platform doesn't hand out audio
+either — what ticli enjoys is de facto tolerance, which is a posture, not a
+guarantee.
+
+Caveat that matters for anyone re-reading: this environment's egress proxy
+blocks Spotify-owned domains, so Spotify-doc quotes in the reference file are
+search-index captures of the cited primary URLs, cross-checked but not
+byte-verified; the doc flags this prominently and lists every unverified
+claim. GitHub sources were fetched directly.
