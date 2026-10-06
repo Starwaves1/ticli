@@ -130,10 +130,10 @@ def running():
         run.stop()
 
 
-def _tui():
+def _tui(**flags):
     conn = ipc.connect()
     assert conn is not None
-    ui = HeadlessTidalPlayer(remote=conn)
+    ui = HeadlessTidalPlayer(remote=conn, **flags)
     ui.console = Console(file=io.StringIO(), width=100, height=40)
     ui._wake = lambda: None
     assert conn.wait_for(conn.send("subscribe"), timeout=2)["ok"]
@@ -441,6 +441,29 @@ class TestLifecycle:
         assert run.core._playing is False
         assert run.core.audio.stopped == 1
         assert not run.thread.is_alive(), "stopped and nobody attached: the player leaves"
+
+
+class TestStartFlagsOnARunningPlayer:
+    def test_a_different_quality_says_the_player_already_runs(self, running):
+        running()
+        ui = _tui(quality="MAX")
+        ui._upgrade_to_pkce = lambda: pytest.fail("no PKCE asked for")
+        ui._honour_start_flags()
+        assert "already running at HIGH" in ui._toast and "restart" in ui._toast
+
+    def test_the_same_quality_is_silent(self, running):
+        running()
+        ui = _tui(quality="high")
+        ui._honour_start_flags()
+        assert ui._toast == ""
+
+    def test_pkce_asked_of_a_device_flow_player_offers_the_upgrade(self, running):
+        running()
+        ui = _tui(login_flow="pkce")
+        upgrades = []
+        ui._upgrade_to_pkce = lambda: upgrades.append(True)
+        ui._honour_start_flags()
+        assert upgrades == [True]
 
 
 class TestSocketPath:

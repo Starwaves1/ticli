@@ -1510,6 +1510,8 @@ class HeadlessTidalPlayer:
         self.commands = Commands(self)
         name = (quality or self.config["quality"]).upper()
         self._quality_name = name if name in self.QUALITY_MAP else self.config["quality"]
+        self._asked_quality = self._quality_name if quality else None
+        self._asked_pkce = (login_flow or "").lower() == "pkce"
         self.session.audio_quality = self.QUALITY_MAP[self._quality_name]
 
     def _get_user_display_name(self) -> str:
@@ -1719,6 +1721,15 @@ class HeadlessTidalPlayer:
             return self.commands.execute(command, args, caller=HUMAN)
         self._pending[self.remote.send(command, args)] = self._remote_refusal
         return {"ok": True, "result": {"accepted": True}}
+
+    def _honour_start_flags(self) -> None:
+        """--quality and --login-flow reach only a player this run started (ADR-0008)."""
+        running = self._mirror.get("quality")
+        if self._asked_quality and running and running != self._asked_quality:
+            self._set_toast(f"Player already running at {running}; change it in settings, "
+                            "or quit and restart", seconds=PLAYER_ERROR_SECONDS)
+        if self._asked_pkce and not self._is_pkce():
+            self._upgrade_to_pkce()
 
     def _remote_refusal(self, response: dict) -> None:
         if not response.get("ok"):
@@ -6083,6 +6094,8 @@ class HeadlessTidalPlayer:
 
             with self._make_live() as live:
                 self._live = live
+                self._repaint(live, force=True)
+                self._honour_start_flags()
                 self._repaint(live, force=True)
                 while self.running:
                     keys = self._read_keys(select, timeout=self._wait_timeout())
