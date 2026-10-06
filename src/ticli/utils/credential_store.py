@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from ticli.utils import testhooks
+
 logger = logging.getLogger(__name__)
 
 SERVICE_NAME = "ticli"
@@ -22,16 +24,18 @@ TOKEN_VERSION = 2
 FALLBACK_DIR = Path.home() / ".config" / SERVICE_NAME
 FALLBACK_FILE = FALLBACK_DIR / "session.json"
 
-try:
-    import keyring
-    # Verify the backend isn't the fail-open "null" backend
-    _backend = keyring.get_keyring()
-    _backend_name = type(_backend).__name__
-    if "fail" in _backend_name.lower() or "null" in _backend_name.lower():
+keyring = None
+if not testhooks.enabled():
+    try:
+        import keyring
+        # Verify the backend isn't the fail-open "null" backend
+        _backend = keyring.get_keyring()
+        _backend_name = type(_backend).__name__
+        if "fail" in _backend_name.lower() or "null" in _backend_name.lower():
+            keyring = None
+            logger.debug("keyring backend is %s — falling back to file", _backend_name)
+    except Exception:
         keyring = None
-        logger.debug("keyring backend is %s — falling back to file", _backend_name)
-except Exception:
-    keyring = None
 
 
 def _ensure_fallback_dir() -> None:

@@ -17,6 +17,7 @@ import queue
 import selectors
 import signal
 import socket
+import stat
 import sys
 import threading
 import time
@@ -27,7 +28,7 @@ from ticli import agentq, ipc
 from ticli import commands as command_layer
 from ticli.commands import AGENT, COMMANDS, HUMAN, tripped_error
 from ticli.utils import throttle
-from ticli.utils.config import PROTECTED_KEYS, load_config
+from ticli.utils.config import PROTECTED_KEYS, UNREADABLE, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ class _Client:
         self.outbuf = bytearray()
         self.subscribed = False
         self.writing = False
+        self.jobs: collections.deque = collections.deque()
+        self.working = False
 
 
 class PlayerServer:
@@ -63,6 +66,7 @@ class PlayerServer:
         self.agent_queue = agentq.TidalQueue(
             self._run_queued, lambda cmd, args: agentq.estimate(core, cmd, args),
             clock=clock, sleep=sleep, on_idle=self.wake)
+        self._jobs_lock = threading.Lock()
         self.wake_r, self.wake_w = os.pipe()
         os.set_blocking(self.wake_r, False)
         core._wake_r, core._wake_w = self.wake_r, self.wake_w
@@ -74,11 +78,7 @@ class PlayerServer:
 
     def listen(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Safe: only the holder of the instance lock gets here, so a file left is a dead player's.
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+        self._clear_stale_socket()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         old = os.umask(0o177)
         try:
@@ -92,6 +92,21 @@ class PlayerServer:
         command_layer.idle_hook = self.wake
         self.sel.register(sock, selectors.EVENT_READ, "accept")
         self.sel.register(self.wake_r, selectors.EVENT_READ, "wake")
+
+    def _clear_stale_socket(self) -> None:
+        """Remove a dead player's socket. Anything else stays: the instance lock may
+        have been unavailable ("start anyway"), so a live player could own it."""
+        try:
+            mode = os.lstat(self.path).st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(mode):
+            raise OSError(f"{self.path} exists and is not a socket")
+        live = ipc.connect(self.path)
+        if live is not None:
+            live.close()
+            raise OSError(f"another player is listening at {self.path}")
+        self.path.unlink()
 
     def serve(self) -> None:
         while self.core.running and not self.should_exit():
@@ -252,7 +267,7 @@ class PlayerServer:
             return
         if cmd == "reload_switches":
             fresh = load_config()
-            for key in PROTECTED_KEYS:
+            for key in (*PROTECTED_KEYS, UNREADABLE):
                 self.core.config[key] = fresh.get(key)
             self.broadcast()
             self._reply(client, rid, {"ok": True, "result": {}})
@@ -269,10 +284,34 @@ class PlayerServer:
         elif spec is not None and spec.read and spec.tidal:
             threading.Thread(target=self._run_posted, args=(client, rid, cmd, args, caller, key),
                              daemon=True).start()
-        else:
+        elif not self._queue_job(client, (rid, cmd, args, caller, key),
+                                 spec is not None and spec.tidal):
+            self._deliver_posted()
             response = self._execute(cmd, args, caller, key)
             self.broadcast()
             self._reply(client, rid, response)
+
+    def _queue_job(self, client: _Client, job: tuple, tidal: bool) -> bool:
+        """A TIDAL call must not freeze the loop for every client: it runs on this
+        client's worker, and the client's later requests queue behind it in order."""
+        with self._jobs_lock:
+            if not (tidal or client.working):
+                return False
+            client.jobs.append(job)
+            if client.working:
+                return True
+            client.working = True
+        threading.Thread(target=self._work, args=(client,), daemon=True).start()
+        return True
+
+    def _work(self, client: _Client) -> None:
+        while True:
+            with self._jobs_lock:
+                if not client.jobs:
+                    client.working = False
+                    return
+                rid, cmd, args, caller, key = client.jobs.popleft()
+            self._run_posted(client, rid, cmd, args, caller, key)
 
     def _execute(self, cmd, args, caller, key) -> dict:
         try:

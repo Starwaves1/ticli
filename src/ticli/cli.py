@@ -144,7 +144,7 @@ class HumanGroup(RegistryGroup):
 @click.group(cls=HumanGroup, invoke_without_command=True)
 @click.option("--key", envvar="TICLI_AI_KEY", default=None, help="The AI control key, when a script (not a terminal) runs a verb. Or TICLI_AI_KEY.")
 @click.option("--quality", default=None, type=QualityChoice(QUALITY_NAMES, case_sensitive=False), help="Audio quality for this run (overrides the saved setting)")
-@click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in when there is no saved session. device (default) is quickest; pkce needs a paste but is the only flow TIDAL streams FLAC to. Settings can switch later.")
+@click.option("--login-flow", default=None, type=click.Choice(["device", "pkce"], case_sensitive=False), help="How to log in. device (default) is quickest; pkce needs a paste but is the only flow TIDAL streams FLAC to. With pkce, a player signed in by the device flow offers the upgrade. Settings can switch later.")
 @click.pass_context
 def cli(ctx, key, quality, login_flow):
     """Ticli - Terminal music player for TIDAL. Plain `ticli` runs the player.

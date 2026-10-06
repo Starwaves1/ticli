@@ -4,6 +4,7 @@ socket with the player core in a thread. No TIDAL, no audio backend."""
 import io
 import os
 import select
+import subprocess
 import sys
 import threading
 import time
@@ -17,6 +18,7 @@ from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
 from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
+from ticli.utils import throttle
 
 
 @pytest.fixture(autouse=True)
@@ -96,8 +98,34 @@ class _Running:
         self.core = core
         self.server = playerd.PlayerServer(core)
         self.server.listen()
+        self.passes = 0
+        self._passed = threading.Condition()
+        step = self.server.step
+
+        def counted(timeout=None):
+            step(timeout)
+            with self._passed:
+                self.passes += 1
+                self._passed.notify_all()
+
+        self.server.step = counted
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
+
+    def stays_after_clients_leave(self, timeout=2.0) -> bool:
+        """True once every client has gone and the loop has since decided, at least
+        once, not to leave; False if it left. Two passes: one may be mid-way."""
+        with self._passed:
+            if not self._passed.wait_for(lambda: not self.server.clients, timeout):
+                return False
+            target = self.passes + 2
+        deadline = time.monotonic() + timeout
+        while self.thread.is_alive() and time.monotonic() < deadline:
+            self.server.wake()
+            with self._passed:
+                if self._passed.wait_for(lambda: self.passes >= target, 0.05):
+                    return self.thread.is_alive()
+        return False
 
     def _serve(self):
         try:
@@ -128,10 +156,10 @@ def running():
         run.stop()
 
 
-def _tui():
+def _tui(**flags):
     conn = ipc.connect()
     assert conn is not None
-    ui = HeadlessTidalPlayer(remote=conn)
+    ui = HeadlessTidalPlayer(remote=conn, **flags)
     ui.console = Console(file=io.StringIO(), width=100, height=40)
     ui._wake = lambda: None
     assert conn.wait_for(conn.send("subscribe"), timeout=2)["ok"]
@@ -279,6 +307,65 @@ class TestBrowsingThroughThePlayer:
         assert removed == [1]
 
 
+class _SlowLookup:
+    is_pkce = False
+
+    def __init__(self):
+        self.release = threading.Event()
+
+    def track(self, tid):
+        assert self.release.wait(5)
+        return _track(tid)
+
+    def __getattr__(self, name):
+        raise AssertionError(f"request attempted: {name}")
+
+
+class TestSlowTidal:
+    def _slow(self, running):
+        core = _core(playing=True)
+        core.session = _SlowLookup()
+        running(core)
+        return core
+
+    def test_a_slow_lookup_does_not_hold_up_other_clients(self, running):
+        core = self._slow(running)
+        a, b = ipc.connect(), ipc.connect()
+        played = a.send("play.track", {"track_id": 999})
+        try:
+            started = time.monotonic()
+            assert b.request("pause", timeout=2)["ok"] is True
+            assert time.monotonic() - started < 0.5
+            assert core._playing is False
+        finally:
+            core.session.release.set()
+        assert a.wait_for(played, timeout=3)["ok"] is True
+        assert core._current_track.id == 999
+
+    def test_one_clients_answers_and_actions_keep_their_order(self, running):
+        core = self._slow(running)
+        a = ipc.connect()
+        played = a.send("play.track", {"track_id": 999})
+        paused = a.send("pause")
+        core.session.release.set()
+        assert a.wait_for(paused, timeout=3)["ok"] is True
+        assert [m.get("id") for m in a.held if "id" in m] == [played], "play answered first"
+        assert core._current_track.id == 999 and core._playing is False
+
+
+class TestQueueByIndex:
+    def test_a_tui_removing_by_a_stale_index_hits_nothing(self, running):
+        core = _core()
+        running(core)
+        ui = _tui()
+        ui._queue_cursor = 2
+        q = core._queue
+        core._queue = [q[0], q[2], q[1]]  # another client moved an entry meanwhile
+        ui._remove_from_queue()
+        assert _pump(ui, lambda: "queue changed" in ui._toast.lower())
+        assert [t.id for t in core._queue] == [1, 3, 2]
+
+
 class TestAgentGateOverTheSocket:
     def test_ai_control_off_refuses_agent_actions(self, running):
         core = _core()
@@ -311,6 +398,16 @@ class TestAgentGateOverTheSocket:
         response = ipc.connect().request("next", caller="agent", timeout=3)
         assert response["code"] == "ai_control_off"
 
+    def test_a_switch_written_before_another_clients_setting_change_is_kept(self, running):
+        core = _core()
+        running(core)
+        # The TUI writes the switch; another client's change lands before reload_switches does.
+        config_mod.update_config({"allow_ai_control": False})
+        assert ipc.connect().request("settings.set", {"key": "page_size", "value": 20},
+                                     caller="tui", timeout=2)["ok"]
+        cfg = config_mod.load_config()
+        assert cfg["allow_ai_control"] is False and cfg["page_size"] == 20
+
     def test_the_key_hash_never_crosses_the_socket(self, running):
         core = _core()
         core.config["ai_control_key"] = config_mod.hash_ai_key("secret")
@@ -322,13 +419,23 @@ class TestAgentGateOverTheSocket:
         assert conn.held[0]["state"]["switches"]["ai_control_key"] is True
 
 
+class TestTestHooks:
+    def test_the_session_hook_needs_its_flag(self, monkeypatch):
+        from ticli.utils import testhooks
+        monkeypatch.setenv("TICLI_TEST_SESSION", "ticli.tests.fake_tidal:session")
+        monkeypatch.delenv("TICLI_TEST_HOOKS", raising=False)
+        assert testhooks.session_factory() is None
+        monkeypatch.setenv("TICLI_TEST_HOOKS", "1")
+        from ticli.tests import fake_tidal
+        assert testhooks.session_factory() is fake_tidal.session
+
+
 class TestLifecycle:
     def test_closing_the_tui_keeps_playing(self, running):
         run = running()
         ui = _tui()
         ui.remote.close()
-        time.sleep(0.1)
-        assert run.thread.is_alive()
+        assert run.stays_after_clients_leave()
         assert run.core._playing is True
         assert run.core.audio.stopped == 0
 
@@ -342,8 +449,7 @@ class TestLifecycle:
     def test_the_last_track_ending_unattended_means_exit(self, running):
         run = running()
         _tui().remote.close()
-        time.sleep(0.05)
-        assert run.thread.is_alive()
+        assert run.stays_after_clients_leave()
         run.core._playing = False
         run.server._tick()
         run.thread.join(2)
@@ -353,8 +459,7 @@ class TestLifecycle:
         run = running(_core(playing=False))
         run.core._download_job = {"state": "running"}
         _tui().remote.close()
-        time.sleep(0.1)
-        assert run.thread.is_alive()
+        assert run.stays_after_clients_leave()
         run.core._download_job = {"state": "done"}
         run.server.wake()
         run.thread.join(2)
@@ -370,6 +475,59 @@ class TestLifecycle:
         assert run.core._playing is False
         assert run.core.audio.stopped == 1
         assert not run.thread.is_alive(), "stopped and nobody attached: the player leaves"
+
+
+class TestStartFlagsOnARunningPlayer:
+    def test_a_different_quality_says_the_player_already_runs(self, running):
+        running()
+        ui = _tui(quality="MAX")
+        ui._upgrade_to_pkce = lambda: pytest.fail("no PKCE asked for")
+        ui._honour_start_flags()
+        assert "already running at HIGH" in ui._toast and "restart" in ui._toast
+
+    def test_the_same_quality_is_silent(self, running):
+        running()
+        ui = _tui(quality="high")
+        ui._honour_start_flags()
+        assert ui._toast == ""
+
+    def test_pkce_asked_of_a_device_flow_player_offers_the_upgrade(self, running):
+        running()
+        ui = _tui(login_flow="pkce")
+        upgrades = []
+        ui._upgrade_to_pkce = lambda: upgrades.append(True)
+        ui._honour_start_flags()
+        assert upgrades == [True]
+
+
+class TestSocketPath:
+    def _listen(self):
+        server = playerd.PlayerServer(_core(playing=False))
+        try:
+            server.listen()
+        finally:
+            server.close()
+
+    def test_a_dead_players_socket_is_replaced(self):
+        import socket
+        path = ipc.socket_path()
+        dead = socket.socket(socket.AF_UNIX)
+        dead.bind(str(path))
+        dead.close()
+        self._listen()
+
+    def test_a_live_player_is_never_replaced(self, running):
+        running()
+        with pytest.raises(OSError, match="another player"):
+            self._listen()
+        assert ipc.connect().request("status", timeout=2)["ok"]
+
+    def test_a_file_that_is_not_a_socket_is_left_alone(self):
+        path = ipc.socket_path()
+        path.write_text("mine")
+        with pytest.raises(OSError, match="not a socket"):
+            self._listen()
+        assert path.read_text() == "mine"
 
 
 class TestSingleInstance:
@@ -437,6 +595,68 @@ class TestAutoStart:
         conn, status = ipc.connect_or_start()
         assert conn is None and status.startswith("error:")
         assert time.monotonic() - started < 5
+
+
+LOGIN_PLAYER = """
+import os, sys
+fd = int(sys.argv[sys.argv.index("--ready-fd") + 1])
+os.write(fd, b"login\\n")
+"""
+
+
+class TestStartRace:
+    def _hold_lock(self):
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        throttle.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (throttle.STATE_DIR / ipc.LOCK_NAME).write_text(f"{holder.pid}\n")
+        return holder
+
+    def test_a_starter_that_leaves_at_once_does_not_strand_the_next_client(self, running,
+                                                                           monkeypatch):
+        holder = self._hold_lock()
+        spawns = []
+
+        def spawn(*args, **kwargs):
+            spawns.append(args)
+            if len(spawns) == 1:
+                # The other client's player holds the lock, then exits: its starter already left.
+                threading.Timer(0.2, lambda: (holder.kill(), holder.wait())).start()
+                return "running"
+            running()
+            return "ready"
+
+        monkeypatch.setattr(ipc, "spawn_player", spawn)
+        conn, status = ipc.connect_or_start(timeout=5)
+        assert status is None and conn is not None
+        assert len(spawns) == 2, "the client started a player of its own once the other left"
+        assert conn.request("status", timeout=2)["ok"]
+
+    def test_a_player_slower_than_the_deadline_is_an_error_not_a_hang(self, monkeypatch):
+        holder = self._hold_lock()
+        try:
+            monkeypatch.setattr(ipc, "spawn_player", lambda *a, **k: "running")
+            started = time.monotonic()
+            conn, status = ipc.connect_or_start(timeout=0.5)
+            assert conn is None and status.startswith("error:") and "in time" in status
+            assert time.monotonic() - started < 2
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_a_player_that_exits_at_once_is_reaped(self, tmp_path, monkeypatch):
+        (tmp_path / "login_playerd.py").write_text(LOGIN_PLAYER)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+        monkeypatch.setattr(ipc, "PLAYER_MODULE", "login_playerd")
+        children = []
+        real = subprocess.Popen
+
+        def popen(*args, **kwargs):
+            children.append(real(*args, **kwargs))
+            return children[-1]
+
+        monkeypatch.setattr(ipc.subprocess, "Popen", popen)
+        assert ipc.connect_or_start() == (None, "login")
+        assert children and children[0].returncode is not None, "no zombie left behind"
 
 
 class _Clock:
@@ -524,7 +744,8 @@ class TestTheRealLoop:
                 ui._show_artwork = False
                 threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM)).start()
                 ui.run()
-                code = 0 if run.thread.is_alive() and run.core.audio.stopped == 0 else 2
+                # Paused and unattended, the player then leaves on its own; the TUI must not stop it.
+                code = 0 if run.core.audio.stopped == 0 and not ui._quitting else 2
             finally:
                 os._exit(code)
         deadline = time.monotonic() + 5
@@ -543,4 +764,4 @@ class TestTheRealLoop:
             os.waitpid(pid, 0)
             pytest.fail("SIGTERM did not end a paused TUI")
         os.close(fd)
-        assert os.waitstatus_to_exitcode(status) == 0, "the player must outlive its TUI"
+        assert os.waitstatus_to_exitcode(status) == 0, "a signal detaches; only quitting stops"

@@ -18,8 +18,8 @@ from typing import Callable, Optional
 from ticli.utils import downloads, throttle
 from ticli.utils.cache import CachedTrack, MetadataCache
 from ticli.utils.config import (
-    PROTECTED_KEYS, SETTINGS_SPEC, ai_key_matches, coerce, get_spec, load_config,
-    save_config,
+    PROTECTED_KEYS, SETTINGS_SPEC, UNREADABLE, UNREADABLE_MESSAGE, ConfigUnreadable,
+    ai_key_matches, coerce, get_spec, load_config, update_config,
 )
 
 HUMAN = "human"
@@ -34,13 +34,13 @@ _NEVER_EDIT = ("Only your human can change this, in ticli's TUI settings ([c]). 
 
 
 class CommandError(Exception):
-    def __init__(self, code: str, reason: str, fix: str = ""):
+    def __init__(self, code: str, reason: str, fix: str = "", **extra):
         super().__init__(reason)
-        self.code, self.reason, self.fix = code, reason, fix
+        self.code, self.reason, self.fix, self.extra = code, reason, fix, extra
 
 
-def _error(code: str, reason: str, fix: str = "") -> dict:
-    payload = {"ok": False, "code": code, "reason": reason}
+def _error(code: str, reason: str, fix: str = "", **extra) -> dict:
+    payload = {"ok": False, "code": code, "reason": reason, **extra}
     if fix:
         payload["fix"] = fix
     return payload
@@ -64,6 +64,9 @@ def gate(name: str, caller: str, key, cfg: dict, *, read: bool = False,
     """A refusal for an agent call the human's switches don't allow, else None."""
     if caller == HUMAN or name == "status":
         return None
+    if cfg.get(UNREADABLE):
+        return _error("config_unreadable", UNREADABLE_MESSAGE,
+                      "Ask your human to fix or delete ticli's config.json. " + _NEVER_EDIT)
     stored = coerce(get_spec("ai_control_key"), cfg.get("ai_control_key"))
     if stored and not key:
         return _error("key_required", "This ticli needs the AI control key.",
@@ -129,7 +132,7 @@ class Commands:
                 return offline_read(name, args, p.config)
             result = cmd.handler(p, args)
         except CommandError as e:
-            return _error(e.code, e.reason, e.fix)
+            return _error(e.code, e.reason, e.fix, **e.extra)
         except throttle.Tripped as e:
             return tripped_error(e.record)
         except Exception as e:
@@ -314,7 +317,8 @@ def _status(p, args) -> dict:
 def switches(cfg) -> dict:
     return {"allow_ai_control": bool(cfg.get("allow_ai_control", True)),
             "allow_dangerous_commands": bool(cfg.get("allow_dangerous_commands", False)),
-            "key_required": bool(coerce(get_spec("ai_control_key"), cfg.get("ai_control_key")))}
+            "key_required": bool(cfg.get(UNREADABLE)
+                                 or coerce(get_spec("ai_control_key"), cfg.get("ai_control_key")))}
 
 
 def _toggle(p, args):
@@ -352,14 +356,26 @@ def _queue_list(p, args) -> dict:
     return {"index": p._queue_index, "tracks": [_track_json(t) for t in p._queue]}
 
 
-def _queue_play(p, args):
-    p._play_queue_index(_index(args))
-
-
-def _queue_remove(p, args) -> dict:
+def _queue_entry(p, args) -> int:
+    """The index asked for, checked against `track_id` when given: with several
+    clients the queue may have moved under a stale index."""
     index = _index(args)
     if not 0 <= index < len(p._queue):
         raise CommandError("bad_args", "No queue entry at that index.")
+    if "track_id" in args and str(args["track_id"]) != _sid(p._queue[index]):
+        raise CommandError("stale", "The queue changed; that index is another track now.",
+                           "Check the queue below and retry with the current index.",
+                           queue={"index": p._queue_index, "length": len(p._queue),
+                                  "track_ids": [getattr(t, "id", None) for t in p._queue]})
+    return index
+
+
+def _queue_play(p, args):
+    p._play_queue_index(_queue_entry(p, args))
+
+
+def _queue_remove(p, args) -> dict:
+    index = _queue_entry(p, args)
     removing_current = index == p._queue_index
     p._queue.pop(index)
     if index < p._queue_index:
@@ -659,9 +675,13 @@ def _settings_set(p, args) -> dict:
     key = spec["key"]
     if value == p.config.get(key, spec["default"]):
         return {"key": key, "value": value, "changed": False}
+    try:
+        update_config({key: value})
+    except ConfigUnreadable:
+        raise CommandError("config_unreadable", UNREADABLE_MESSAGE,
+                           "Fix or delete ticli's config.json, then try again.")
     p.config[key] = value
     p._apply_setting(key, value)
-    save_config(p.config)
     return {"key": key, "value": value, "changed": True}
 
 

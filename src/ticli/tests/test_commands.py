@@ -125,6 +125,18 @@ class TestActions:
         _human(p, "queue.remove", index=0)
         assert p._current_track is None and p.audio.stopped == 1
 
+    @pytest.mark.parametrize("name", ["queue.play", "queue.remove"])
+    def test_a_stale_queue_index_is_refused_with_the_queue_as_it_is(self, name):
+        p = _player()
+        result = _human(p, name, index=2, track_id=2)
+        assert result["ok"] is False and result["code"] == "stale"
+        assert result["queue"] == {"index": 1, "length": 3, "track_ids": [1, 2, 3]}
+        assert len(p._queue) == 3 and p._plays == []
+
+    def test_a_matching_track_id_goes_through(self):
+        p = _player()
+        assert _human(p, "queue.play", index=2, track_id=3)["ok"] and p._plays == [3]
+
     def test_play_album_from_the_open_list_costs_nothing(self):
         p = _player()
         p._browse_source = ("album", "77")
@@ -303,6 +315,35 @@ class TestAIControlSwitch:
         p = _player(allow_ai_control=False, ai_control_key=hash_ai_key("k"))
         assert _human(p, "next")["ok"]
         assert p.slept == []
+
+
+class TestUnreadableConfig:
+    @pytest.fixture(autouse=True)
+    def corrupt(self, config_file):
+        config_file.write_text('{"allow_ai_control": true, "allow_dangerous')
+
+    def test_agents_are_refused_everything_but_status(self):
+        p = _player()
+        for name in ("next", "queue.list", "search", "cache.clear"):
+            _assert_refusal(_agent(p, name, query="x"), "config_unreadable")
+        assert p._plays == [] and p.session.asked == []
+        switches = _agent(p, "status")["result"]["switches"]
+        assert switches == {"allow_ai_control": False, "allow_dangerous_commands": False,
+                            "key_required": True}
+
+    def test_the_agent_cli_gate_fails_closed_too(self):
+        refused = commands.gate("search", AGENT, None, load_config(), read=True)
+        assert refused["code"] == "config_unreadable"
+
+    def test_the_human_still_plays_but_cannot_overwrite_the_file(self, config_file):
+        p = _player()
+        assert _human(p, "next")["ok"]
+        result = p.commands.execute("settings.set", {"key": "page_size", "value": 20}, caller=HUMAN)
+        assert result["code"] == "config_unreadable"
+        assert config_file.read_text().startswith('{"allow_ai_control": true, "allow_dangerous')
+
+    def test_the_tui_says_so(self):
+        assert "unreadable" in HeadlessTidalPlayer()._toast
 
 
 class TestDangerousSwitch:

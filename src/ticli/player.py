@@ -253,8 +253,11 @@ from ticli.utils.config import (
     display_value,
     get_spec,
     hash_ai_key,
+    UNREADABLE,
+    UNREADABLE_MESSAGE,
+    ConfigUnreadable,
     load_config,
-    save_config,
+    update_config,
 )
 from ticli.utils.cache import (
     PLAY_COUNTS_AFTER,
@@ -1474,6 +1477,8 @@ class HeadlessTidalPlayer:
         self._refetch_pending = False
         self._toast = ""
         self._toast_until = 0.0
+        if self.config.get(UNREADABLE):
+            self._set_toast(UNREADABLE_MESSAGE, seconds=PLAYER_ERROR_SECONDS)
         self._quit_pending = False
         self._logout_pending = False
         self._disable_songs_pending = False
@@ -1505,6 +1510,8 @@ class HeadlessTidalPlayer:
         self.commands = Commands(self)
         name = (quality or self.config["quality"]).upper()
         self._quality_name = name if name in self.QUALITY_MAP else self.config["quality"]
+        self._asked_quality = self._quality_name if quality else None
+        self._asked_pkce = (login_flow or "").lower() == "pkce"
         self.session.audio_quality = self.QUALITY_MAP[self._quality_name]
 
     def _get_user_display_name(self) -> str:
@@ -1714,6 +1721,15 @@ class HeadlessTidalPlayer:
             return self.commands.execute(command, args, caller=HUMAN)
         self._pending[self.remote.send(command, args)] = self._remote_refusal
         return {"ok": True, "result": {"accepted": True}}
+
+    def _honour_start_flags(self) -> None:
+        """--quality and --login-flow reach only a player this run started (ADR-0008)."""
+        running = self._mirror.get("quality")
+        if self._asked_quality and running and running != self._asked_quality:
+            self._set_toast(f"Player already running at {running}; change it in settings, "
+                            "or quit and restart", seconds=PLAYER_ERROR_SECONDS)
+        if self._asked_pkce and not self._is_pkce():
+            self._upgrade_to_pkce()
 
     def _remote_refusal(self, response: dict) -> None:
         if not response.get("ok"):
@@ -4609,7 +4625,8 @@ class HeadlessTidalPlayer:
     def _remove_from_queue(self):
         if not self._queue or self._queue_cursor >= len(self._queue):
             return
-        self._run("queue.remove", index=self._queue_cursor)
+        self._run("queue.remove", index=self._queue_cursor,
+                  track_id=getattr(self._queue[self._queue_cursor], "id", None))
         if self._queue:
             self._queue_cursor = min(self._queue_cursor, len(self._queue) - 1)
 
@@ -5352,7 +5369,10 @@ class HeadlessTidalPlayer:
         allowed = min(wanted, ceiling)
         if allowed != self.config.get("volume"):
             self.config["volume"] = allowed
-            save_config(self.config)
+            try:
+                update_config({"volume": allowed})
+            except ConfigUnreadable as e:
+                logger.warning("Volume not saved: %s", e)
         if self.audio:
             self.audio.set_volume(allowed)
 
@@ -5366,15 +5386,15 @@ class HeadlessTidalPlayer:
         # The only writer of the protected rows, reached from settings keypresses alone (ADR-0007).
         if value == self.config.get(spec["key"], spec["default"]):
             return
+        try:
+            # Only this key, over the file as it is now: the hash never crosses the socket.
+            update_config({spec["key"]: value})
+        except ConfigUnreadable as e:
+            self._set_toast(str(e), seconds=PLAYER_ERROR_SECONDS)
+            return
         self.config[spec["key"]] = value
-        if self.remote is None:
-            save_config(self.config)
-        else:
-            # The mirrored config never carries the key hash: write the file's own copy, then
-            # have the player re-read the switches. Not a command: none may write these.
-            on_disk = load_config()
-            on_disk[spec["key"]] = value
-            save_config(on_disk)
+        if self.remote is not None:
+            # Not a command: none may write these.
             self.remote.send("reload_switches")
         self._set_toast(f"{spec['label']}: {display_value(spec, value)}")
 
@@ -5767,7 +5787,8 @@ class HeadlessTidalPlayer:
             self._cursor_down("_queue_cursor", len(self._queue))
         elif key in (KEY_ENTER, KEY_ENTER2):
             if self._queue:
-                self._run("queue.play", index=self._queue_cursor)
+                self._run("queue.play", index=self._queue_cursor,
+                          track_id=getattr(self._queue[self._queue_cursor], "id", None))
         elif key == "x":
             self._remove_from_queue()
         elif key == "y":
@@ -6073,6 +6094,8 @@ class HeadlessTidalPlayer:
 
             with self._make_live() as live:
                 self._live = live
+                self._repaint(live, force=True)
+                self._honour_start_flags()
                 self._repaint(live, force=True)
                 while self.running:
                     keys = self._read_keys(select, timeout=self._wait_timeout())
