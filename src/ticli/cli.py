@@ -136,6 +136,26 @@ class HumanGroup(RegistryGroup):
                 + f"\n\nArgs {_shape(spec)}. Playlists, albums and artists take a name or id; "
                   "songs take an id, a TIDAL URL, \"artist - title\" or current.")
 
+    def resolve_command(self, ctx, args):
+        # `ticli play <anything>`; `play album|track|...` keeps its own verbs.
+        if args and args[0] == "play" and not (len(args) > 1 and f"play.{args[1]}" in self._registry()):
+            return "play", self._play, args[1:]
+        return super().resolve_command(ctx, args)
+
+    @property
+    def _play(self):
+        def callback(words):
+            from ticli import humancli
+            if not words:
+                raise click.UsageError("ticli play NAME: an album, playlist, track or artist name, a TIDAL URL, or a number to pick.")
+            humancli.play(words)
+        return click.Command("play", callback=callback,
+                             params=[click.Argument(["words"], nargs=-1, type=click.UNPROCESSED)],
+                             context_settings={"ignore_unknown_options": True},
+                             help="Play anything: an album, playlist, track or artist by name, or a TIDAL URL. "
+                                  "Your playlists match first with no request; else one TIDAL search. "
+                                  "`ticli play album NAME` etc. still work.")
+
     def run(self, dotted, tokens) -> None:
         from ticli import humancli
         humancli.verb(dotted, tokens)
@@ -150,7 +170,7 @@ def cli(ctx, key, quality, login_flow):
     """Ticli - Terminal music player for TIDAL. Plain `ticli` runs the player.
 
     \b
-    Verbs: `ticli pause|resume|next|prev|status`, `ticli start playlist
+    Verbs: `ticli play NAME`, `ticli pause|resume|next|prev|status`, `ticli start playlist
     NAME`, `ticli playlist add NAME SONG`, `ticli like`... A SONG is a track
     id, a TIDAL URL, "artist - title" or current.
 

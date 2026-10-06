@@ -267,6 +267,59 @@ class TestStart:
         assert [t.id for t in h.core._queue] == [61, 62]
 
 
+class TestPlayAnything:
+    def test_an_exact_album_name_plays_the_album_with_one_search(self, player, tty):
+        album = fake_album(4242, "How to Listen to This Album", "Artist",
+                           [fake_track(61), fake_track(62)])
+        h = player(session=FakeTidal(search_albums=[album]))
+        before = len(h.session.requests)
+        result = ticli("play", "How", "to", "listen", "to", "this", "album")
+        assert result.exit_code == 0, result.output
+        assert 'playing album "How to Listen to This Album - Artist": 2 tracks' in result.output
+        assert [t.id for t in h.core._queue] == [61, 62]
+        assert h.session.requests[before:].count("GET search") == 1
+
+    def test_your_playlist_by_exact_name_costs_no_request(self, player, tty):
+        h = player()
+        h.road.items = [fake_track(5), fake_track(6)]
+        before = len(h.session.requests)
+        assert ticli("play", "road", "trip").exit_code == 0
+        assert [t.id for t in h.core._queue] == [5, 6]
+        assert "GET search" not in h.session.requests[before:]
+
+    def test_an_exact_track_title_plays_the_track(self, player, tty):
+        h = player(session=FakeTidal(search_tracks=[fake_track(7, "One More Time", ["Daft Punk"])]))
+        assert ticli("play", "one", "more", "time").exit_code == 0
+        assert h.core._current_track.id == 7
+
+    def test_several_loose_matches_number_them_and_a_number_picks(self, player, tty):
+        a = fake_album(4242, "Discovery Live", "Daft Punk", [fake_track(61)])
+        b = fake_album(4343, "Discovery Remixes", "Daft Punk", [fake_track(71)])
+        h = player(session=FakeTidal(search_albums=[a, b]))
+        first = ticli("play", "discovery")
+        assert first.exit_code == 1
+        assert "1. album: Discovery Live" in first.output and "ticli play 2" in first.output
+        assert ticli("play", "2").exit_code == 0
+        assert [t.id for t in h.core._queue] == [71]
+
+    def test_the_kinded_verbs_still_work(self, player, tty):
+        album = fake_album(4242, "Discovery", "Daft Punk", [fake_track(61), fake_track(62)])
+        h = player(session=FakeTidal(search_albums=[album]))
+        assert ticli("play", "album", "discovery").exit_code == 0
+        assert [t.id for t in h.core._queue] == [61, 62]
+
+    def test_a_tidal_url_plays_without_searching(self, player, tty):
+        album = fake_album(4242, "Discovery", "Daft Punk", [fake_track(61)])
+        session = FakeTidal(search_albums=[album])
+        session.album_tracks["4242"] = [fake_track(61)]
+        h = player(session=session)
+        before = len(session.requests)
+        result = ticli("play", "https://tidal.com/browse/album/4242")
+        assert result.exit_code == 0, result.output
+        assert "GET search" not in session.requests[before:]
+        assert [t.id for t in h.core._queue] == [61]
+
+
 class TestSongForms:
     def add(self, *song):
         return ticli("playlist", "add", ROAD, *song)

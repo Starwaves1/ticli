@@ -610,3 +610,73 @@ def start(kind: str, name: str, no_tui: bool) -> None:
         root = click.get_current_context().find_root().params
         from ticli.player import run_tui
         run_tui(quality=root.get("quality"), login_flow=root.get("login_flow"))
+
+
+PLAY_ORDER = ("album", "playlist", "track", "artist")
+PLAY_URL = re.compile(r"(?:^|/)(track|album|playlist|artist|mix)/([0-9A-Za-z-]+)")
+
+
+def _play_target(link: Link, text: str) -> tuple:
+    """(kind, id, label) for free text: a TIDAL URL, a pick, one of your playlists by
+    exact name (0 requests), else one search across all four kinds. An exact name
+    wins (album, then playlist, track, artist); otherwise a single result does."""
+    if _is_tidal_url(text):
+        found = PLAY_URL.findall(text)
+        if found:
+            kind, ident = found[-1]
+            return kind, ident, text
+    picked = _take_pick(link.who, "any", text) if link.picks else None
+    if picked:
+        return picked["kind"], picked["id"], picked["name"]
+    wanted = text.casefold()
+    own = [p for p in _local_playlists(link.who) if p["name"].casefold() == wanted]
+    if len(own) == 1:
+        return "playlist", own[0]["id"], own[0]["name"]
+    if link.who == AGENT and not _ai_control():
+        raise Stop(refusal("not_found", f'None of your playlists is called "{text}".',
+                           "AI control is off, so TIDAL was not searched; pass an id."))
+    reply = link.ask("search", {"query": text, "types": list(PLAY_ORDER), "limit": TOP})
+    if not reply.get("ok"):
+        raise Stop(reply)
+    found = reply["result"] or {}
+    rows = [{"kind": k, "title": o.get("name") or o.get("title") or "", **_row(k, o)}
+            for k in PLAY_ORDER for o in found.get(k + "s", [])]
+    exact = [r for r in rows if r.pop("title").casefold() == wanted]
+    if exact or len(rows) == 1:
+        best = (exact or rows)[0]
+        return best["kind"], best["id"], best["name"]
+    if not rows:
+        raise Stop(refusal("not_found", f'Nothing on TIDAL matches "{text}".',
+                           f"Try `ticli search {text}`."))
+    rows = rows[:TOP]
+    if link.picks:
+        _save_picks(link.who, "any", rows)
+    if link.who == AGENT:
+        raise Stop(refusal("ambiguous", f'"{text}" matches several things.',
+                           "Run it again with one candidate's URL or id.", candidates=rows))
+    shown = "\n".join(f'  {i}. {r["kind"]}: {r["name"]}' for i, r in enumerate(rows, 1))
+    raise Stop(refusal("ambiguous", f'"{text}" matches several things:\n{shown}',
+                       "Run `ticli play 2` to pick."))
+
+
+def play(words) -> None:
+    """Play anything by name, URL or pick; one line, no TUI."""
+    text = " ".join(words).strip()
+    who = caller()
+    link = Link(who)
+    try:
+        try:
+            kind, ident, label = _play_target(link, text)
+            cmd = f"play.{kind}"
+            if who == AGENT:
+                guard(cmd, who)
+            reply = link.ask(cmd, {"track_id": ident} if kind == "track" else {"id": ident})
+        except Stop as stop:
+            reply, kind, label = stop.reply, "", text
+    finally:
+        link.close()
+    if reply.get("ok") and not (reply.get("result") or {}).get("queued"):
+        n = (reply.get("result") or {}).get("queue_length")
+        click.echo(f'playing {kind} "{label}"' + (f": {n} tracks" if n and kind != "track" else ""))
+    else:
+        say(who, f"play.{kind}" if kind else "play", reply)
