@@ -91,3 +91,35 @@ class FakeSession:
 def session():
     _no_network()
     return FakeSession()
+
+
+class OfflineSession(FakeSession):
+    """No network at all: every TIDAL call fails as a dead network does, and is logged
+    to ~/fake-tidal/requests.log so a test can count what the player attempted."""
+
+    def _attempt(self, what):
+        import requests
+        log = Path.home() / "fake-tidal" / "requests.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as out:
+            out.write(what + "\n")
+        raise requests.exceptions.ConnectionError(f"fake TIDAL: offline ({what})")
+
+    def load_oauth_session(self, *args, **kwargs):
+        self._attempt("sessions")
+
+    def check_login(self):
+        self._attempt("check_login")
+
+    def track(self, tid):
+        self._attempt(f"track {tid}")
+
+    def search(self, *args, **kwargs):
+        self._attempt("search")
+
+
+def offline_session():
+    _no_network()
+    session = OfflineSession()
+    session.user = None
+    return session

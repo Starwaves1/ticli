@@ -55,7 +55,10 @@ def _check_trip(response) -> None:
 def instrument(session) -> None:
     """Pace and count the requests the queue's own thread makes; trip on 429/4006.
     Other threads (the TUI's, playback's) pass straight through."""
-    http = getattr(session, "request_session", None)
+    try:
+        http = getattr(session, "request_session", None)
+    except Exception:  # a stand-in session with no HTTP layer
+        http = None
     if http is None or getattr(http, "_ticli_paced", False):
         return
     original = http.request

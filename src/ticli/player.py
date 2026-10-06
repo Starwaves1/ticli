@@ -1402,7 +1402,6 @@ class HeadlessTidalPlayer:
         self._connectivity = ONLINE
         self._session_loaded = False
         self._reconnect_lock = threading.Lock()
-        self._reconnect_tries = 0
         self.session = tidal_session()
         self._watch_transport()
         flow = (login_flow or LOGIN_FLOWS[0]).lower()
@@ -1648,36 +1647,42 @@ class HeadlessTidalPlayer:
         playing, never `_logout()` (it deletes them)."""
         if self._connectivity != OFFLINE:
             return self._connectivity
-        tries = self._reconnect_tries
-        with self._reconnect_lock:
-            if self._reconnect_tries != tries or self._connectivity != OFFLINE:
+        if not self._reconnect_lock.acquire(blocking=False):
+            with self._reconnect_lock:  # one is in flight: its answer is ours
                 return self._connectivity
-            self._reconnect_tries += 1
-            data = load_tokens()
-            try:
-                if not data:
-                    raise RuntimeError("no stored login")
-                loaded = self.session.load_oauth_session(
-                    data["token_type"], data["access_token"], data.get("refresh_token"),
-                    data.get("expiry_time"), is_pkce=data.get("is_pkce", False))
-            except Exception as e:
-                if not data or auth_rejected(e):
-                    self._signed_out()
-                else:
-                    logger.debug("Still offline: %s", e)
-                return self._connectivity
-            if loaded is False:
+        try:
+            return self._reconnect_locked()
+        finally:
+            self._reconnect_lock.release()
+
+    def _reconnect_locked(self) -> str:
+        if self._connectivity != OFFLINE:
+            return self._connectivity
+        data = load_tokens()
+        try:
+            if not data:
+                raise RuntimeError("no stored login")
+            loaded = self.session.load_oauth_session(
+                data["token_type"], data["access_token"], data.get("refresh_token"),
+                data.get("expiry_time"), is_pkce=data.get("is_pkce", False))
+        except Exception as e:
+            if not data or auth_rejected(e):
                 self._signed_out()
-                return self._connectivity
-            if self.session.access_token != data.get("access_token"):
-                self._save_session()
-            self._session_loaded = True
-            self._connectivity = ONLINE
-            self._user_display_name = self._get_user_display_name()
-            self._set_toast("Back online")
-            self._load_favorites()
-            self._wake()
-            return ONLINE
+            else:
+                logger.debug("Still offline: %s", e)
+            return self._connectivity
+        if loaded is False:
+            self._signed_out()
+            return self._connectivity
+        if self.session.access_token != data.get("access_token"):
+            self._save_session()
+        self._session_loaded = True
+        self._connectivity = ONLINE
+        self._user_display_name = self._get_user_display_name()
+        self._set_toast("Back online")
+        self._load_favorites()
+        self._wake()
+        return ONLINE
 
     def _signed_out(self) -> None:
         self._connectivity = SIGNED_OUT

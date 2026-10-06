@@ -155,3 +155,28 @@ def test_a_stale_socket_is_replaced_and_sigterm_saves_and_leaves(home):
     assert _wait(lambda: not _mpv_running(home), 5)
     saved = json.loads((throttle.STATE_DIR / "player_state.json").read_text())
     assert saved["track_ids"] == [1] and saved["position"] > 0
+
+
+def test_offline_start_reconnects_only_on_an_action(home, monkeypatch):
+    monkeypatch.setenv("TICLI_TEST_SESSION", "ticli.tests.fake_tidal:offline_session")
+    log = home / "fake-tidal" / "requests.log"
+
+    def attempts():
+        return log.read_text().split() if log.exists() else []
+
+    a, status = ipc.connect_or_start()
+    assert status is None and a is not None, status
+    assert a.request("subscribe", timeout=5)["ok"]
+    assert a.held[0]["state"]["connectivity"] == "offline"
+    assert _status(a)["connectivity"] == "offline"
+    assert attempts() == ["sessions"]
+    time.sleep(1.5)  # three monitor ticks while idle
+    assert attempts() == ["sessions"], "idle offline: no timer, probe or heartbeat"
+
+    reply = a.request("search", {"query": "x"}, caller="agent", timeout=10)
+    assert reply["ok"] and reply["result"]["source"] == "local", reply
+    assert reply["state"]["connectivity"] == "offline"
+    assert attempts() == ["sessions", "sessions"], "the action reconnected once, then answered locally"
+    refused = a.request("like", {"track_ids": [1]}, caller="agent", timeout=10)
+    assert refused["code"] == "offline"
+    a.close()
