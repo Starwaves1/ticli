@@ -161,6 +161,34 @@ class TestActions:
         assert json.loads(config_file.read_text())["page_size"] == 20
 
 
+class TestHardening:
+    def test_search_uses_the_query_argument_not_the_input_box(self):
+        p = _player()
+        p._search_query = ""
+        seen = []
+        p._apply_search_scope = lambda: seen.append(p._search_query)
+        result = p.commands.execute("search", {"query": "x"}, caller=HUMAN)
+        assert result["ok"] and seen == ["x"] and p._search_query == "x"
+
+    def test_a_raising_danger_predicate_is_a_structured_error(self, monkeypatch):
+        p = _player()
+        def boom(player, args):
+            raise ValueError("nope")
+        monkeypatch.setitem(commands.COMMANDS, "next",
+                            commands.COMMANDS["next"].__class__(
+                                **{**vars(commands.COMMANDS["next"]), "dangerous": boom}))
+        result = _agent(p, "next")
+        assert result["ok"] is False and "ValueError" in result["reason"]
+
+    def test_a_failing_disk_read_is_a_structured_error(self, monkeypatch):
+        def boom(self):
+            raise RuntimeError("corrupt")
+        monkeypatch.setattr(commands.MetadataCache, "get_playlists", boom)
+        result = offline_read("library.playlists", {}, {})
+        assert result["ok"] is False and result["code"] == "local_read_failed"
+        assert result["fix"]
+
+
 class TestProtectedSettings:
     @pytest.mark.parametrize("key,value", [
         ("allow_ai_control", False), ("allow_dangerous_commands", True),

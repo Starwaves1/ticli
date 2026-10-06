@@ -5072,7 +5072,8 @@ class HeadlessTidalPlayer:
             return
         track = self._picker_track
         self._go_back()
-        self._run("playlist.add", id=self._obj_id(playlist), track_ids=[track.id])
+        self._run("playlist.add", id=self._obj_id(playlist), playlist=playlist,
+                  track_ids=[track.id])
 
     def _picker_create_and_add(self, name: str):
         if self._picker_busy:

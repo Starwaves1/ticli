@@ -195,6 +195,23 @@ class TestPicker:
         assert _wait_for(lambda: p._toast == "Failed to remove from playlist")
         assert len(p._browse_tracks) == 2
 
+    def test_picker_add_survives_a_background_refresh_swapping_the_list(self):
+        p = _make_player()
+        p._current_track = _fake_track(1)
+        added = []
+        chosen = types.SimpleNamespace(
+            name="Mix A", id="a", add=lambda ids: (added.append(ids), [1])[-1])
+        p._editable_playlists = [chosen]
+        p._open_playlist_picker()
+        p._handle_add_to_playlist_key(KEY_ENTER)
+        p._editable_playlists = [_fake_playlist("Mix Z")]
+        p._picker_track = p._current_track
+        p.session = types.SimpleNamespace(
+            playlist=lambda pid: pytest.fail("extra session.playlist request"))
+        p._picker_add_to(chosen)
+        assert _wait_for(lambda: not p._picker_busy)
+        assert len(added) == 1
+
     def test_busy_guard_prevents_double_add(self):
         p = _make_player()
         p._current_track = _fake_track(1)

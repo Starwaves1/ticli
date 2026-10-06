@@ -506,6 +506,18 @@ class TestPermissions:
         assert payload["ok"] and payload["source"] == "disk"
         assert no_session == []
 
+    def test_a_failing_disk_read_is_one_json_error(self, stored_tokens, no_session, monkeypatch):
+        from ticli.utils.cache import MetadataCache
+
+        def boom(self):
+            raise RuntimeError("corrupt")
+        monkeypatch.setattr(MetadataCache, "get_playlists", boom)
+        self._settings(allow_ai_control=False)
+        result = CliRunner().invoke(cli, ["agent", "playlist", "list"])
+        payload = json.loads(result.output)
+        assert result.exit_code == 1 and payload["ok"] is False
+        assert payload["error"] == "local_read_failed" and payload["hint"]
+
     def test_a_set_key_is_required(self, stored_tokens, no_session):
         from ticli.utils.config import hash_ai_key
         self._settings(ai_control_key=hash_ai_key("open sesame"))

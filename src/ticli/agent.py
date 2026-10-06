@@ -71,7 +71,10 @@ def _permit(verb: str, offline: str = "") -> dict:
     if refused:
         raise fail(refused["code"], refused["reason"], hint=refused["fix"])
     if offline and not cfg["allow_ai_control"]:
-        return offline_read(offline, cfg=cfg)["result"]
+        read = offline_read(offline, cfg=cfg)
+        if not read["ok"]:
+            raise fail(read["code"], read["reason"], hint=read["fix"])
+        return read["result"]
     return {}
 
 

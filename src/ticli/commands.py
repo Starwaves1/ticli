@@ -101,14 +101,14 @@ class Commands:
                           "Run `ticli agent docs` for the command list.")
         caller = HUMAN if caller == HUMAN else AGENT
         p = self.player
-        if caller == AGENT:
-            refused = gate(name, caller, key, p.config, read=cmd.read,
-                           dangerous=cmd.is_dangerous(p, args), sleep=self._sleep)
-            if refused:
-                return refused
-            if cmd.read and not p.config.get("allow_ai_control", True):
-                return offline_read(name, args, p.config)
         try:
+            if caller == AGENT:
+                refused = gate(name, caller, key, p.config, read=cmd.read,
+                               dangerous=cmd.is_dangerous(p, args), sleep=self._sleep)
+                if refused:
+                    return refused
+                if cmd.read and not p.config.get("allow_ai_control", True):
+                    return offline_read(name, args, p.config)
             result = cmd.handler(p, args)
         except CommandError as e:
             return _error(e.code, e.reason, e.fix)
@@ -341,7 +341,7 @@ def _playlist_add(p, args) -> dict:
         raise CommandError("busy", "A playlist change is still in flight.")
     playlist_id = args.get("id", "")
     ids = [str(t) for t in _ids(args)]
-    playlist = _editable_playlist(p, playlist_id)
+    playlist = args.get("playlist") or _editable_playlist(p, playlist_id)
     p._picker_busy = True
 
     def _run():
@@ -546,8 +546,8 @@ def _search(p, args) -> dict:
     query = str(args.get("query") or "").strip()
     if not query:
         raise CommandError("bad_args", "query must not be empty.")
+    p._search_query = query
     p._reset_search_results()
-    p._search_key = query
     p._apply_search_scope()
     return {"accepted": True}
 
@@ -696,3 +696,6 @@ def offline_read(name: str, args: Optional[dict] = None, cfg: Optional[dict] = N
         return {"ok": True, "result": reader(load_config() if cfg is None else cfg, args or {})}
     except CommandError as e:
         return _error(e.code, e.reason, e.fix)
+    except Exception as e:
+        return _error("local_read_failed", f"{type(e).__name__}: {e}",
+                      "Report this to your human; nothing was sent to TIDAL.")
