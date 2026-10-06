@@ -15,7 +15,7 @@ from collections import deque
 from typing import Callable, Optional
 
 from ticli import ipc
-from ticli.commands import ADD_LIMIT, COMMANDS, _live_playlist, tripped_error
+from ticli.commands import ADD_LIMIT, COMMANDS, _live_playlist, tripped_error, unknown_tracks
 from ticli.utils import throttle
 
 SPACING = throttle.MIN_INTERVAL_SECONDS
@@ -84,7 +84,12 @@ def estimate(core, cmd: str, args: dict) -> int:
     if cmd == "unlike":
         return len(ids)
     if cmd == "playlist.create":
-        return 1 + (2 if args.get("track_ids") else 0)
+        return 1 + (2 * math.ceil(len(ids) / ADD_LIMIT) if args.get("track_ids") else 0)
+    if cmd == "download":
+        # Unknown ids are looked up here; the stream requests are paced in the job itself.
+        return unknown_tracks(core, ids) if args.get("track_ids") else 0
+    if cmd == "refetch":
+        return 0
     if cmd in LOCAL_MOSTLY:
         return 0
     if cmd == "queue.remove":
@@ -239,10 +244,7 @@ class TidalQueue:
             response = self._execute(head)
             with self._cond:
                 self._running = None
-                row = {"job": head.id, "cmd": head.cmd, "ok": bool(response.get("ok"))}
-                if not row["ok"]:
-                    row["code"] = response.get("code")
-                self._done.append(row)
+                self._done.append(_done_row(head, response))
                 idle = not self._jobs
             for callback in head.callbacks:
                 try:
@@ -273,6 +275,23 @@ class TidalQueue:
             response = {"ok": False, "code": "failed", "reason": f"{type(e).__name__}: {e}"}
         response["cost"] = {"requests": ctx.requests, "wait_s": round(max(0.0, waited), 1)}
         return response
+
+
+def _done_row(job: Job, response: dict) -> dict:
+    """What every caller merged into the job reads in `status`: enough to tell its own ids apart."""
+    row = {"job": job.id, "cmd": job.cmd, "ok": bool(response.get("ok"))}
+    if job.count > 1:
+        row["merged"] = job.count
+    result = response.get("result")
+    if row["ok"] and isinstance(result, dict) and "added" in result:
+        row["added"] = result["added"]
+    if not row["ok"]:
+        row["code"] = response.get("code")
+        if "failed_from" in response:
+            ids = job.args.get("track_ids") or []
+            row.update(added=response.get("added", 0), failed_from=response["failed_from"],
+                       not_added=[str(t) for t in ids[response["failed_from"]:]])
+    return row
 
 
 # ── the reply an agent reads ──
@@ -373,6 +392,9 @@ def error_reply(response: dict) -> dict:
              "reason": response.get("reason", "")}
     if response.get("fix"):
         reply["fix"] = response["fix"]
+    for key in ("added", "failed_from", "candidates"):
+        if key in response:
+            reply[key] = response[key]
     return reply
 
 

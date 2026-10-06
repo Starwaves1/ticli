@@ -125,8 +125,8 @@ class Commands:
             return refused
         cmd = COMMANDS[name]
         p = self.player
-        was = getattr(_inline, "on", False)
-        _inline.on = inline
+        was, was_caller = getattr(_inline, "on", False), getattr(_inline, "caller", HUMAN)
+        _inline.on, _inline.caller = inline, caller
         try:
             if caller == AGENT and cmd.read and not p.config.get("allow_ai_control", True):
                 return offline_read(name, args, p.config)
@@ -134,13 +134,13 @@ class Commands:
         except CommandError as e:
             return _error(e.code, e.reason, e.fix, **e.extra)
         except throttle.Tripped as e:
-            return tripped_error(e.record)
+            return {**tripped_error(e.record), **getattr(e, "partial", {})}
         except Exception as e:
             if caller == HUMAN:
                 raise
-            return classify(e)
+            return {**classify(e), **getattr(e, "partial", {})}
         finally:
-            _inline.on = was
+            _inline.on, _inline.caller = was, was_caller
         if caller == AGENT and not cmd.read:
             p._note_agent_action(AGENT_TOASTS.get(name, name))
         return {"ok": True, "result": result}
@@ -206,7 +206,31 @@ def _background(fn) -> None:
     global _in_flight
     with _in_flight_lock:
         _in_flight += 1
-    threading.Thread(target=run, daemon=True).start()
+    try:
+        threading.Thread(target=run, daemon=True).start()
+    except BaseException:
+        with _in_flight_lock:
+            _in_flight -= 1
+        raise
+
+
+def _by_agent() -> bool:
+    return getattr(_inline, "caller", HUMAN) == AGENT
+
+
+# The agent queue serialises its own playlist writes; only the TUI's and the human CLI's hold this.
+_picker_idle = threading.Condition()
+
+
+def _set_picker_busy(p, busy: bool) -> None:
+    with _picker_idle:
+        p._picker_busy = busy
+        _picker_idle.notify_all()
+
+
+def wait_picker_idle(p, timeout: float = 120.0) -> None:
+    with _picker_idle:
+        _picker_idle.wait_for(lambda: not p._picker_busy, timeout)
 
 
 def _reraise_inline() -> None:
@@ -222,9 +246,9 @@ def _sid(obj) -> str:
     return str(getattr(obj, "id", "") or "")
 
 
-def _tracks(p, ids, *first) -> list:
-    """Track objects for ids, from lists already loaded (0 requests); an unknown
-    id costs one request. Pools listed first win, so a caller's own row is used."""
+def _lookup(p, ids, *first) -> list:
+    """Track objects for ids from lists already loaded (0 requests); None where unknown.
+    Pools listed first win, so a caller's own row is used."""
     pools = [*first, [p._current_track], p._queue, p._browse_tracks,
              p._artist_section_tracks(),
              [row["obj"] for row in p._search_results if row["type"] == "track"],
@@ -244,9 +268,19 @@ def _tracks(p, ids, *first) -> list:
                 wanted = {str(t) for t in ids}
                 indexed = {str(r.get("id")): CachedTrack(r) for _pid, r in p._cache.iter_tracks()
                            if str(r.get("id")) in wanted}
-            track = indexed.get(str(tid)) or p.session.track(tid)
+            track = indexed.get(str(tid))
         tracks.append(track)
     return tracks
+
+
+def _tracks(p, ids, *first) -> list:
+    """As `_lookup`; an unknown id costs one request."""
+    return [t if t is not None else p.session.track(tid)
+            for tid, t in zip(ids, _lookup(p, ids, *first))]
+
+
+def unknown_tracks(p, ids) -> int:
+    return sum(1 for t in _lookup(p, ids, [p._download_track], p._download_tracks) if t is None)
 
 
 def _known(p, kind, obj_id):
@@ -490,15 +524,35 @@ def _live_playlist(p, playlist_id):
     return None
 
 
-def _playlist_add(p, args) -> dict:
+def _add_chunks(playlist, ids) -> list:
+    """Each add is a POST plus tidalapi's reparse GET. A failure carries how far it got."""
+    added = []
+    for start in range(0, len(ids), ADD_LIMIT):
+        try:
+            added += playlist.add(ids[start:start + ADD_LIMIT]) or []
+        except Exception as e:
+            e.partial = {"added": len(added), "failed_from": start}
+            raise
+    return added
+
+
+def _claim_picker(p) -> bool:
+    """Whether this call holds `_picker_busy`: the agent queue (inline) never does."""
+    if getattr(_inline, "on", False):
+        return False
     if p._picker_busy:
         raise CommandError("busy", "A playlist change is still in flight.")
+    _set_picker_busy(p, True)
+    return True
+
+
+def _playlist_add(p, args) -> dict:
     playlist_id = args.get("id", "")
     ids = list(dict.fromkeys(str(t) for t in _ids(args)))
     playlist = args.get("playlist")
     if not hasattr(playlist, "add"):
         playlist = _live_playlist(p, playlist_id)
-    p._picker_busy = True
+    held = _claim_picker(p)
     outcome = {"accepted": True}
 
     def _run():
@@ -506,10 +560,7 @@ def _playlist_add(p, args) -> dict:
         try:
             if target is None:
                 target = p.session.playlist(playlist_id)
-            added = []
-            for start in range(0, len(ids), ADD_LIMIT):
-                # Each add is a POST plus tidalapi's reparse GET.
-                added += target.add(ids[start:start + ADD_LIMIT]) or []
+            added = _add_chunks(target, ids)
             outcome["added"] = len(added)
             p._remember_last_playlist(target)
             p._set_toast(f'{"Added to" if added else "Already in"} "{target.name}"')
@@ -517,7 +568,8 @@ def _playlist_add(p, args) -> dict:
             p._set_toast("Failed to add to playlist")
             _reraise_inline()
         finally:
-            p._picker_busy = False
+            if held:
+                _set_picker_busy(p, False)
             p._wake()
 
     _background(_run)
@@ -525,24 +577,26 @@ def _playlist_add(p, args) -> dict:
 
 
 def _playlist_create(p, args) -> dict:
-    if p._picker_busy:
-        raise CommandError("busy", "A playlist change is still in flight.")
     name = str(args.get("name") or "").strip()
     if not name:
         raise CommandError("bad_args", "Playlist name can't be empty.")
-    ids = [str(t) for t in args.get("track_ids") or []]
+    ids = list(dict.fromkeys(str(t) for t in args.get("track_ids") or []))
     description = str(args.get("description") or "")
-    # Set first: a second Enter on the same tick must already see this, or the playlist is created twice.
-    p._picker_busy = True
+    # Claimed first: a second Enter on the same tick must already see this, or the playlist is created twice.
+    held = _claim_picker(p)
     outcome = {"accepted": True}
+
+    def _release():
+        if held:
+            _set_picker_busy(p, False)
+        p._wake()
 
     def _run():
         try:
             playlist = p.session.user.create_playlist(name, description)
         except Exception:
             p._set_toast(f'Failed to create "{name}"')
-            p._picker_busy = False
-            p._wake()
+            _release()
             _reraise_inline()
             return
         outcome["playlist"] = playlist
@@ -553,18 +607,16 @@ def _playlist_create(p, args) -> dict:
             q for q in p._editable_playlists if not pid or _sid(q) != pid]
         if not ids:
             p._set_toast(f'Created "{name}"')
-            p._picker_busy = False
-            p._wake()
+            _release()
             return
         try:
-            playlist.add(ids)
-            p._set_toast(f'Created "{name}" and added track')
+            outcome["added"] = len(_add_chunks(playlist, ids))
+            p._set_toast(f'Created "{name}" and added track{"" if len(ids) == 1 else "s"}')
         except Exception:
-            p._set_toast(f'Created "{name}", but failed to add track')
+            p._set_toast(f'Created "{name}", but failed to add track{"" if len(ids) == 1 else "s"}')
             _reraise_inline()
         finally:
-            p._picker_busy = False
-            p._wake()
+            _release()
 
     _background(_run)
     return outcome
@@ -611,7 +663,10 @@ def _playlist_remove(p, args) -> dict:
 def _download(p, args) -> dict:
     tier = str(args.get("tier") or p._quality_name).upper()
     tracks = _tracks(p, _ids(args), [p._download_track], p._download_tracks)
-    if len(tracks) > 1:
+    if _by_agent():
+        # One slot, each track's stream request through the shared 2 s throttle (ADR-0001).
+        p._start_bulk_download_job(tier, tracks=tracks, label=args.get("label"), paced=True)
+    elif len(tracks) > 1:
         p._start_bulk_download_job(tier, tracks=tracks, label=args.get("label"))
     else:
         p._download_track = tracks[0]
@@ -640,7 +695,7 @@ def _download_delete(p, args) -> dict:
 
 
 def _refetch(p, args):
-    p._start_refetch_job()
+    p._start_refetch_job(paced=_by_agent())
 
 
 def _refetch_cancel(p, args):
@@ -787,13 +842,23 @@ def _resolve(p, args) -> dict:
     return rank_tracks(tracks, artist, title)
 
 
+def _page(args):
+    """(limit, offset) when the caller pages through a long list, else None: one default page."""
+    if "offset" not in args and "limit" not in args:
+        return None
+    return int(args.get("limit") or 100), int(args.get("offset") or 0)
+
+
 def _album_tracks(p, args) -> dict:
     album_id = str(args.get("id", ""))
     album = _known(p, "album", album_id) or p.session.album(album_id)
-    tracks = list(album.tracks() or [])
+    p._remember("album", [album])
+    page = _page(args)
+    tracks = list((album.tracks(limit=page[0], offset=page[1]) if page else album.tracks()) or [])
     p._remember("track", tracks)
-    p._lists[("album", album_id)] = tracks
-    return {"tracks": tracks}
+    if page is None:
+        p._lists[("album", album_id)] = tracks
+    return {"tracks": tracks, "num_tracks": getattr(album, "num_tracks", None)}
 
 
 def _playlist_tracks(p, args) -> dict:
@@ -802,11 +867,13 @@ def _playlist_tracks(p, args) -> dict:
     if live is None or getattr(live, "cached", False):
         live = p.session.playlist(playlist_id)
         p._remember("playlist", [live])
-    tracks = list(live.tracks() or [])
+    page = _page(args)
+    tracks = list((live.tracks(limit=page[0], offset=page[1]) if page else live.tracks()) or [])
     p._remember("track", tracks)
-    p._lists[("playlist", playlist_id)] = tracks
-    p._cache.put_playlist_tracks(playlist_id, tracks)
-    return {"playlist": live, "tracks": tracks}
+    if page is None:
+        p._lists[("playlist", playlist_id)] = tracks
+        p._cache.put_playlist_tracks(playlist_id, tracks)
+    return {"playlist": live, "tracks": tracks, "num_tracks": getattr(live, "num_tracks", None)}
 
 
 def _artist_section(p, args) -> dict:
@@ -887,8 +954,9 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("history.forget", _history_forget, params=("query",)),
     Command("search", _search, read=True, tidal=True, params=("query",)),
     Command("resolve", _resolve, read=True, tidal=True, params=("artist", "title")),
-    Command("album.tracks", _album_tracks, read=True, tidal=True, params=("id",)),
-    Command("playlist.tracks", _playlist_tracks, read=True, tidal=True, params=("id",)),
+    Command("album.tracks", _album_tracks, read=True, tidal=True, params=("id", "offset", "limit")),
+    Command("playlist.tracks", _playlist_tracks, read=True, tidal=True,
+            params=("id", "offset", "limit")),
     Command("artist.section", _artist_section, read=True, tidal=True,
             params=("id", "section", "limit")),
     Command("library.playlists", _library_playlists, read=True, tidal=True),

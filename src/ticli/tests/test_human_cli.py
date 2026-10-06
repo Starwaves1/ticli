@@ -15,7 +15,7 @@ from click.testing import CliRunner
 
 from ticli import commands, ipc
 from ticli.cli import cli
-from ticli.tests.agent_harness import Harness
+from ticli.tests.agent_harness import GYM, ROAD, Harness
 from ticli.tests.fakes import (
     FakeTidal, fake_album, fake_playlist, fake_track,
 )
@@ -149,10 +149,8 @@ class TestPlaylistsAndLikes:
     def test_list_and_show(self, player, tty):
         h = player()
         h.road.items = [fake_track(5, "Song", ["Band"])]
-        assert ticli("playlist", "list").output.splitlines() == [
-            "road  Road trip (1 tracks)", "gym  Gym (0 tracks)"][:0] or True
         listed = ticli("playlist", "list").output
-        assert "road  Road trip" in listed and "gym  Gym" in listed
+        assert f"{ROAD}  Road trip (1 tracks)" in listed and f"{GYM}  Gym" in listed
         shown = ticli("playlist", "show", "road trip").output
         assert "Road trip" in shown and "5  Band - Song" in shown
 
@@ -218,7 +216,7 @@ class TestStart:
     def test_no_tui_only_plays(self, player, tty, tui):
         h = player()
         h.gym.items = [fake_track(8)]
-        assert ticli("start", "playlist", "gym", "--no-tui").exit_code == 0
+        assert ticli("start", "playlist", "Gym", "--no-tui").exit_code == 0
         assert [t.id for t in h.core._queue] == [8] and tui == []
 
     def test_ambiguous_prints_a_numbered_top_five_and_a_number_picks(self, player, tty, tui):
@@ -243,7 +241,7 @@ class TestStart:
         result = ticli("start", "playlist", "edm")
         out = json.loads(result.output)
         assert out["code"] == "ambiguous"
-        assert [c["id"] for c in out["candidates"]] == ["road", "gym"]
+        assert [c["id"] for c in out["candidates"]] == [ROAD, GYM]
 
     def test_no_local_match_makes_exactly_one_tidal_request(self, player, tty, tui):
         pid = "8f1b2c3d-1111-2222-3333-444455556666"
@@ -271,7 +269,7 @@ class TestStart:
 
 class TestSongForms:
     def add(self, *song):
-        return ticli("playlist", "add", "road", *song)
+        return ticli("playlist", "add", ROAD, *song)
 
     def test_a_track_id(self, player, tty):
         h = player()
@@ -296,7 +294,7 @@ class TestSongForms:
     def test_a_playlist_url_is_all_its_tracks(self, player, tty):
         h = player()
         h.gym.items = [fake_track(81), fake_track(82)]
-        assert self.add("https://tidal.com/browse/playlist/gym").exit_code == 0
+        assert self.add(f"https://tidal.com/browse/playlist/{GYM}").exit_code == 0
         settle(h, lambda: h.road.adds)
         assert h.road.adds == [["81", "82"]]
 
@@ -308,8 +306,8 @@ class TestSongForms:
 
     def test_current_with_nothing_playing_does_not_start_the_player(self, tty, spawned):
         from ticli.tests.fakes import fake_playlist
-        MetadataCache().put_playlists([fake_playlist("road", "Road trip")])
-        result = ticli("playlist", "add", "road", "current")
+        MetadataCache().put_playlists([fake_playlist(ROAD, "Road trip")])
+        result = ticli("playlist", "add", ROAD, "current")
         assert result.exit_code == 1 and "no_track" in result.output and spawned == []
 
     def test_artist_dash_title_adds_only_when_confident(self, player, tty):

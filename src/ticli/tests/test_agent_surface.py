@@ -24,7 +24,7 @@ from click.testing import CliRunner
 from ticli import agent as agent_mod
 from ticli import ipc
 from ticli.cli import cli
-from ticli.tests.agent_harness import Harness
+from ticli.tests.agent_harness import GYM, ROAD, Harness
 from ticli.tests.fakes import FakeResponse, FakeTidal
 from ticli.utils import throttle
 
@@ -335,8 +335,8 @@ class TestCliContract:
 
     def test_do_reads_a_batch_from_stdin_and_merges_adds(self, player):
         h = player()
-        batch = json.dumps(["playlist add road 1",
-                            {"cmd": "playlist.add", "args": {"id": "road", "track_ids": [2]}},
+        batch = json.dumps([f"playlist add {ROAD} 1",
+                            {"cmd": "playlist.add", "args": {"id": ROAD, "track_ids": [2]}},
                             "queue list"])
         result, out = agent("do", input=batch)
         assert result.exit_code == 0 and out["ok"]
@@ -345,14 +345,14 @@ class TestCliContract:
         assert len(listed["result"]["tracks"]) == 3
         h.idle()
         assert h.road.adds == [["1", "2"]]
-        assert h.session.requests == ["POST playlists/road/items", "GET playlists/road"]
+        assert h.session.requests == [f"POST playlists/{ROAD}/items", f"GET playlists/{ROAD}"]
 
     def test_status_lists_what_the_running_player_has_queued(self, player, monkeypatch):
         h = player()
         monkeypatch.setattr(agent_mod, "_player_running", lambda: True)
         h.hold()
-        agent("playlist", "add", "road", "1")
-        agent("playlist", "add", "road", "2")
+        agent("playlist", "add", ROAD, "1")
+        agent("playlist", "add", ROAD, "2")
         _, out = agent("status")
         assert out["pending"] == [{"job": 1, "cmd": "playlist.add", "eta_s": 4.0, "merged": 2}]
         assert out["state"]["pending"] == 1 and "status" in out["next"]
@@ -362,7 +362,7 @@ class TestCliContract:
 
     def test_a_typical_reply_stays_small(self, player):
         player()
-        for args in (("pause",), ("playlist", "add", "road", "1"), ("next",)):
+        for args in (("pause",), ("playlist", "add", ROAD, "1"), ("next",)):
             result = CliRunner().invoke(cli, ["agent", *args])
             assert result.exit_code == 0 and len(result.output) < 450, result.output
 
@@ -456,14 +456,14 @@ class TestAgentDocs:
 class TestErrorClassification:
     def test_a_404_is_not_found_not_an_outage(self, player):
         player()
-        result, out = agent("playlist", "show", "nope")
+        result, out = agent("playlist", "show", "aaaaaaaa-0000-4000-8000-000000000404")
         assert result.exit_code == 1 and out["error"] == "not_found"
         assert "playlist list" in out["hint"]  # says where real ids come from
 
     def test_other_failures_are_api_error_with_a_hint(self, player):
         h = player()
         h.session.request_session.answers = [FakeResponse(500)]
-        result, out = agent("playlist", "show", "road")
+        result, out = agent("playlist", "show", ROAD)
         assert result.exit_code == 1 and out["error"] == "api_error"
         assert out["hint"]  # the docs promise every code carries one
 
@@ -496,7 +496,7 @@ class TestPermissions:
 
     def test_ai_control_off_refuses_actions_without_starting_the_player(self, no_player):
         self._settings(allow_ai_control=False)
-        for args in (("playlist", "add", "road", "1"), ("pause",), ("do", '["pause"]')):
+        for args in (("playlist", "add", ROAD, "1"), ("pause",), ("do", '["pause"]')):
             result, out = agent(*args)
             refusal = out["result"][0] if args[0] == "do" else out
             assert result.exit_code == 1 and refusal["code"] == "ai_control_off", args
@@ -537,7 +537,7 @@ class TestPermissions:
         by_env, out_env = agent("playlist", "list", env={"TICLI_AI_KEY": "open sesame"})
         _, out_flag = agent("--key", "open sesame", "queue", "list")
         assert out_env["ok"] and out_flag["ok"]
-        assert [p["id"] for p in out_env["playlists"]] == ["road", "gym"]
+        assert [p["id"] for p in out_env["playlists"]] == [ROAD, GYM]
         h.core.commands._sleep = lambda s: None
         _, wrong = agent("pause", env={"TICLI_AI_KEY": "nope"})
         assert wrong["code"] == "wrong_key"

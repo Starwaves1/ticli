@@ -268,7 +268,7 @@ from ticli.utils.cache import (
     is_owned_audio,
     track_record,
 )
-from ticli.utils import artwork, backend_health, downloads, tags
+from ticli.utils import artwork, backend_health, downloads, tags, throttle
 from ticli.utils.net import is_transport_failure, tidal_session
 
 STATE_DIR = Path.home() / ".config" / "ticli"
@@ -557,7 +557,7 @@ def fetch_to_file(sources: list, part: str, abandoned=None, progress=None) -> st
 
 class _PacedRun:
     def __init__(self, items, resolve, fetch, alive, report,
-                 workers: int = 1, slots=(), clock=None):
+                 workers: int = 1, slots=(), clock=None, pace=None):
         self.items = list(items)
         self.resolve = resolve
         self.fetch = fetch
@@ -566,6 +566,8 @@ class _PacedRun:
         self.workers = max(1, workers)
         self.slots = tuple(slots) if slots else (None,) * self.workers
         self.clock = [None] if clock is None else clock
+        # An agent's run: `pace` (throttle.acquire) before each track instead of the local spacing.
+        self.pace = pace
         self.results: list = []
         self._written = 0
         self.consumed = 0
@@ -588,7 +590,14 @@ class _PacedRun:
                 blocked = self._blocked()
                 if blocked or self.offline:
                     break
-                if self.clock[0] is not None:
+                if self.pace is not None:
+                    try:
+                        self.pace()
+                    except throttle.Tripped:
+                        self._stopped_by = self._stopped_by or "rate-limited (agent stop is in force)"
+                        blocked = self._blocked()
+                        break
+                elif self.clock[0] is not None:
                     self._pace(self.clock[0])
                     if not self.alive():
                         return None
@@ -674,6 +683,8 @@ class _PacedRun:
             self.offline = self.offline or str(exc)[:PLAYER_ERROR_CHARS]
         elif _rate_limited(exc):
             self._stopped_by = self._stopped_by or str(exc)[:PLAYER_ERROR_CHARS]
+            if self.pace is not None:
+                throttle.trip("http_429", detail=self._stopped_by)
 
     def _blocked(self) -> str:
         return self._stopped_by
@@ -4827,7 +4838,7 @@ class HeadlessTidalPlayer:
         return {tid for _t, _tier, tid in run.items[:] if tid is not None}
 
     def _start_bulk_download_job(self, tier: str, tracks=None,
-                                 label: Optional[str] = None):
+                                 label: Optional[str] = None, paced: bool = False):
         tracks = [t for t in (self._download_tracks if tracks is None else tracks) if t is not None]
         if not tracks:
             return
@@ -4905,9 +4916,10 @@ class HeadlessTidalPlayer:
             fetch=_fetch,
             alive=_alive,
             report=_update,
-            workers=DOWNLOAD_WORKERS,
+            workers=1 if paced else DOWNLOAD_WORKERS,
             slots=slots,
             clock=self._api_pace,
+            pace=throttle.acquire if paced else None,
         )
         self._download_run = run
 
@@ -4929,7 +4941,7 @@ class HeadlessTidalPlayer:
                 self._download_job = dict(self._download_job or {}, state="done")
                 self._start_bulk_download_job(
                     leftover[0][1], tracks=[t for t, _q, _i in leftover],
-                    label=labels[-1] if labels else "")
+                    label=labels[-1] if labels else "", paced=run.pace is not None)
                 self._wake()
                 return
             if blocked:
@@ -5142,7 +5154,7 @@ class HeadlessTidalPlayer:
                 classify(record.get("quality"), key, record.get("bytes"), plan["cache"])
         return plan
 
-    def _start_refetch_job(self) -> None:
+    def _start_refetch_job(self, paced: bool = False) -> None:
         job = self._refetch_job
         if job and job.get("state") == "running":
             return
@@ -5177,6 +5189,7 @@ class HeadlessTidalPlayer:
                 report=_update,
                 workers=1,
                 clock=self._api_pace,
+                pace=throttle.acquire if paced else None,
             )
             outcome = run.run()
             if outcome is None:

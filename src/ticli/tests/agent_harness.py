@@ -60,13 +60,17 @@ def make_core(session):
     return core
 
 
+ROAD = "3f6a1c2e-7b4d-4e9a-8c1f-2d5b6a7e8f90"
+GYM = "9b2e4d6f-1a3c-4b5d-8e7f-0a1b2c3d4e5f"
+
+
 class Harness:
     def __init__(self, session=None, clock=None):
         self.session = session or FakeTidal()
         self.clock = clock or FakeClock()
         self.core = make_core(self.session)
-        self.road = self.session.add_playlist("road", "Road trip")
-        self.gym = self.session.add_playlist("gym", "Gym")
+        self.road = self.session.add_playlist(ROAD, "Road trip")
+        self.gym = self.session.add_playlist(GYM, "Gym")
         self.core._editable_playlists = [self.road, self.gym]
         self.server = playerd.PlayerServer(self.core, clock=self.clock, sleep=self.clock.sleep)
         self.server.listen()

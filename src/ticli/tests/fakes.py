@@ -80,6 +80,11 @@ class FakeHTTP:
         return self.answers.pop(0) if self.answers else FakeResponse()
 
 
+def _paged(items, limit, offset):
+    """TIDAL's default page when no limit is asked for is not "everything"."""
+    return list(items)[offset:offset + (limit or 10)]
+
+
 def fake_track(tid, name=None, artists=None, duration=200):
     import types
     return types.SimpleNamespace(
@@ -106,9 +111,9 @@ class FakePlaylist:
         self.items += [fake_track(t) for t in ids]
         return list(ids)
 
-    def tracks(self):
+    def tracks(self, limit=None, offset=0):
         self.session.http("GET", f"playlists/{self.id}/items")
-        return list(self.items)
+        return _paged(self.items, limit, offset)
 
 
 class FakeFavorites:
@@ -133,7 +138,7 @@ class FakeUser:
 
     def create_playlist(self, name, description):
         self.session.http("POST", "users/playlists")
-        playlist = FakePlaylist(self.session, f"new-{len(self.session.playlists)}", name)
+        playlist = FakePlaylist(self.session, f"00000000-0000-4000-8000-{len(self.session.playlists):012d}", name)
         playlist.description = description
         self.session.playlists[playlist.id] = playlist
         return playlist
@@ -183,7 +188,8 @@ class FakeTidal:
         import types
         self.http("GET", f"albums/{aid}")
         tracks = self.album_tracks.get(str(aid), [])
-        return types.SimpleNamespace(id=aid, name=f"Album {aid}", tracks=lambda: tracks)
+        return types.SimpleNamespace(id=aid, name=f"Album {aid}", num_tracks=len(tracks),
+                                     tracks=lambda limit=None, offset=0: _paged(tracks, limit, offset))
 
     def track(self, tid):
         self.http("GET", f"tracks/{tid}")
