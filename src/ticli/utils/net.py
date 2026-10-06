@@ -6,16 +6,21 @@ API_TIMEOUT = (5, 30)
 
 class TimeoutSession(requests.Session):
     on_transport_failure = None  # the player's: any request that can't reach TIDAL means offline
+    refresh_status = None  # tidalapi raises one AuthenticationError for every failed refresh, 5xx included
 
     def request(self, method, url, **kwargs):
         if kwargs.get("timeout") is None:
             kwargs["timeout"] = API_TIMEOUT
         try:
-            return super().request(method, url, **kwargs)
+            response = super().request(method, url, **kwargs)
         except requests.exceptions.ConnectionError as e:
             if self.on_transport_failure is not None and is_transport_failure(e):
                 self.on_transport_failure()
             raise
+        data = kwargs.get("data")
+        if isinstance(data, dict) and data.get("grant_type") == "refresh_token":
+            self.refresh_status = response.status_code
+        return response
 
 
 def tidal_session():

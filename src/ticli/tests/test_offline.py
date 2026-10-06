@@ -501,3 +501,65 @@ class TestMetadataCache:
 def lists_size() -> int:
     return sum(f.stat().st_size for f in cache_mod.lists_dir().glob("*.json")
                if f.name != "manifest.json")
+
+
+def _canned_tidal(refresh_status):
+    """A real tidalapi session over a real TimeoutSession whose transport answers from a
+    table: /sessions says the token expired, the token endpoint says `refresh_status`."""
+    import tidalapi
+    from ticli.utils.net import TimeoutSession
+
+    class Canned(requests.adapters.BaseAdapter):
+        def send(self, request, **kwargs):
+            response = requests.Response()
+            response.request, response.url = request, request.url
+            if "oauth2/token" in request.url:
+                response.status_code = refresh_status
+                response._content = json.dumps({"error": "e", "error_description": "d"}).encode()
+            else:
+                response.status_code = 401
+                response._content = json.dumps({"userMessage": "The token has expired."}).encode()
+            return response
+
+        def close(self):
+            pass
+
+    session = tidalapi.Session()
+    session.request_session = TimeoutSession()
+    session.request_session.mount("https://", Canned())
+    return session
+
+
+class TestWhatCountsAsSignedOut:
+    @pytest.mark.parametrize("status", [400, 401])
+    def test_the_token_endpoint_refusing_the_refresh_is_signed_out(self, tokens, status):
+        p = _offline_player(tokens, fail=_dead())
+        p.session = _canned_tidal(status)
+        assert p._reconnect() == SIGNED_OUT
+
+    @pytest.mark.parametrize("status", [500, 503])
+    def test_a_token_endpoint_5xx_stays_offline_and_retryable(self, tokens, status):
+        p = _offline_player(tokens, fail=_dead())
+        p.session = _canned_tidal(status)
+        assert p._reconnect() == OFFLINE
+        assert p._reconnect() == OFFLINE
+
+    def test_an_ordinary_request_s_401_rechecks_and_signs_out_when_the_refresh_is_refused(self, tokens):
+        p = _offline_player(tokens, fail=None)
+        p._load_favorites = lambda: None
+        assert p._reconnect() == ONLINE
+        p.session = _canned_tidal(400)
+        result = p.commands.execute("play.album", {"id": 9})
+        assert p._connectivity == SIGNED_OUT
+        assert result["code"] == "signed_out"
+
+    def test_an_ordinary_request_s_401_with_the_tokens_still_good_stays_online(self, tokens):
+        p = _offline_player(tokens, fail=None)
+        p._load_favorites = lambda: None
+        assert p._reconnect() == ONLINE
+        loads = p.session.calls.count("sessions")
+        p.session.album = lambda album_id: (_ for _ in ()).throw(_unauthorized())
+        with pytest.raises(requests.HTTPError):
+            p.commands.execute("play.album", {"id": 9})
+        assert p._connectivity == ONLINE
+        assert p.session.calls.count("sessions") == loads + 1, "one recheck"

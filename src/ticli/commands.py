@@ -145,6 +145,9 @@ class Commands:
         except Exception as e:
             if _transport(e):
                 p._went_offline()
+            elif unauthorized(e) and p._connectivity == ONLINE:
+                p._reconnect(recheck=True)
+            if _transport(e) or (unauthorized(e) and p._connectivity == SIGNED_OUT):
                 e = offline_error(p)
                 return _error(e.code, e.reason, e.fix)
             if caller == HUMAN:
@@ -178,15 +181,23 @@ def classify(e) -> dict:
         return _error("not_found", f"{type(e).__name__}: {e}",
                       "No such id. Playlist ids come from `playlist list` or `playlist create`; "
                       "track ids from `resolve` or `search`.")
-    if status == 401 or type(e).__name__ == "AuthenticationError":
+    if unauthorized(e):
         return _error("auth_failed", "TIDAL rejected the stored session.",
                       "Ask your human to open ticli and log in again.")
     return _error("api_error", f"{type(e).__name__}: {e}",
                   "Not a rate limit and not auth. Report it to your human if it persists.")
 
 
-def auth_rejected(e) -> bool:
+def unauthorized(e) -> bool:
     return _status_of(e) == 401 or type(e).__name__ == "AuthenticationError"
+
+
+def auth_rejected(e, refresh_status=None) -> bool:
+    """TIDAL refused the tokens: the refresh got a 400/401, or a 401 with no refresh tried.
+    A 5xx or transport failure is not a verdict on them."""
+    if refresh_status is not None:
+        return refresh_status in (400, 401)
+    return _status_of(e) == 401
 
 
 def _transport(e) -> bool:

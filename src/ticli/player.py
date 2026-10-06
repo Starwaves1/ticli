@@ -242,7 +242,7 @@ HIDE_HOLD_KEYS = frozenset({KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, " "})
 HIDE_HINT_RANK = 9
 
 from ticli.commands import (
-    HUMAN, OFFLINE, ONLINE, SIGNED_OUT, Commands, auth_rejected, download_tracks,
+    HUMAN, OFFLINE, ONLINE, SIGNED_OUT, Commands, auth_rejected, download_tracks, unauthorized,
 )
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
@@ -1653,24 +1653,29 @@ class HeadlessTidalPlayer:
                         seconds=PLAYER_ERROR_SECONDS)
         self._wake()
 
-    def _reconnect(self) -> str:
+    def _reconnect(self, recheck: bool = False) -> str:
         """Called only by an action that needs TIDAL, never a timer or probe (ADR-0003).
         From offline: one `load_oauth_session` in flight; callers that arrive meanwhile
         share its answer. A 401 is signed_out: the tokens stay and the player keeps
-        playing, never `_logout()` (it deletes them)."""
-        if self._connectivity != OFFLINE:
+        playing, never `_logout()` (it deletes them). `recheck`: the same load from online,
+        after a request got a 401, to learn whether TIDAL still takes the tokens."""
+        want = ONLINE if recheck else OFFLINE
+        if self._connectivity != want:
             return self._connectivity
         if not self._reconnect_lock.acquire(blocking=False):
             with self._reconnect_lock:  # one is in flight: its answer is ours
                 return self._connectivity
         try:
-            return self._reconnect_locked()
+            return self._reconnect_locked(want)
         finally:
             self._reconnect_lock.release()
 
-    def _reconnect_locked(self) -> str:
-        if self._connectivity != OFFLINE:
+    def _reconnect_locked(self, want: str) -> str:
+        if self._connectivity != want:
             return self._connectivity
+        http = vars(self.session).get("request_session")
+        if http is not None:
+            http.refresh_status = None
         data = load_tokens()
         try:
             if not data:
@@ -1679,7 +1684,7 @@ class HeadlessTidalPlayer:
                 data["token_type"], data["access_token"], data.get("refresh_token"),
                 data.get("expiry_time"), is_pkce=data.get("is_pkce", False))
         except Exception as e:
-            if not data or auth_rejected(e):
+            if not data or auth_rejected(e, getattr(http, "refresh_status", None)):
                 self._signed_out()
             else:
                 logger.debug("Still offline: %s", e)
@@ -1689,6 +1694,8 @@ class HeadlessTidalPlayer:
             return self._connectivity
         if self.session.access_token != data.get("access_token"):
             self._save_session()
+        if want == ONLINE:
+            return ONLINE
         self._session_loaded = True
         self._connectivity = ONLINE
         self._user_display_name = self._get_user_display_name()
@@ -2371,6 +2378,8 @@ class HeadlessTidalPlayer:
                 logger.warning("Could not play %s: %r", getattr(track, "id", None), e)
                 if is_transport_failure(e):
                     self._went_offline()
+                elif unauthorized(e):
+                    self._reconnect(recheck=True)
                 if self._play_gen == gen:
                     self._playing = False
                     self._play_start_time = None
