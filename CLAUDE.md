@@ -16,6 +16,7 @@ Package in `src/ticli`; entry point `ticli = ticli.cli:main`.
 
 - `cli.py`: Click entry, `--quality` / `--login-flow`, the `ticli agent` command group.
 - `player.py`: everything interactive. `AudioPlayer` drives the mpv/ffplay process, seeking and the cache download; `HeadlessTidalPlayer` is the TUI (despite the name): login, `_stream_url`, `_monitor_playback` (the 0.5 s tick), `_handle_key` → per-screen `_handle_*_key`, `_build_display`, `run`.
+- `commands.py`: every player-level action as one named command behind `execute(name, args, caller)`, with the permission gate.
 - `agent.py` + `agent_docs.py`: the agent surface and the contract `ticli agent docs` prints.
 - `utils/throttle.py`: cross-process request pacing and the trip.
 - `utils/backend_health.py`: classifies backend exits; post-failure version probe.

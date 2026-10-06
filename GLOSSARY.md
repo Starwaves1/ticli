@@ -75,6 +75,19 @@ _Avoid_: seek mode, scrub mode
 `ticli agent <verb>`, the JSON-only CLI for programs. `HeadlessTidalPlayer` is the TUI, despite its name.
 _Avoid_: API, headless mode
 
+**Command**:
+One named player-level action in `commands.py` (`next`, `playlist.add`, `cache.clear`...), taking and returning JSON-shaped data. TUI keys, `ticli <verb>` and `ticli agent <verb>` all call the same commands; screens, cursors and menus are not commands.
+_Avoid_: action, endpoint
+
+**Caller**:
+Who a command runs for: `human` (TUI keys, `ticli <verb>` from a terminal) or `agent` (`ticli agent`, or `ticli <verb>` without a TTY). Only agent calls are gated.
+
+**AI control**:
+The human's three TUI-only switches: Allow AI control, Allow dangerous commands, and the AI control key. No command can change them (ADR-0007).
+
+**Dangerous command**:
+A command that deletes or is hard to undo: removing from or deleting/renaming a playlist, deleting a download, clearing the cache, lowering the cache budget, logout, changing the login flow. Refused to agents unless Allow dangerous commands is on.
+
 **Trip**:
 The throttle's persisted stop, written on a 429 or 401/4006. Every agent request fails fast until a human runs `ticli agent unblock`.
 _Avoid_: cooldown, backoff (it never expires on its own)

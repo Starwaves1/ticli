@@ -131,7 +131,12 @@ ticli agent playlist create "Morning Uplift"
 ticli agent playlist add <playlist-id> <track-id>...
 ```
 
-Two things make it safe to point an agent at:
+Three things make it safe to point an agent at:
+
+- **You hold the switches.** The settings page (`c`) has "Allow AI control"
+  (on), "Allow dangerous commands" (off) and an optional "AI control key"
+  that agents must pass as `TICLI_AI_KEY`. Only a keypress in the TUI
+  changes them, and every refusal tells the agent to ask you.
 
 - **Rate limiting is enforced, not suggested.** Every request goes through a
   cross-process throttle (2 seconds apart, however many agents are running).

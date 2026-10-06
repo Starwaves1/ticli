@@ -150,10 +150,10 @@ skips duplicates; `{"ok": true, "playlist_id": "...", "requested": 5,
 "added": 5}` tells you what it actually took.
 
 There is no `playlist delete`, no track removal, no destructive verb of any
-kind in this surface — deliberately, and it will stay that way. Asked to
-delete a playlist or remove tracks: report that it is human-only, done in
-the TUI (`x` on the track or playlist, with a confirmation). Do not go
-looking for another way.
+kind in this surface yet; when they come they will need the human's "Allow
+dangerous commands". Asked to delete a playlist or remove tracks: report
+that it is done in the TUI (`x` on the track, with a confirmation). Do not
+go looking for another way.
 
 ### `ticli agent unblock` — 0 requests
 Clears a trip. **Human-only** — see The trip above. Present it to the user
@@ -180,8 +180,8 @@ settings page (PKCE sign-in).
 **Anything that touches playback** — play, pause, skip, queue, volume,
 what's playing, downloads, favorites, radio: **not in this surface yet.**
 Say it is not yet supported and point at the TUI; the running player is the
-human's. (A control socket for the live player is deferred, not
-forgotten.) The one thing you *can* see
+human's. (Control of the live player is planned, not built yet.) The one
+thing you *can* see
 is `status`'s `player_running` boolean.
 
 Also not here yet: **browsing** (an album's track list, an artist's page —
