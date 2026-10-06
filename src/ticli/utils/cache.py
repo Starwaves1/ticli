@@ -6,9 +6,11 @@ Machine-owned and disposable, unlike `~/.config/ticli`, except that the same
 directory also holds the download index (`downloads.json`, utils/downloads.py):
 losing it forgets the user's whole download library.
 
-The cache is a first paint, never an answer: callers pair every read with a
-live fetch that replaces it. MAX_AGE_SECONDS only drops entries from a month
-offline. Records are flat text so a local playlist search can scan the index.
+The cache is a first paint, never an answer while online: callers pair every
+read with a live fetch that replaces it. Offline it is the answer, with its age
+(ADR-0009): nothing expires, and the index is held to METADATA_CAP_BYTES,
+evicting the least recently opened lists first and the user's own library last.
+Records are flat text so a local search can scan the index.
 """
 
 import json
@@ -18,6 +20,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +35,11 @@ PLAY_COUNTS_AFTER = 30.0
 
 BYTES_PER_GB = 1024 ** 3
 
-MAX_AGE_SECONDS = 30 * 24 * 3600
+# Metadata has its own cap, separate from the audio budget (ADR-0009).
+METADATA_CAP_BYTES = 100 * 1024 * 1024
+# Evicted last: the lists that are the user's own library.
+LIBRARY_PREFIXES = ("favorites:",)
+LIBRARY_KEYS = ("playlists", "mixes")
 
 # Every extension AudioPlayer can produce (player._audio_extension owns that
 # list; test_cache pins the two together).
@@ -248,6 +255,109 @@ def playlist_record(playlist, editable: bool) -> dict:
     }
 
 
+class CachedAlbum:
+    cached = True
+    wire_kind = "album"
+    __slots__ = ("id", "name", "artist", "cover", "num_tracks")
+
+    def __init__(self, record: dict):
+        record = record if isinstance(record, dict) else {}
+        self.id = record.get("id")
+        self.name = _clean_str(record.get("name")) or "?"
+        artist = _clean_str(record.get("artist"))
+        self.artist = _Named(artist) if artist else None
+        self.cover = _clean_str(record.get("cover"))
+        self.num_tracks = _clean_number(record.get("num_tracks"))
+
+
+class CachedArtist:
+    cached = True
+    wire_kind = "artist"
+    __slots__ = ("id", "name")
+
+    def __init__(self, record: dict):
+        record = record if isinstance(record, dict) else {}
+        self.id = record.get("id")
+        self.name = _clean_str(record.get("name")) or "?"
+
+
+class CachedMix:
+    cached = True
+    wire_kind = "mix"
+    __slots__ = ("id", "name")
+
+    def __init__(self, record: dict):
+        record = record if isinstance(record, dict) else {}
+        self.id = record.get("id")
+        self.name = _clean_str(record.get("name")) or "?"
+
+
+_KINDS_BY_CLASS = {"Track": "track", "Video": "track", "Album": "album", "Artist": "artist",
+                   "Playlist": "playlist", "UserPlaylist": "playlist", "Mix": "mix", "MixV2": "mix",
+                   "CachedTrack": "track", "CachedPlaylist": "playlist"}
+
+
+def kind_of(obj):
+    kind = getattr(obj, "wire_kind", None) or _KINDS_BY_CLASS.get(type(obj).__name__)
+    if kind:
+        return kind
+    if hasattr(obj, "duration") and hasattr(obj, "artists"):
+        return "track"
+    if hasattr(obj, "num_tracks") and hasattr(obj, "artist"):
+        return "album"
+    if hasattr(obj, "num_tracks") or hasattr(obj, "creator"):
+        return "playlist"
+    if hasattr(obj, "id") and hasattr(obj, "name"):
+        return "artist"
+    return None
+
+
+def _is_editable(obj) -> bool:
+    return type(obj).__name__ == "UserPlaylist" or bool(getattr(obj, "editable", False))
+
+
+def record_of(kind: str, obj) -> dict:
+    if kind == "track":
+        return track_record(obj)
+    if kind == "playlist":
+        return playlist_record(obj, _is_editable(obj))
+    if kind == "album":
+        artist = getattr(obj, "artist", None)
+        return {"id": getattr(obj, "id", None), "name": getattr(obj, "name", None),
+                "artist": getattr(artist, "name", None) if artist else None,
+                "cover": _clean_str(getattr(obj, "cover", None)),
+                "num_tracks": getattr(obj, "num_tracks", None)}
+    if kind == "mix":
+        return {"id": getattr(obj, "id", None),
+                "name": getattr(obj, "title", None) or getattr(obj, "name", None)}
+    return {"id": getattr(obj, "id", None), "name": getattr(obj, "name", None)}
+
+
+SHIMS = {"track": CachedTrack, "playlist": CachedPlaylist, "album": CachedAlbum,
+         "artist": CachedArtist, "mix": CachedMix}
+
+
+def item_record(obj) -> dict:
+    """Any list row, tagged with its kind; untagged records (older lists) are tracks."""
+    kind = kind_of(obj) or "track"
+    return {"_k": kind, **record_of(kind, obj)}
+
+
+def item_from(record):
+    kind = record.get("_k") if isinstance(record, dict) else None
+    return SHIMS.get(kind, CachedTrack)(record)
+
+
+def age_label(fetched, now=None) -> str:
+    """"cached 3 days ago": how old an offline list is (ADR-0009)."""
+    seconds = max(0, (time.time() if now is None else now) - (fetched or 0))
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            count = int(seconds // size)
+            return f"cached {count} {unit}{'' if count == 1 else 's'} ago"
+    return "cached just now"
+
+
 def format_gb(num_bytes: int) -> str:
     """Three decimals, so a handful of tracks does not round to "0.00 GB"."""
     return f"{num_bytes / BYTES_PER_GB:.3f} GB"
@@ -286,11 +396,16 @@ class MetadataCache:
     a disk walk, never by a caller).
     """
 
-    def __init__(self, metadata: bool = True, songs: bool = True, budget_gb: int = 2):
+    def __init__(self, metadata: bool = True, songs: bool = True, budget_gb: int = 2,
+                 metadata_cap: Optional[int] = None):
         self.metadata = metadata
         self.songs = songs
         self.budget_gb = budget_gb
+        self.metadata_cap = metadata_cap
         self._index = None  # loaded from disk on first use
+        # Another process (the player, or the TUI beside it) may have replaced the file since.
+        self._index_stamp = None
+        self._index_lock = threading.Lock()
         # Measured on demand; see invalidate_audio_count
         self._audio_count = None
         self._disk_bytes = None
@@ -312,15 +427,24 @@ class MetadataCache:
     def budget_bytes(self) -> int:
         return max(0, int(self.budget_gb)) * BYTES_PER_GB
 
+    @staticmethod
+    def _stamp():
+        try:
+            st = index_file().stat()
+        except OSError:
+            return None
+        return st.st_mtime_ns, st.st_size
+
     def _load(self) -> dict:
-        """Read the index. Missing, corrupt or wrong version → empty, never raises."""
-        if self._index is not None:
+        """Read the index. Missing, corrupt or wrong version → empty, never raises.
+        Re-read when the file changed under us: the TUI paints from what the player wrote."""
+        stamp = self._stamp()
+        if self._index is not None and stamp == self._index_stamp:
             return self._index
         entries = {}
-        path = index_file()
         try:
-            if path.exists():
-                data = json.loads(path.read_text())
+            if stamp is not None:
+                data = json.loads(index_file().read_text())
                 if isinstance(data, dict) and data.get("version") == CACHE_VERSION:
                     raw = data.get("entries")
                     if isinstance(raw, dict):
@@ -331,41 +455,90 @@ class MetadataCache:
         except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as e:
             logger.debug("Unusable metadata cache, starting empty: %s", e)
         self._index = entries
+        self._index_stamp = stamp
         return entries
 
     def _save(self, entries: dict) -> None:
-        """Atomically replace the index, then enforce the budget. Best effort."""
+        """Atomically replace the index, held to the metadata cap. Best effort."""
+        text = json.dumps({"version": CACHE_VERSION, "entries": entries})
+        if len(text) > self.cap_bytes:
+            entries = self._capped(entries)
+            text = json.dumps({"version": CACHE_VERSION, "entries": entries})
         self._index = entries
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-            _atomic_write_json(
-                index_file(), {"version": CACHE_VERSION, "entries": entries})
+            tmp = index_file().with_suffix(".tmp")
+            tmp.write_text(text)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, index_file())
         except OSError as e:
             logger.debug("Failed to write metadata cache: %s", e)
             return
-        self.enforce_budget()
+        self._index_stamp = self._stamp()
+
+    @property
+    def cap_bytes(self) -> int:
+        return METADATA_CAP_BYTES if self.metadata_cap is None else self.metadata_cap
+
+    def _library_keys(self, entries: dict) -> set:
+        own = {f"playlist:{r.get('id')}" for r in (entries.get("playlists") or {}).get("data") or []
+               if isinstance(r, dict)}
+        return {k for k in entries
+                if k in LIBRARY_KEYS or k in own or k.startswith(LIBRARY_PREFIXES)}
+
+    def _capped(self, entries: dict) -> dict:
+        """Evict until the index fits the cap: least recently opened first, the
+        user's own library (playlists, favourites) only after everything else."""
+        sizes = {k: len(json.dumps(v)) + len(json.dumps(k)) + 2 for k, v in entries.items()}
+        total = sum(sizes.values()) + 40
+        cap = self.cap_bytes
+        library = self._library_keys(entries)
+        order = sorted(entries, key=lambda k: (k in library, entries[k].get("used") or 0))
+        kept = dict(entries)
+        for key in order:
+            if total <= cap:
+                break
+            kept.pop(key)
+            total -= sizes[key]
+        return kept
 
     # ── generic entry access ──
 
     def get(self, key: str):
-        """Stored records for a key, or None if absent, stale or disabled."""
+        """Stored records for a key, or None if absent or disabled. Never expires (ADR-0009)."""
+        entry = self.entry(key)
+        return entry["data"] if entry else None
+
+    def entry(self, key: str):
+        """`{"fetched", "used", "data"}` for a key, marked as opened now (kept in memory
+        until the next write: an open must not rewrite the whole index)."""
         if not self.enabled:
             return None
         entry = self._load().get(key)
         if not entry:
             return None
-        fetched = entry.get("fetched") or 0
-        if time.time() - fetched > MAX_AGE_SECONDS:
-            return None
-        return entry["data"]
+        entry["used"] = time.time()
+        return entry
+
+    def fetched_at(self, key: str):
+        entry = self.entry(key)
+        return (entry.get("fetched") or 0) if entry else None
 
     def put(self, key: str, records: list) -> None:
         if not self.enabled:
             return
-        now = time.time()
-        entries = dict(self._load())
-        entries[key] = {"fetched": now, "used": now, "data": list(records)}
-        self._save(entries)
+        with self._index_lock:
+            now = time.time()
+            entries = dict(self._load())
+            entries[key] = {"fetched": now, "used": now, "data": list(records)}
+            self._save(entries)
+
+    def put_items(self, key: str, objs) -> None:
+        self.put(key, [item_record(o) for o in objs or []])
+
+    def get_items(self, key: str):
+        records = self.get(key)
+        return [item_from(r) for r in records] if records is not None else None
 
     def clear(self) -> None:
         """Drop everything — the index, any cached audio, any cover art."""
@@ -376,6 +549,7 @@ class MetadataCache:
     def clear_metadata(self) -> None:
         """Forget the index, on disk too."""
         self._index = {}
+        self._index_stamp = None
         try:
             index_file().unlink()
         except OSError:
@@ -689,23 +863,17 @@ class MetadataCache:
     # ── budget ──
 
     def total_bytes(self) -> int:
-        """Everything the cache directory is currently costing on disk."""
-        total = _dir_size(audio_dir())
-        try:
-            total += index_file().stat().st_size
-        except OSError:
-            pass
-        return total
+        """What the cached audio costs on disk. The metadata index has its own cap (ADR-0009)."""
+        return _dir_size(audio_dir())
 
     def enforce_budget(self) -> int:
         """Evict until the cache fits its budget. Returns bytes freed.
 
         Audio goes first, in `audio_value` order: fewest plays, then oldest.
         A file the tracker has never heard of sorts at `(0, 0)`: litter or
-        pre-tracker, and `reconcile()` adopts anything real long before. Only
-        if the index alone still overshoots do metadata entries go, oldest
-        first. Called after every write; being over budget is an event, not a
-        state to poll for.
+        pre-tracker, and `reconcile()` adopts anything real long before.
+        Metadata is not counted here; it has its own cap (`_save`). Called
+        after every write; being over budget is an event, not a state to poll for.
         """
         budget = self.budget_bytes
         freed = 0
@@ -742,23 +910,4 @@ class MetadataCache:
             self._audio_count = None  # a song just left the directory
         self.forget_cached(evicted)
 
-        if total <= budget:
-            return freed
-
-        # Still over on metadata alone (rare: the index is single-digit MB)
-        entries = dict(self._load())
-        for key in sorted(entries, key=lambda k: entries[k].get("used") or 0):
-            if total <= budget:
-                break
-            entries.pop(key, None)
-            self._index = entries
-            try:
-                _atomic_write_json(
-                    index_file(),
-                    {"version": CACHE_VERSION, "entries": entries})
-            except OSError:
-                break
-            new_total = self.total_bytes()
-            freed += max(0, total - new_total)
-            total = new_total
         return freed

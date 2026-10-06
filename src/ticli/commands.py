@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ticli.utils import downloads, throttle
-from ticli.utils.cache import CachedTrack, MetadataCache
+from ticli.utils.cache import (
+    CachedPlaylist, CachedTrack, MetadataCache, age_label, item_from, kind_of, record_of,
+)
 from ticli.utils.config import (
     PROTECTED_KEYS, SETTINGS_SPEC, UNREADABLE, UNREADABLE_MESSAGE, ConfigUnreadable,
     ai_key_matches, coerce, get_spec, load_config, update_config,
@@ -28,6 +30,11 @@ AGENT = "agent"
 ARTIST_SECTIONS = ("tracks", "albums", "playlists", "suggestions")
 
 WRONG_KEY_DELAY_SECONDS = 1.0
+
+ONLINE, OFFLINE, SIGNED_OUT = "online", "offline", "signed_out"
+OFFLINE_FIX = "Reconnect, or play downloaded/cached music (`download list`, `play downloads`)."
+SIGN_IN_FIX = ("Press [o] in ticli's TUI to sign in again (agents: ask your human). "
+               "Downloaded and cached music still plays.")
 
 _NEVER_EDIT = ("Only your human can change this, in ticli's TUI settings ([c]). "
                "Ask them; never edit config.json or impersonate the TUI.")
@@ -136,6 +143,10 @@ class Commands:
         except throttle.Tripped as e:
             return tripped_error(e.record)
         except Exception as e:
+            if _transport(e):
+                p._went_offline()
+                e = offline_error(p)
+                return _error(e.code, e.reason, e.fix)
             if caller == HUMAN:
                 raise
             return classify(e)
@@ -172,6 +183,52 @@ def classify(e) -> dict:
                       "Ask your human to open ticli and log in again.")
     return _error("api_error", f"{type(e).__name__}: {e}",
                   "Not a rate limit and not auth. Report it to your human if it persists.")
+
+
+def auth_rejected(e) -> bool:
+    return _status_of(e) == 401 or type(e).__name__ == "AuthenticationError"
+
+
+def _transport(e) -> bool:
+    from ticli.utils.net import is_transport_failure  # deferred: keep `ticli agent --help` instant
+    return is_transport_failure(e)
+
+
+def offline_error(p) -> CommandError:
+    if getattr(p, "_connectivity", ONLINE) == SIGNED_OUT:
+        return CommandError("signed_out", "TIDAL signed this player out.", SIGN_IN_FIX)
+    return CommandError("offline", "Offline: TIDAL can't be reached.", OFFLINE_FIX)
+
+
+def _require_online(p) -> None:
+    """Writes are refused offline, not queued for later."""
+    if p._reconnect() != ONLINE:
+        raise offline_error(p)
+
+
+def _read(p, key: str, live) -> tuple:
+    """(rows, cached_at): live when TIDAL answers, else the list as last opened (ADR-0009)."""
+    if p._reconnect() == ONLINE:
+        try:
+            return live(), None
+        except Exception as e:
+            if not _transport(e):
+                raise
+            p._went_offline()
+    entry = p._cache.entry(key)
+    if entry is None:
+        raise offline_error(p)
+    return [item_from(r) for r in entry["data"]], entry.get("fetched") or 0
+
+
+def _tagged(kind: str, obj) -> dict:
+    return {"_k": kind, **record_of(kind, obj)}
+
+
+def _age(cached_at) -> dict:
+    if cached_at is None:
+        return {}
+    return {"cached_at": round(cached_at), "age": age_label(cached_at), "offline": True}
 
 
 _inline = threading.local()
@@ -239,14 +296,60 @@ def _tracks(p, ids, *first) -> list:
     for tid in ids:
         track = known.get(str(tid)) or p._known.get(("track", str(tid)))
         if track is None:
-            # A row the TUI found in the metadata index: playback resolves it only if no local copy exists.
+            # A row the TUI found locally: playback resolves it only if no local copy exists.
             if indexed is None:
                 wanted = {str(t) for t in ids}
-                indexed = {str(r.get("id")): CachedTrack(r) for _pid, r in p._cache.iter_tracks()
-                           if str(r.get("id")) in wanted}
-            track = indexed.get(str(tid)) or p.session.track(tid)
+                indexed = {str(t.id): t for t in local_tracks(p._cache) if str(t.id) in wanted}
+            track = indexed.get(str(tid))
+            if track is None:
+                _require_online(p)
+                track = p.session.track(tid)
         tracks.append(track)
     return tracks
+
+
+def _track_id(text):
+    return int(text) if str(text).isdigit() else text
+
+
+def download_tracks() -> list:
+    """The download library as playable rows, newest first; no request (ADR-0009)."""
+    rows = []
+    for row in downloads.present():
+        title, artist, album = downloads.describe(row["entry"].get("path") or "")
+        rows.append(CachedTrack({"id": _track_id(row["id"]), "name": title,
+                                 "artists": [artist] if artist else [], "album": album,
+                                 "duration": row["entry"].get("duration")}))
+    return rows
+
+
+def local_tracks(cache) -> list:
+    """Every track known on this machine: downloads, favourites, your playlists' rows."""
+    seen, found = set(), []
+    sources = (download_tracks(), cache.get_items("favorites:tracks") or [],
+               (CachedTrack(r) for _pid, r in cache.iter_tracks()))
+    for source in sources:
+        for track in source:
+            if str(track.id) not in seen and kind_of(track) == "track":
+                seen.add(str(track.id))
+                found.append(track)
+    return found
+
+
+def _text(obj) -> str:
+    album = getattr(obj, "album", None)
+    return " ".join([obj.name, *(a.name for a in getattr(obj, "artists", None) or []),
+                     getattr(album, "name", "") if album else ""]).casefold()
+
+
+def local_search(cache, query: str) -> dict:
+    """Search what is on disk: your playlists, favourites and downloads (0 requests)."""
+    needle = query.casefold()
+    return {"tracks": [t for t in local_tracks(cache) if needle in _text(t)],
+            "albums": [a for a in cache.get_items("favorites:albums") or [] if needle in _text(a)],
+            "artists": [a for a in cache.get_items("favorites:artists") or [] if needle in _text(a)],
+            "playlists": [pl for pl in cache.get_playlists() or [] if needle in pl.name.casefold()],
+            "source": "local"}
 
 
 def _known(p, kind, obj_id):
@@ -294,6 +397,11 @@ def _play_list(p, tracks, index) -> dict:
         raise CommandError("empty", "Nothing to play.")
     if not 0 <= index < len(tracks):
         raise CommandError("bad_args", f"index must be 0..{len(tracks) - 1}.")
+    if p._connectivity != ONLINE:
+        # Offline, start at the first entry from here that plays from disk (no reconnect for that).
+        owned = {row["id"] for row in downloads.present()}
+        local = [i for i in range(index, len(tracks)) if p._has_local_copy(tracks[i], owned)]
+        index = local[0] if local else index
     p._queue = list(tracks)
     p._play_queue_index(index)
     return {"queue_length": len(tracks), "index": index}
@@ -311,6 +419,7 @@ def _status(p, args) -> dict:
         "position": round(p._get_position(), 1) if track else 0,
         "queue": {"length": len(p._queue), "index": p._queue_index},
         "switches": switches(cfg),
+        "connectivity": p._connectivity,
     }
 
 
@@ -399,8 +508,9 @@ def _play_track_cmd(p, args) -> dict:
 
 def _play_album(p, args) -> dict:
     album_id = str(args.get("id", ""))
-    tracks = _list(p, ("album", album_id))
-    if tracks is None:
+    tracks = _list(p, ("album", album_id)) or p._cache.get_items(f"album:{album_id}")
+    if not tracks:
+        _require_online(p)
         album = _known(p, "album", album_id) or p.session.album(album_id)
         tracks = list(album.tracks())
     return _play_list(p, tracks, _index(args))
@@ -408,11 +518,31 @@ def _play_album(p, args) -> dict:
 
 def _play_playlist(p, args) -> dict:
     playlist_id = str(args.get("id", ""))
-    tracks = _list(p, ("playlist", playlist_id))
-    if tracks is None:
-        tracks = (p._cache.get_playlist_tracks(playlist_id)
-                  or list(p.session.playlist(playlist_id).tracks()))
+    tracks = _list(p, ("playlist", playlist_id)) or p._cache.get_playlist_tracks(playlist_id)
+    if not tracks:
+        _require_online(p)
+        tracks = list(p.session.playlist(playlist_id).tracks())
     return _play_list(p, tracks, _index(args))
+
+
+def _play_mix(p, args) -> dict:
+    mix_id = str(args.get("id", ""))
+    tracks = _list(p, ("mix", mix_id)) or p._cache.get_items(f"mix:{mix_id}")
+    if not tracks:
+        tracks = _mix_tracks(p, {"id": mix_id})["tracks"]
+    return _play_list(p, tracks, _index(args))
+
+
+def _play_downloads(p, args) -> dict:
+    """Play the download library from an entry, newest first, as the downloads screen lists it."""
+    tracks = download_tracks()
+    index = _index(args)
+    if "track_id" in args:
+        ids = [str(t.id) for t in tracks]
+        if str(args["track_id"]) not in ids:
+            raise CommandError("not_found", "That track is not downloaded.", "Run `download list`.")
+        index = ids.index(str(args["track_id"]))
+    return _play_list(p, tracks, index)
 
 
 def _artist_section_arg(args) -> str:
@@ -434,13 +564,13 @@ def _play_artist(p, args) -> dict:
     elif record and record["state"] == "ready":
         tracks = [row["obj"] for row in record["items"] if row["type"] == "track"]
     else:
-        artist = _known(p, "artist", artist_id) or p.session.artist(artist_id)
-        tracks = [row["obj"] for row in p._fetch_artist_section(artist, section, 50)
-                  if row["type"] == "track"]
+        rows = _artist_section(p, {"id": artist_id, "section": section, "limit": 50})["items"]
+        tracks = [row["obj"] for row in rows if row["type"] == "track"]
     return _play_list(p, tracks, _index(args))
 
 
 def _radio(p, args):
+    _require_online(p)
     p._start_track_radio()
 
 
@@ -453,6 +583,7 @@ def _like(on: bool):
             if current is None:
                 raise CommandError("no_track", "Nothing is playing; pass track_ids.")
             ids = [current]
+        _require_online(p)
 
         def _run():
             try:
@@ -493,6 +624,7 @@ def _live_playlist(p, playlist_id):
 def _playlist_add(p, args) -> dict:
     if p._picker_busy:
         raise CommandError("busy", "A playlist change is still in flight.")
+    _require_online(p)
     playlist_id = args.get("id", "")
     ids = list(dict.fromkeys(str(t) for t in _ids(args)))
     playlist = args.get("playlist")
@@ -530,6 +662,7 @@ def _playlist_create(p, args) -> dict:
     name = str(args.get("name") or "").strip()
     if not name:
         raise CommandError("bad_args", "Playlist name can't be empty.")
+    _require_online(p)
     ids = [str(t) for t in args.get("track_ids") or []]
     description = str(args.get("description") or "")
     # Set first: a second Enter on the same tick must already see this, or the playlist is created twice.
@@ -588,6 +721,7 @@ def _playlist_remove(p, args) -> dict:
         raise CommandError("stale", "That playlist changed; reopen it before removing.")
     if p._browse_remove_busy:
         raise CommandError("busy", "A removal is still in flight.")
+    _require_online(p)
     p._browse_remove_busy = True
 
     def _run():
@@ -609,6 +743,7 @@ def _playlist_remove(p, args) -> dict:
 
 
 def _download(p, args) -> dict:
+    _require_online(p)
     tier = str(args.get("tier") or p._quality_name).upper()
     tracks = _tracks(p, _ids(args), [p._download_track], p._download_tracks)
     if len(tracks) > 1:
@@ -640,6 +775,7 @@ def _download_delete(p, args) -> dict:
 
 
 def _refetch(p, args):
+    _require_online(p)
     p._start_refetch_job()
 
 
@@ -706,6 +842,7 @@ def _cache_clear(p, args) -> dict:
 
 
 def _login_pkce(p, args):
+    _require_online(p)
     p._upgrade_to_pkce()
 
 
@@ -732,12 +869,29 @@ def _search(p, args) -> dict:
     kinds = [k if k.endswith("s") else k + "s" for k in args.get("types") or SEARCH_KINDS]
     if not set(kinds) <= set(SEARCH_KINDS):
         raise CommandError("bad_args", "types are track, album, artist, playlist.")
-    # One GET whatever the scope: `types=` carries all four and `limit` is per type.
-    results = p.session.search(query, models=p._search_models(), limit=limit, offset=offset)
-    found = {kind: list(results.get(kind) or []) for kind in SEARCH_KINDS}
+    key = f"search:{query.casefold()}"
+
+    def live():
+        # One GET whatever the scope: `types=` carries all four and `limit` is per type.
+        results = p.session.search(query, models=p._search_models(), limit=limit, offset=offset)
+        found = {kind: list(results.get(kind) or []) for kind in SEARCH_KINDS}
+        if offset == 0:
+            p._cache.put(key, [_tagged(kind[:-1], o) for kind in SEARCH_KINDS for o in found[kind]])
+        return found
+
+    try:
+        found, cached_at = _read(p, key, live)
+    except CommandError as e:
+        if e.code not in (OFFLINE, SIGNED_OUT):
+            raise
+        found = local_search(p._cache, query)
+        return {**{kind: found[kind][offset:offset + limit] for kind in kinds},
+                "source": "local", "offline": True}
+    if cached_at is not None:
+        found = {kind: [o for o in found if kind_of(o) == kind[:-1]] for kind in SEARCH_KINDS}
     for kind, objs in found.items():
         p._remember(kind[:-1], objs)
-    return {kind: found[kind] for kind in kinds}
+    return {**{kind: found[kind] for kind in kinds}, **_age(cached_at)}
 
 
 # Version qualifiers that make a track a different listen from the plain title.
@@ -780,6 +934,9 @@ def _resolve(p, args) -> dict:
     artist, title = str(args.get("artist") or ""), str(args.get("title") or "")
     if not artist or not title:
         raise CommandError("bad_args", "resolve needs artist and title.")
+    if p._reconnect() != ONLINE:
+        return {**rank_tracks(local_tracks(p._cache), artist, title), "source": "local",
+                "offline": True}
     results = p.session.search(f"{artist} {title}", models=p._search_models()[:1],
                                limit=int(args.get("limit") or 10))
     tracks = list(results.get("tracks") or [])
@@ -789,45 +946,133 @@ def _resolve(p, args) -> dict:
 
 def _album_tracks(p, args) -> dict:
     album_id = str(args.get("id", ""))
-    album = _known(p, "album", album_id) or p.session.album(album_id)
-    tracks = list(album.tracks() or [])
+    key = f"album:{album_id}"
+
+    def live():
+        album = _known(p, "album", album_id) or p.session.album(album_id)
+        tracks = list(album.tracks() or [])
+        p._cache.put_items(key, tracks)
+        return tracks
+
+    tracks, cached_at = _read(p, key, live)
     p._remember("track", tracks)
     p._lists[("album", album_id)] = tracks
-    return {"tracks": tracks}
+    return {"tracks": tracks, **_age(cached_at)}
+
+
+def _cached_playlist(p, playlist_id):
+    return next((pl for pl in p._cache.get_playlists() or [] if str(pl.id) == playlist_id),
+                None) or CachedPlaylist({"id": playlist_id, "name": "Playlist"})
 
 
 def _playlist_tracks(p, args) -> dict:
     playlist_id = str(args.get("id", ""))
-    live = _known(p, "playlist", playlist_id)
-    if live is None or getattr(live, "cached", False):
-        live = p.session.playlist(playlist_id)
-        p._remember("playlist", [live])
-    tracks = list(live.tracks() or [])
+    holder = {}
+
+    def live():
+        found = _known(p, "playlist", playlist_id)
+        if found is None or getattr(found, "cached", False):
+            found = p.session.playlist(playlist_id)
+            p._remember("playlist", [found])
+        holder["playlist"] = found
+        tracks = list(found.tracks() or [])
+        p._cache.put_playlist_tracks(playlist_id, tracks)
+        return tracks
+
+    tracks, cached_at = _read(p, f"playlist:{playlist_id}", live)
+    playlist = holder.get("playlist") or _known(p, "playlist", playlist_id) \
+        or _cached_playlist(p, playlist_id)
     p._remember("track", tracks)
     p._lists[("playlist", playlist_id)] = tracks
-    p._cache.put_playlist_tracks(playlist_id, tracks)
-    return {"playlist": live, "tracks": tracks}
+    return {"playlist": playlist, "tracks": tracks, **_age(cached_at)}
 
 
 def _artist_section(p, args) -> dict:
     artist_id = str(args.get("id", ""))
     section = _artist_section_arg(args)
     limit = int(args.get("limit") or 20)
-    artist = _known(p, "artist", artist_id) or p.session.artist(artist_id)
-    rows = p._fetch_artist_section(artist, section, limit)
+    key = f"artist:{artist_id}:{section}"
+
+    def live():
+        artist = _known(p, "artist", artist_id) or p.session.artist(artist_id)
+        rows = p._fetch_artist_section(artist, section, limit)
+        p._cache.put(key, [_tagged(r["type"], r["obj"]) for r in rows])
+        return rows
+
+    rows, cached_at = _read(p, key, live)
+    if cached_at is not None:
+        rows = [{"type": kind_of(o) or "track", "obj": o} for o in rows]
     for row in rows:
         p._remember(row["type"], [row["obj"]])
     p._lists[("artist:" + section, artist_id)] = [r["obj"] for r in rows if r["type"] == "track"]
-    return {"items": rows}
+    return {"items": rows, **_age(cached_at)}
 
 
 def _library_playlists(p, args) -> dict:
-    playlists = list(p.session.user.playlists() or [])
+    def live():
+        playlists = list(p.session.user.playlists() or [])
+        p._cache.put_playlists(playlists, editable_type=p._editable_type())
+        p._editable_playlists = [pl for pl in playlists if p._is_editable(pl)]
+        p._editable_playlists_time = time.time()
+        return playlists
+
+    playlists, cached_at = _read(p, "playlists", live)
+    if cached_at is not None:
+        playlists = p._cache.get_playlists() or []
     p._remember("playlist", playlists)
-    p._cache.put_playlists(playlists, editable_type=p._editable_type())
-    p._editable_playlists = [pl for pl in playlists if p._is_editable(pl)]
-    p._editable_playlists_time = time.time()
-    return {"playlists": playlists}
+    return {"playlists": playlists, **_age(cached_at)}
+
+
+FAVORITE_KINDS = ("tracks", "albums", "artists")
+
+
+def _library_favorites(p, args) -> dict:
+    kind = str(args.get("kind") or "tracks")
+    if kind not in FAVORITE_KINDS:
+        raise CommandError("bad_args", "kind must be tracks, albums or artists.")
+    key = f"favorites:{kind}"
+
+    def live():
+        objs = list(getattr(p.session.user.favorites, kind)() or [])
+        p._cache.put_items(key, objs)
+        if kind == "tracks":
+            p._liked_ids = {t.id for t in objs}
+        return objs
+
+    objs, cached_at = _read(p, key, live)
+    p._remember(kind[:-1], objs)
+    if kind == "tracks":
+        p._lists[("favorites", "tracks")] = objs
+    return {kind: objs, **_age(cached_at)}
+
+
+def _library_mixes(p, args) -> dict:
+    def live():
+        mixes = [m for m in p.session.mixes() if kind_of(m) == "mix"]
+        p._cache.put_items("mixes", mixes)
+        return mixes
+
+    mixes, cached_at = _read(p, "mixes", live)
+    p._remember("mix", mixes)
+    return {"mixes": mixes, **_age(cached_at)}
+
+
+def _mix_tracks(p, args) -> dict:
+    mix_id = str(args.get("id", ""))
+    key = f"mix:{mix_id}"
+
+    def live():
+        mix = _known(p, "mix", mix_id)
+        if mix is None or getattr(mix, "cached", False):
+            mix = p.session.mix(mix_id)
+        tracks = [t for t in mix.items() if kind_of(t) == "track"]
+        p._cache.put_items(key, tracks)
+        return tracks
+
+    tracks, cached_at = _read(p, key, live)
+    p._remember("track", tracks)
+    p._lists[("mix", mix_id)] = tracks
+    return {"tracks": tracks, **_age(cached_at)}
 
 
 def _stop(p, args):
@@ -862,6 +1107,8 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("play.album", _play_album, tidal=True, params=("id", "index")),
     Command("play.playlist", _play_playlist, tidal=True, params=("id", "index")),
     Command("play.artist", _play_artist, tidal=True, params=("id", "section", "index")),
+    Command("play.mix", _play_mix, tidal=True, params=("id", "index")),
+    Command("play.downloads", _play_downloads, params=("index", "track_id")),
     Command("play.radio", _radio, tidal=True),
     Command("like", _like(True), tidal=True, params=("track_ids*",)),
     Command("unlike", _like(False), tidal=True, params=("track_ids*",)),
@@ -892,6 +1139,9 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("artist.section", _artist_section, read=True, tidal=True,
             params=("id", "section", "limit")),
     Command("library.playlists", _library_playlists, read=True, tidal=True),
+    Command("library.favorites", _library_favorites, read=True, tidal=True, params=("kind",)),
+    Command("library.mixes", _library_mixes, read=True, tidal=True),
+    Command("mix.tracks", _mix_tracks, read=True, tidal=True, params=("id",)),
 )}
 
 AGENT_TOASTS = {
@@ -899,7 +1149,8 @@ AGENT_TOASTS = {
     "next": "next track", "prev": "previous track", "queue.play": "played from the queue",
     "queue.remove": "removed a queue entry", "play.track": "played a track",
     "play.album": "played an album", "play.playlist": "played a playlist",
-    "play.artist": "played an artist", "play.radio": "started radio", "like": "liked a track",
+    "play.artist": "played an artist", "play.mix": "played a mix",
+    "play.downloads": "played your downloads", "play.radio": "started radio", "like": "liked a track",
     "unlike": "unliked a track", "playlist.create": "created a playlist",
     "playlist.add": "added to a playlist", "playlist.remove": "removed from a playlist",
     "download": "started a download", "download.cancel": "cancelled the download",
@@ -965,20 +1216,12 @@ def _disk_downloads(cfg, args) -> dict:
 
 
 def _disk_search(cfg, args) -> dict:
-    query = str(args.get("query") or "").strip().lower()
+    query = str(args.get("query") or "").strip()
     if not query:
         raise CommandError("bad_args", "query must not be empty.")
-    cache = MetadataCache()
-    playlists = [{"id": _sid(pl), "name": pl.name} for pl in cache.get_playlists() or []
-                 if query in pl.name.lower()]
-    seen, tracks = set(), []
-    for _pid, record in cache.iter_tracks():
-        found = _record_json(record)
-        text = " ".join([found["title"] or "", *found["artists"]]).lower()
-        if query in text and found["id"] not in seen:
-            seen.add(found["id"])
-            tracks.append(found)
-    return {"playlists": playlists, "tracks": tracks, "source": "disk"}
+    found = local_search(MetadataCache(), query)
+    return {"playlists": [{"id": _sid(pl), "name": pl.name} for pl in found["playlists"]],
+            "tracks": [_track_json(t) for t in found["tracks"]], "source": "disk"}
 
 
 _DISK_READS = {

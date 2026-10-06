@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Optional
 
 from ticli.utils import throttle
-from ticli.utils.cache import CachedPlaylist, CachedTrack, _Named, playlist_record, track_record
+from ticli.utils.cache import (  # noqa: F401
+    SHIMS, CachedAlbum, CachedArtist, CachedPlaylist, CachedTrack, kind_of, record_of,
+)
 
 SOCKET_NAME = "player.sock"
 LOG_NAME = "player.log"
@@ -41,74 +43,13 @@ def log_path() -> Path:
 # ── TIDAL objects on the wire ──
 
 
-class RemoteAlbum:
-    cached = True
-    wire_kind = "album"
-    __slots__ = ("id", "name", "artist", "cover", "num_tracks")
-
-    def __init__(self, record: dict):
-        self.id = record.get("id")
-        self.name = record.get("name") or "?"
-        self.artist = _Named(record["artist"]) if record.get("artist") else None
-        self.cover = record.get("cover")
-        self.num_tracks = record.get("num_tracks") or 0
-
-
-class RemoteArtist:
-    cached = True
-    wire_kind = "artist"
-    __slots__ = ("id", "name")
-
-    def __init__(self, record: dict):
-        self.id = record.get("id")
-        self.name = record.get("name") or "?"
-
-
-_KINDS_BY_CLASS = {"Track": "track", "Video": "track", "Album": "album", "Artist": "artist",
-                   "Playlist": "playlist", "UserPlaylist": "playlist",
-                   "CachedTrack": "track", "CachedPlaylist": "playlist"}
-
-
-def kind_of(obj) -> Optional[str]:
-    kind = getattr(obj, "wire_kind", None) or _KINDS_BY_CLASS.get(type(obj).__name__)
-    if kind:
-        return kind
-    if hasattr(obj, "duration") and hasattr(obj, "artists"):
-        return "track"
-    if hasattr(obj, "num_tracks") and hasattr(obj, "artist"):
-        return "album"
-    if hasattr(obj, "num_tracks") or hasattr(obj, "creator"):
-        return "playlist"
-    if hasattr(obj, "id") and hasattr(obj, "name"):
-        return "artist"
-    return None
-
-
-def _is_editable(obj) -> bool:
-    return type(obj).__name__ == "UserPlaylist" or bool(getattr(obj, "editable", False))
-
-
-def record_of(kind: str, obj) -> dict:
-    if kind == "track":
-        return track_record(obj)
-    if kind == "playlist":
-        return playlist_record(obj, _is_editable(obj))
-    if kind == "album":
-        artist = getattr(obj, "artist", None)
-        return {"id": getattr(obj, "id", None), "name": getattr(obj, "name", None),
-                "artist": getattr(artist, "name", None) if artist else None,
-                "cover": getattr(obj, "cover", None) if isinstance(getattr(obj, "cover", None), str) else None,
-                "num_tracks": getattr(obj, "num_tracks", None)}
-    return {"id": getattr(obj, "id", None), "name": getattr(obj, "name", None)}
-
-
-_SHIMS = {"track": CachedTrack, "playlist": CachedPlaylist, "album": RemoteAlbum,
-          "artist": RemoteArtist}
+# The shims live in utils/cache.py: the metadata index stores the same flat records.
+RemoteAlbum, RemoteArtist = CachedAlbum, CachedArtist
 
 
 def _object_hook(data: dict):
     kind = data.get("_k")
-    shim = _SHIMS.get(kind) if isinstance(kind, str) else None
+    shim = SHIMS.get(kind) if isinstance(kind, str) else None
     return shim(data) if shim else data
 
 

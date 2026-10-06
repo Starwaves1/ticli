@@ -241,7 +241,7 @@ HIDE_HOLD_KEYS = frozenset({KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, " "})
 
 HIDE_HINT_RANK = 9
 
-from ticli.commands import HUMAN, Commands
+from ticli.commands import HUMAN, OFFLINE, ONLINE, SIGNED_OUT, Commands, auth_rejected
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
     PROTECTED_KEYS,
@@ -382,9 +382,14 @@ def _rate_limited(exc) -> bool:
 
 
 OFFLINE_MESSAGE = "couldn't reach TIDAL"
+NO_NETWORK_SIGN_IN = ("[red]Can't reach TIDAL to sign in.[/red] [dim]Signing in needs the network once; "
+                      "after that ticli starts offline and plays your downloads. Check the "
+                      "connection and run ticli again.[/dim]")
 
 
 def _play_failure_text(exc) -> str:
+    if isinstance(exc, _NoLocalCopy):
+        return str(exc)
     if is_transport_failure(exc):
         return f"Can't play — {OFFLINE_MESSAGE}"
     if _rate_limited(exc):
@@ -514,6 +519,13 @@ def _wire_job(job) -> Optional[dict]:
     if "slots" in plain:
         plain["slots"] = [{k: v for k, v in slot.items() if k != "mark"} for slot in plain["slots"]]
     return plain
+
+
+class _NoLocalCopy(Exception):
+    def __init__(self, track, connectivity: str):
+        name = getattr(track, "name", None) or "this track"
+        super().__init__(f'Signed out — "{name}" has no local copy; [o] to sign in again'
+                         if connectivity == SIGNED_OUT else f'Offline — "{name}" has no local copy')
 
 
 class _DownloadSuperseded(Exception):
@@ -1378,7 +1390,14 @@ class HeadlessTidalPlayer:
         self._quitting = False
         self._logged_out = False
         self.start_failure = None
+        # online / offline / signed_out, pushed to every client. Only an action that needs
+        # TIDAL tries to leave offline (ADR-0003); a dead token waits for a human sign-in.
+        self._connectivity = ONLINE
+        self._session_loaded = False
+        self._reconnect_lock = threading.Lock()
+        self._reconnect_tries = 0
         self.session = tidal_session()
+        self._watch_transport()
         flow = (login_flow or LOGIN_FLOWS[0]).lower()
         self._login_flow = flow if flow in LOGIN_FLOWS else LOGIN_FLOWS[0]
         self._live = None
@@ -1539,9 +1558,13 @@ class HeadlessTidalPlayer:
                 if self.session.check_login():
                     if self.session.access_token != previous_token:
                         self._save_session()
+                    self._session_loaded = True
                     self._user_display_name = self._get_user_display_name()
                     return True
             except Exception as e:
+                if not interactive and is_transport_failure(e):
+                    self._start_offline(data)
+                    return True
                 logger.debug("Failed to load saved session: %s", e)
 
         if not interactive:
@@ -1583,12 +1606,83 @@ class HeadlessTidalPlayer:
         except Exception as e:
             logger.warning("Failed to save session: %s", e)
 
+    def _start_offline(self, data: dict) -> None:
+        """No network at start: keep the stored tokens on the session and play what is on
+        disk. tidalapi can't make a content request from tokens alone (no countryCode until
+        GET /sessions answers), so `_reconnect` reloads before the first one."""
+        for field in ("token_type", "access_token", "refresh_token", "expiry_time"):
+            setattr(self.session, field, data.get(field))
+        self.session.is_pkce = bool(data.get("is_pkce", False))
+        self._session_loaded = False
+        self._connectivity = OFFLINE
+        user = self._read_state_dict().get("user")
+        self._user_display_name = user if isinstance(user, str) else ""
+        logger.warning("TIDAL unreachable at start; playing offline")
+
+    def _watch_transport(self) -> None:
+        http = vars(self.session).get("request_session")
+        if http is not None and hasattr(http, "on_transport_failure"):
+            http.on_transport_failure = self._went_offline
+
+    def _went_offline(self) -> None:
+        if self._connectivity != ONLINE:
+            return
+        self._connectivity = OFFLINE
+        self._set_toast("Offline — downloaded and cached music still plays",
+                        seconds=PLAYER_ERROR_SECONDS)
+        self._wake()
+
+    def _reconnect(self) -> str:
+        """Called only by an action that needs TIDAL, never a timer or probe (ADR-0003).
+        From offline: one `load_oauth_session` in flight; callers that arrive meanwhile
+        share its answer. A 401 is signed_out: the tokens stay and the player keeps
+        playing, never `_logout()` (it deletes them)."""
+        if self._connectivity != OFFLINE:
+            return self._connectivity
+        tries = self._reconnect_tries
+        with self._reconnect_lock:
+            if self._reconnect_tries != tries or self._connectivity != OFFLINE:
+                return self._connectivity
+            self._reconnect_tries += 1
+            data = load_tokens()
+            try:
+                if not data:
+                    raise RuntimeError("no stored login")
+                loaded = self.session.load_oauth_session(
+                    data["token_type"], data["access_token"], data.get("refresh_token"),
+                    data.get("expiry_time"), is_pkce=data.get("is_pkce", False))
+            except Exception as e:
+                if not data or auth_rejected(e):
+                    self._signed_out()
+                else:
+                    logger.debug("Still offline: %s", e)
+                return self._connectivity
+            if loaded is False:
+                self._signed_out()
+                return self._connectivity
+            if self.session.access_token != data.get("access_token"):
+                self._save_session()
+            self._session_loaded = True
+            self._connectivity = ONLINE
+            self._user_display_name = self._get_user_display_name()
+            self._set_toast("Back online")
+            self._load_favorites()
+            self._wake()
+            return ONLINE
+
+    def _signed_out(self) -> None:
+        self._connectivity = SIGNED_OUT
+        self._set_toast("Signed out by TIDAL: [o] to sign in again", seconds=PLAYER_ERROR_SECONDS)
+        self._wake()
+
     def _login_device(self) -> bool:
         self.console.print("[cyan]Starting TIDAL login...[/cyan]")
         try:
             login, future = self.session.login_oauth()
         except Exception as e:
             logger.debug("Device login failed to start: %s", type(e).__name__)
+            if is_transport_failure(e):
+                self.console.print(NO_NETWORK_SIGN_IN)
             return False
         self.console.print("\n[bold yellow]Open this URL to login:[/bold yellow]")
         self.console.print(f"[bold white]https://{login.verification_uri_complete}[/bold white]\n")
@@ -1636,6 +1730,9 @@ class HeadlessTidalPlayer:
             except Exception as e:
                 # Type only: the exception text can quote the pasted address (live auth code)
                 logger.debug("PKCE token exchange failed: %s", type(e).__name__)
+                if is_transport_failure(e):
+                    self.console.print(NO_NETWORK_SIGN_IN)
+                    return False
                 if remaining:
                     self.console.print(
                         f"[red]That didn't work.[/red] [dim]Copy the full address, "
@@ -1800,7 +1897,15 @@ class HeadlessTidalPlayer:
         self.session.load_oauth_session(
             data["token_type"], data["access_token"], data.get("refresh_token"),
             data.get("expiry_time"), is_pkce=data.get("is_pkce", False))
+        was = self._connectivity
+        self._session_loaded = True
+        self._connectivity = ONLINE
+        self._user_display_name = self._get_user_display_name()
         self._quality_ceiling = None
+        if was != ONLINE:
+            self._set_toast("Signed in again")
+            self._load_favorites()
+            return
         self._set_toast(
             "Signed in for higher quality — songs already cached still play "
             "as before; [x] clears them", seconds=6)
@@ -1832,6 +1937,7 @@ class HeadlessTidalPlayer:
             "ceiling": self._quality_ceiling,
             "badge": self._playing_badge,
             "user": self._user_display_name,
+            "connectivity": self._connectivity,
             "pkce": bool(getattr(self.session, "is_pkce", False)),
             "config": {k: v for k, v in self.config.items() if k not in PROTECTED_KEYS},
             "switches": {k: bool(coerce(get_spec(k), self.config.get(k))) for k in PROTECTED_KEYS},
@@ -1873,6 +1979,8 @@ class HeadlessTidalPlayer:
                 self._playing_badge = value
             elif key == "user":
                 self._user_display_name = value
+            elif key == "connectivity":
+                self._connectivity = value
             elif key == "config":
                 for name, setting in value.items():
                     if self.config.get(name) != setting:
@@ -1944,10 +2052,14 @@ class HeadlessTidalPlayer:
         self._wake()
 
     def _load_favorites(self):
+        if self._connectivity != ONLINE:
+            return
+
         def _run():
             try:
                 favs = self.session.user.favorites.tracks(limit=999)
                 self._liked_ids = {t.id for t in favs}
+                self._cache.put_items("favorites:tracks", favs)
             except Exception:
                 pass
         threading.Thread(target=_run, daemon=True).start()
@@ -2025,6 +2137,8 @@ class HeadlessTidalPlayer:
                 "position": self._get_position(),
                 "search_history": self._search_history[:200],
             }
+            if self._user_display_name:
+                state["user"] = self._user_display_name
             if self._last_playlist_id:
                 state["last_playlist_id"] = self._last_playlist_id
             self._write_state_file(state)
@@ -2093,6 +2207,9 @@ class HeadlessTidalPlayer:
                 if not (self.running and self._restore_pending):
                     abandoned = True
                     return None
+                if self._connectivity != ONLINE:
+                    offline = True
+                    return None
                 last_start = time.monotonic()
                 try:
                     return self.session.track(tid)
@@ -2156,7 +2273,8 @@ class HeadlessTidalPlayer:
                 logger.debug("Failed to restore player state: %s", e)
 
         threading.Thread(target=_run, daemon=True).start()
-    def _play_track(self, track: tidalapi.Track, seek: float = 0):
+    def _play_track(self, track: tidalapi.Track, seek: float = 0, automatic: bool = False):
+        """`automatic` (auto-advance, a vanished source) never reconnects (ADR-0003)."""
         self._track_changing = True
         self._play_gen = gen = self._play_gen + 1
         self._seek_target = None
@@ -2175,6 +2293,8 @@ class HeadlessTidalPlayer:
                 if local:
                     real, url, granted = track, "", None
                 else:
+                    if (self._connectivity if automatic else self._reconnect()) != ONLINE:
+                        raise _NoLocalCopy(track, self._connectivity)
                     # A cached row carries no stream URL; resolve it directly so a network
                     # failure propagates to the play-failure toast
                     real = self.session.track(track.id) if getattr(track, "cached", False) else track
@@ -2198,7 +2318,8 @@ class HeadlessTidalPlayer:
                 self._playing = True
                 self._play_start_time = time.time()
                 self._play_offset = seek
-                if local and getattr(track, "cached", False) and not artwork.cover_id_of(track):
+                if (local and getattr(track, "cached", False) and not artwork.cover_id_of(track)
+                        and self._connectivity == ONLINE):
                     self._resolve_for_artwork(track, gen)
             except backend_health.SpawnError as e:
                 if self._play_gen == gen:
@@ -2206,8 +2327,11 @@ class HeadlessTidalPlayer:
                     self._report_player_failure(e.failure)
             except Exception as e:
                 logger.warning("Could not play %s: %r", getattr(track, "id", None), e)
+                if is_transport_failure(e):
+                    self._went_offline()
                 if self._play_gen == gen:
                     self._playing = False
+                    self._play_start_time = None
                     self._set_toast(_play_failure_text(e), seconds=PLAYER_ERROR_SECONDS)
                     self._wake()
             finally:
@@ -2249,7 +2373,8 @@ class HeadlessTidalPlayer:
         cached = cached_audio_path(track_id) if self._cache.keeps_audio else None
         if cached:
             record = self._cache.audio_record(track_id) or {}
-            if self._tier_is_enough(record.get("quality")):
+            # Offline, a copy below the chosen tier beats silence.
+            if self._connectivity != ONLINE or self._tier_is_enough(record.get("quality")):
                 return cached, None
         return None, None
 
@@ -2282,7 +2407,7 @@ class HeadlessTidalPlayer:
         return url, granted
 
     def _maybe_prefetch_next(self):
-        if self._prefetch_id is not None or not self._playing:
+        if self._prefetch_id is not None or not self._playing or self._connectivity != ONLINE:
             return
         if not self._queue or self._queue_index >= len(self._queue) - 1:
             return
@@ -2358,13 +2483,45 @@ class HeadlessTidalPlayer:
             self._play_track(self._queue[index])
 
     def _next_track(self):
-        self._play_queue_index(self._queue_index + 1)
+        self._advance(1)
 
     def _prev_track(self):
         if self._current_track is not None and self._get_position() > PREV_RESTART_SECONDS:
             self._restart_current_track()
             return
-        self._play_queue_index(self._queue_index - 1)
+        self._advance(-1)
+
+    def _has_local_copy(self, track, owned: set) -> bool:
+        track_id = getattr(track, "id", None)
+        return str(track_id) in owned or (
+            self._cache.keeps_audio and cached_audio_path(track_id) is not None)
+
+    def _advance(self, step: int, automatic: bool = False) -> bool:
+        """Next/prev and auto-advance. Offline, entries with no local copy are skipped,
+        with one toast; nothing local left stops playback. Never reconnects."""
+        index = self._queue_index + step
+        if self._connectivity == ONLINE:
+            if not 0 <= index < len(self._queue):
+                return False
+            self._queue_index = index
+            self._play_track(self._queue[index], **({"automatic": True} if automatic else {}))
+            return True
+        owned = {row["id"] for row in downloads.present()}
+        skipped = 0
+        while 0 <= index < len(self._queue) and not self._has_local_copy(self._queue[index], owned):
+            index += step
+            skipped += 1
+        if not 0 <= index < len(self._queue):
+            if skipped:
+                self._set_toast("Offline — nothing further in the queue has a local copy",
+                                seconds=PLAYER_ERROR_SECONDS)
+            return False
+        if skipped:
+            self._set_toast(f"Offline — skipped {skipped} track{'' if skipped == 1 else 's'} "
+                            "with no local copy", seconds=PLAYER_ERROR_SECONDS)
+        self._queue_index = index
+        self._play_track(self._queue[index], **({"automatic": True} if automatic else {}))
+        return True
 
     def _restart_current_track(self):
         self._seek_target = None
@@ -2545,7 +2702,13 @@ class HeadlessTidalPlayer:
                         and self._track_has_time_left()):
                     # Cached file deleted between "it exists" and the player opening it: restart
                     # from the network. Not for a finished track (a cache clear leaves it gone too)
-                    self._play_track(self._current_track, seek=self._get_position())
+                    if self._connectivity == ONLINE:
+                        self._play_track(self._current_track, seek=self._get_position())
+                    else:
+                        self._playing = False
+                        self._play_start_time = None
+                        self._set_toast(f"Playback stopped — {OFFLINE_MESSAGE}",
+                                        seconds=PLAYER_ERROR_SECONDS)
                 elif self._stream_ended_early():
                     # Both backends play out their buffer and exit 0 with empty stderr on a dead
                     # source, indistinguishable from a finished song except by the clock. Stop and
@@ -2565,9 +2728,7 @@ class HeadlessTidalPlayer:
                     self._play_start_time = None
                     self._play_offset = position
                     self._report_player_failure(None)
-                elif self._queue and self._queue_index < len(self._queue) - 1:
-                    self._play_queue_index(self._queue_index + 1)
-                else:
+                elif not self._advance(1, automatic=True):
                     self._playing = False
                     self._play_start_time = None
                     self._play_offset = 0
@@ -4939,6 +5100,7 @@ class HeadlessTidalPlayer:
                     "Nothing will be retried.",
                     seconds=PLAYER_ERROR_SECONDS)
             elif run.offline:
+                self._went_offline()
                 _update(state="failed", error=OFFLINE_MESSAGE)
                 self._set_toast(f"Download stopped — {OFFLINE_MESSAGE}",
                                 seconds=PLAYER_ERROR_SECONDS)
@@ -5190,6 +5352,7 @@ class HeadlessTidalPlayer:
                     "Nothing will be retried.",
                     seconds=PLAYER_ERROR_SECONDS)
             elif run.offline:
+                self._went_offline()
                 _update(state="failed", error=OFFLINE_MESSAGE)
                 self._set_toast(f"Re-fetch stopped after {done} — {OFFLINE_MESSAGE}",
                                 seconds=PLAYER_ERROR_SECONDS)

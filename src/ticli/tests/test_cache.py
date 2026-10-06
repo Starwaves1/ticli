@@ -350,12 +350,12 @@ class TestRevalidation:
         _load_playlists(_player(session))
         assert session.list_calls == 2, "cache must never answer on its own"
 
-    def test_expired_entries_are_ignored(self, monkeypatch):
+    def test_nothing_expires(self, monkeypatch):
         cache = MetadataCache()
         cache.put("playlists", [{"id": "p1", "name": "Old"}])
-        later = time.time() + cache_mod.MAX_AGE_SECONDS + 1
+        later = time.time() + 400 * 24 * 3600
         monkeypatch.setattr(cache_mod.time, "time", lambda: later)
-        assert MetadataCache().get("playlists") is None
+        assert MetadataCache().get("playlists") == [{"id": "p1", "name": "Old"}]
 
     def test_opening_a_cached_row_gets_the_real_playlist(self):
         session = _FakeSession()
@@ -570,18 +570,12 @@ class TestBudget:
         assert not old.exists()
         assert new.exists()
 
-    def test_a_zero_budget_evicts_metadata_too(self):
+    def test_the_audio_budget_never_evicts_metadata(self):
         cache = MetadataCache(budget_gb=0)
         cache.put("playlist:p1", [{"id": 1, "name": "T"}])
-        cache.put("playlist:p2", [{"id": 2, "name": "U"}])
         cache.enforce_budget()
-        assert cache.total_bytes() == 0 or cache.get("playlist:p1") is None
-
-    def test_writing_enforces_the_budget_without_being_asked(self):
-        cache = MetadataCache(budget_gb=1)
-        self._audio_file(2_000_000, name="103")
-        cache.put("playlist:p1", [{"id": 1, "name": "T"}])
-        assert cache.total_bytes() <= 1024 * 1024
+        assert cache.total_bytes() == 0
+        assert cache.get("playlist:p1") == [{"id": 1, "name": "T"}]
 
     def test_lowering_the_setting_evicts_immediately(self):
         p = _player()

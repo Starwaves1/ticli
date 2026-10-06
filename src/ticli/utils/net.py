@@ -5,10 +5,17 @@ API_TIMEOUT = (5, 30)
 
 
 class TimeoutSession(requests.Session):
+    on_transport_failure = None  # the player's: any request that can't reach TIDAL means offline
+
     def request(self, method, url, **kwargs):
         if kwargs.get("timeout") is None:
             kwargs["timeout"] = API_TIMEOUT
-        return super().request(method, url, **kwargs)
+        try:
+            return super().request(method, url, **kwargs)
+        except requests.exceptions.ConnectionError as e:
+            if self.on_transport_failure is not None and is_transport_failure(e):
+                self.on_transport_failure()
+            raise
 
 
 def tidal_session():
