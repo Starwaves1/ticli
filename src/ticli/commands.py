@@ -695,7 +695,10 @@ def _download_delete(p, args) -> dict:
 
 
 def _refetch(p, args):
-    p._start_refetch_job(paced=_by_agent())
+    if _by_agent():
+        p._start_refetch_job(paced=True)
+    else:
+        p._start_refetch_job()
 
 
 def _refetch_cancel(p, args):
