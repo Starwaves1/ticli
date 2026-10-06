@@ -6,6 +6,7 @@ No TIDAL session or network anywhere: the artist is a fake that counts every
 endpoint it is asked for, and the config directory is redirected to tmp_path.
 """
 
+import threading
 import time
 import types
 
@@ -33,6 +34,38 @@ def _wait_for(cond, timeout=2.0):
             return True
         time.sleep(0.01)
     return False
+
+
+# A section that never answers while its test looks at it; released at teardown.
+_stalled = threading.Event()
+
+
+@pytest.fixture(autouse=True)
+def no_fetch_outlives_its_test(monkeypatch):
+    """Wait out every section fetch a test started. The cache resolves its
+    directory at write time, so a fetch still running when its test ends lands
+    in the next test's cache, and the page shows those rows as already cached."""
+    pending = []
+    real = HeadlessTidalPlayer._fetch
+
+    def fetch(self, command, args, done, known=()):
+        finished = threading.Event()
+        pending.append(finished)
+
+        def tracked(response):
+            try:
+                done(response)
+            finally:
+                finished.set()
+
+        real(self, command, args, tracked, known)
+
+    monkeypatch.setattr(HeadlessTidalPlayer, "_fetch", fetch)
+    _stalled.clear()
+    yield
+    _stalled.set()
+    for finished in pending:
+        finished.wait(10)
 
 
 @pytest.fixture
@@ -218,7 +251,7 @@ class TestStates:
     def test_loading_says_so(self, config_file):
         p = HeadlessTidalPlayer()
         blocked = _FakeArtist()
-        blocked.get_top_tracks = lambda limit=None, offset=0: time.sleep(5)
+        blocked.get_top_tracks = lambda limit=None, offset=0: _stalled.wait(5)
         p._open_artist(blocked)
         text = p._build_artist_display().plain
         assert "Loading top tracks" in text
@@ -311,7 +344,7 @@ class TestSections:
     def test_tab_works_while_a_section_is_loading(self, config_file):
         p = HeadlessTidalPlayer()
         slow = _FakeArtist()
-        slow.get_top_tracks = lambda limit=None, offset=0: time.sleep(5)
+        slow.get_top_tracks = lambda limit=None, offset=0: _stalled.wait(5)
         p._open_artist(slow)
         p._handle_key(KEY_TAB)
         assert p._artist_section == "albums"
@@ -484,7 +517,7 @@ class TestNoDeadEnds:
     def test_esc_leaves_a_loading_section(self, config_file):
         p = HeadlessTidalPlayer()
         slow = _FakeArtist()
-        slow.get_top_tracks = lambda limit=None, offset=0: time.sleep(5)
+        slow.get_top_tracks = lambda limit=None, offset=0: _stalled.wait(5)
         p._open_artist(slow)
         p._handle_key(KEY_ESC)
         assert p._mode == HeadlessTidalPlayer.MODE_PLAYER
