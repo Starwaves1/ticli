@@ -413,6 +413,12 @@ class TestAgentDocs:
 
         walk(agent_group, "ticli agent")
 
+    def test_every_registry_command_is_documented(self):
+        from ticli.commands import COMMANDS
+        docs = self._docs()
+        for name in COMMANDS:
+            assert f"(`{name}`)" in docs, f"undocumented command: {name}"
+
     def test_docs_carry_the_load_bearing_rules(self):
         """Not full prose assertions — the phrases an agent's behaviour
         hinges on: the trip procedure, the batching rule, what is not yet
@@ -420,7 +426,8 @@ class TestAgentDocs:
         docs = self._docs()
         assert "stop and report to the human" in docs   # the trip procedure
         assert "batch them, never add in a loop" in docs
-        assert "not in this surface yet" in docs         # playback honesty
+        assert "Ask your human; never edit config.json" in docs
+        assert "2 s apart" in docs and "ticli agent do" in docs
         assert "the only sanctioned path" in docs
         assert "Human-only" in docs                      # unblock ownership
 
@@ -469,11 +476,9 @@ class TestDocsGapFixes:
         runner = CliRunner()
         docs = runner.invoke(cli, ["agent", "docs"]).output
         assert "never auto-create" in docs           # sim 1: missing playlist
-        assert "no destructive verb" in docs         # sim 5: delete request
         assert "from your own tally" in docs         # sim 7: trip mid-task
         assert "it proves the login, not the audio" in docs  # sim 4: --verify
         assert "not_found" in docs                   # audit: error codes
-        assert "Also not here yet" in docs           # audit: browse/settings
 
 
 class TestPermissions:
@@ -547,7 +552,7 @@ class TestPermissions:
                                          "key_required": True}
 
     def test_docs_state_the_honour_system(self):
-        from ticli.agent_docs import DOCS
-        for phrase in ("Only the\nhuman can change them", "never edit `config.json`",
-                       "TICLI_AI_KEY", "ask\nyour human", "dangerous_off", "key_required"):
-            assert phrase in DOCS, phrase
+        from ticli.agent_docs import render
+        for phrase in ("Only the human can change them", "never edit config.json",
+                       "TICLI_AI_KEY", "Ask your human", "dangerous_off", "key_required"):
+            assert phrase in render(), phrase

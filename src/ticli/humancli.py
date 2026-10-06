@@ -12,7 +12,6 @@ import `ticli.player` at module level: `ticli --help` stays instant.
 
 import json
 import re
-import sys
 
 import click
 
@@ -285,7 +284,7 @@ def _ambiguous(kind: str, text: str, rows: list, example: str) -> Stop:
     who = caller()
     if who == AGENT:
         return Stop(refusal("ambiguous", f'"{text}" matches several {kind}s.',
-                            f"Pick one and run the command again with its id instead of the name.",
+                            "Pick one and run the command again with its id instead of the name.",
                             candidates=rows))
     shown = "\n".join(f'  {i}. {_named(r)}' for i, r in enumerate(rows, 1))
     return Stop(refusal("ambiguous", f'"{text}" matches several {kind}s:\n{shown}',

@@ -53,6 +53,21 @@ ticli
 
 On first run you'll get a URL to authorize with your TIDAL account. After that, your session is cached and you go straight to the player.
 
+## From the command line
+
+Verbs that talk to the running player, one line of output each (`ticli --help` lists them all):
+
+```bash
+ticli status | pause | resume | next | prev          # "nothing playing" if no player is running; never starts one
+ticli start playlist edm                             # play it, then open the TUI here (--no-tui: just play)
+ticli playlist create "Road trip"
+ticli playlist add "Road trip" "daft punk - one more time"
+ticli like                                           # the playing track
+ticli download https://tidal.com/browse/track/123
+```
+
+Playlist names match your own playlists case-insensitively with no TIDAL request, otherwise one TIDAL search; several matches print a numbered top 5 (`ticli start playlist 2` picks). A song is a track id, a TIDAL URL, `"artist - title"` (added only when the match is confident, otherwise you get candidates) or `current`. Dangerous verbs (deleting, clearing the cache, logout) ask y/N. Run without a terminal, a verb is treated as an AI agent and obeys the TUI's AI-control switches.
+
 ### Login, and where FLAC comes from
 
 Two sign-ins exist, and they are not equal:

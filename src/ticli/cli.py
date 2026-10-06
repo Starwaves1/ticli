@@ -228,8 +228,8 @@ def agent(ctx, key):
 def docs():
     """The complete contract, as markdown: every verb with its cost and JSON
     shape, the rate rules, and workflows. Read this before anything else."""
-    from ticli.agent_docs import DOCS
-    click.echo(DOCS, nl=False)
+    from ticli.agent_docs import render
+    click.echo(render(), nl=False)
 
 
 @agent.command()

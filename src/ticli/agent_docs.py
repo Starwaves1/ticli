@@ -1,231 +1,183 @@
-"""The text behind `ticli agent docs` — the complete contract for programs.
+"""The text behind `ticli agent docs`: the complete contract for programs.
 
-A plain module holding one string, so `ticli agent docs` costs an import of
-nothing but this file and stays instant. The single source of truth for how
-an agent uses ticli: README's Agents section and AGENTS.md point here rather
-than restating it, and a test walks the click group to assert every verb that
-exists is documented — the docs cannot silently fall behind the surface.
-
-The one deliberate exception to the agent surface's JSON contract: this verb
-prints markdown, because its consumer is a language model reading prose, not
-a program parsing fields. The contract section below says so out loud.
+Rendered, not stored: the verb list comes from the `ticli.commands` registry, so
+a new command shows up here with its cost and arguments and cannot go
+undocumented (a test requires every registry command to appear). Only the
+prose around it is written by hand. The one verb that prints markdown rather
+than JSON, because its reader is a language model.
 """
 
-DOCS = """\
-# ticli agent — the contract for programs
+# Agent verbs that predate the registry and keep their own names and keys.
+LEGACY_VERBS = {"library.playlists": "playlist list", "playlist.tracks": "playlist show"}
 
-ticli is a terminal music player for TIDAL; the TUI is the human's surface.
-`ticli agent` is yours: headless verbs that speak JSON, rate-limited in code.
-Everything you can do with ticli programmatically is on this page. If you are
-here to work on ticli's *source*, this is the wrong document — read
-`CLAUDE.md` in the repo first.
+HEAD = """\
+# ticli agent: the contract for programs
 
-## The contract
+ticli is a terminal music player for TIDAL; the TUI is the human's surface and
+`ticli agent` is yours: headless verbs that print JSON, paced in code. This page
+is everything you can do. To work on ticli's *source*, read `CLAUDE.md` instead.
 
-- Every verb prints **exactly one JSON object** on stdout, then exits.
-  Success: `{"ok": true, ...}`. Failure: `{"ok": false, "error": <code>,
-  "message": ..., "hint": ...}` with a nonzero exit code. stderr is for
-  humans; parse stdout only. (`docs` — this page — is the one exception:
-  it prints markdown, for you to read rather than parse.)
-- Error codes you must handle: `not_logged_in`, `rate_limited`,
-  `auth_failed`, `not_found` (a bad or stale id), `api_error` (anything
-  else), and the permission refusals below (`ai_control_off`,
-  `dangerous_off`, `key_required`, `wrong_key`). Each carries a `hint`
-  saying what to do.
-- Every verb's `--help` states its request cost. Budget before you loop:
-  requests are spaced ~2 seconds apart by a throttle you cannot bypass, so
-  20 resolves is ~40 seconds by design. Prefer verbs that answer in one
-  request over loops that ask in many.
+## Reply shape
 
-## The trip — read this before your first request
+Every verb prints **one JSON object** on stdout and exits (`docs` is markdown).
+```json
+{"ok": true, "result": {...},
+ "state": {"track": {"id": 1, "title": "T", "artist": "A", "pos": 12, "dur": 200},
+           "playing": true, "queue": {"len": 3, "index": 0},
+           "switches": {"ai": true, "dangerous": false}, "pending": 2},
+ "next": ["pause", "next", "queue list"],
+ "cost": {"requests": 1, "wait_s": 4.0, "eta_s": 10.0}}
+```
+- `state` is a snapshot after the call (`track` is null when nothing is loaded;
+  `pending` appears only while agent commands wait). `next` is up to 5 verbs
+  that apply right now. `cost`: TIDAL `requests` used, `wait_s` you waited in
+  the queue, `eta_s` until the last queued command finishes. Track durations
+  are `duration_seconds` everywhere (`dur` in `state`).
+- Failure: `{"ok": false, "code", "reason", "fix"}` and exit 1. Codes:
+  `ai_control_off`, `dangerous_off`, `key_required`, `wrong_key` (permissions),
+  `rate_limited`, `not_logged_in`, `auth_failed`, `not_found` (stale or wrong
+  id), `stale` (the queue moved; the reply carries the current `queue`),
+  `bad_args`, `empty`, `no_track`, `human_only`, `api_error`,
+  `player_unavailable`. Act on `fix`. The original verbs (`search`, `resolve`,
+  `playlist ...`) also keep `error`, `message`, `hint`, and their own result keys.
+- Arguments are positional in the order shown below, `key=value`, or one JSON
+  object. Ids are what verbs take: get them from `search`, `resolve`, `playlist list`.
 
-TIDAL rate-limits by IP, and a block stops the *owner's music*, not just
-your call. The throttle spaces requests automatically; you never wait or
-pace by hand. But if TIDAL answers 429 or flags the session, the surface
-**trips**: every agent request from every process fails fast with
-`"error": "rate_limited"` until a human clears it.
+## The queue: pacing, ETAs, coalescing
 
-When you see `rate_limited`: **stop and report to the human.** That is the
-entire procedure. Clearing the trip is `ticli agent unblock`, and it is the
-human's command to run after investigating — a trip cleared on a guess gets
-the IP banned for longer. Tripped mid-task: report what completed and what
-was still pending from your own tally of the responses you already have —
-spend nothing trying to reconcile, and leave finishing for after the human
-clears it.
+Every verb that reaches TIDAL waits in one queue in the player, shared by all
+agents, **requests 2 s apart**; you never pace by hand and cannot bypass it.
+- **Reads** (`search`, `resolve`, `playlist list/show`, `album tracks`,
+  `artist section`) block until answered and return the data; `cost.wait_s` is
+  what the queue made them wait.
+- **Actions** (play, like, playlist add, download...) answer at once with
+  `result.queued` (position) and `result.job`; `cost.eta_s` is when the last
+  one should finish. `ticli agent status` lists `pending` and recent `done`.
+- **Local** commands (pause, queue edits, settings reads) cost 0 requests and
+  run at once.
+- **Coalescing**: waiting adds to one playlist merge into one add (up to 100 ids
+  per request, plus TIDAL's re-read: 2 requests for 1-100 ids); waiting likes
+  merge too. The reply says so in `result.merged`. So **batch them, never add
+  in a loop**.
+- **`ticli agent do`** runs a JSON array in order with one combined reply, local
+  commands first, TIDAL ones queued together so they coalesce:
+  `ticli agent do '["playlist add ID 1 2", "like 3", "queue list"]'` (or the
+  array on stdin; items may be `{"cmd": "playlist.add", "args": {...}}`). A
+  failing item skips the rest (`"code": "skipped"`).
+- Queue entries: pass the `track_id` you saw with the index
+  (`queue remove 2 TRACK_ID`); if the queue moved you get `stale`, not another track.
 
-## Permissions — your human decides, you ask
+## The trip
 
-Three switches in ticli's TUI settings decide what you may do. **Only the
-human can change them**, by keypress in the TUI. No command or verb can
-change them, and you must never edit `config.json`, write ticli's files or
-pretend to be the TUI to get around them. Any change shows up in the TUI.
+TIDAL rate-limits by IP; a block stops the owner's music too. On a 429 or
+bot-detection response everything agent-side trips and fails fast with
+`rate_limited`. Then stop and report to the human, from your own tally of
+what already completed; spend nothing reconciling. `ticli agent unblock` is
+Human-only: it refuses without a terminal. Never retry; retries extend the block.
 
-- **Allow AI control** (on by default). Off: every action is refused with
-  `ai_control_off`; reads (`status`, `playlist list`, `search`, `queue list`,
-  `download list`, `settings get`) answer from what is saved on disk
-  (`"source": "disk"`), with 0 requests and without starting the player.
-- **Allow dangerous commands** (off by default). Dangerous: deleting or
-  renaming a playlist, removing tracks from one, deleting downloads,
-  clearing the cache, lowering the cache budget, logging out, changing the
-  login flow. Refused with `dangerous_off`.
-- **AI control key** (unset by default). Set: every verb except `status`
-  needs it, via `TICLI_AI_KEY` or `ticli agent --key KEY <verb>`. Missing →
-  `key_required`; wrong → `wrong_key`, after a 1 s delay. Do not guess.
+## Permissions: your human decides, you ask
 
-`status` reports all three as `ai_control`. On any refusal: stop and ask
-your human, quoting the refusal's `hint`. That is the whole procedure.
+Three switches in ticli's TUI settings. **Only the human can change them**:
+no command or verb can. **Ask your human; never edit config.json, write ticli's
+files or impersonate the TUI.** Changes show in the TUI.
+- **Allow AI control** (on by default). Off: actions are refused with
+  `ai_control_off`; reads (`status`, `queue list`, `download list`,
+  `settings get`, `playlist list`, `search` over your own playlists) answer from
+  disk, 0 requests, `"source": "disk"`, and never start the player.
+- **Allow dangerous commands** (off by default): deleting playlists or
+  downloads, removing playlist tracks, clearing the cache, lowering the cache
+  budget, logout, changing the login flow. Refused with `dangerous_off`.
+- **AI control key** (unset by default). Set: every verb except `status` needs
+  it via `TICLI_AI_KEY` or `ticli agent --key KEY <verb>`; wrong keys cost 1 s.
+On any refusal quote its `fix` to your human and stop.
 
-## Through the player
-
-Every verb except `docs`, `status` and `unblock` runs inside ticli's
-background player, which the verb starts if it isn't running. Every agent
-command that reaches TIDAL waits in one queue, in arrival order across all
-agents, requests 2 s apart. **Reads** (search, resolve, playlist list/show,
-queue list) wait their turn and answer with the data. **Actions** (play,
-next, playlist add, like, download...) answer at once with `"queued"`
-(position) and `"job"`; `cost.eta_s` says when the last one queued should
-be done. Local commands (pause, queue edits, settings) cost 0 requests.
-
-Waiting adds to one playlist merge into one request (up to 100 ids per
-request, plus TIDAL's re-read: 2 requests for 1-100 ids), and waiting likes
-into one; the reply says so in `"merged"`. So batch them, never add in a
-loop: `ticli agent do '["playlist add ID 1 2", "like 3"]'` (or the JSON
-array on stdin, or `{"cmd": "playlist.add", "args": {...}}` items) runs a
-batch in order with one combined reply.
-
-Replies also carry `state` (now playing, playing, queue, switches),
-`next` (up to 5 verbs that apply now) and `cost` (`requests`, `wait_s`,
-`eta_s`). Errors are `{"ok": false, "code", "reason", "fix"}`; the
-original verbs also keep `error`, `message` and `hint`. `playlist add` no
-longer reports `added` (it is queued, so not known yet): check with
-`playlist show`. `status` lists `pending` and `done` jobs while the player
-runs. Every player command is a verb — `ticli agent --help` lists them;
-arguments are positional, `key=value`, or one JSON object.
+`ticli <verb>` (no `agent`) without a terminal on stdin is treated as you too:
+same switches and key, readable text output, and it accepts names and songs
+(a playlist name from your own playlists, a TIDAL URL, `"artist - title"`,
+`current`); ambiguous ones return `candidates` with ids as JSON.
 
 ## Verbs
+"""
 
-### `ticli agent docs` — 0 requests
-This page. The one verb that prints markdown instead of JSON, because its
-consumer is you, reading — not a program, parsing.
-
-### `ticli agent status` — 0 requests
-Where everything stands, for free. Run it first when unsure of the setup.
-```json
-{"ok": true, "ai_control": {"allow_ai_control": true,
- "allow_dangerous_commands": false, "key_required": false},
- "session_stored": true, "flow": "pkce", "flac_capable": true,
- "player_running": true,
- "throttle": {"min_interval_seconds": 2.0, "tripped": null}}
-```
-`flow` is `"pkce"` (entitled to FLAC), `"device"` (AAC only — TIDAL
-silently downgrades lossless requests from it), or `null` when no session
-is stored (then `flac_capable` is `false` and stays honest). `player_running`
-means the human's TUI holds the instance lock right now. `--verify` spends
-1 request confirming the session actually works and adds `"verified":
-true|false` to the output — it proves the login, not the audio: what codec
-a live stream actually granted is only observable in the TUI's quality
-badge, so answer entitlement questions from `flow`/`flac_capable` and say
-that distinction if the human asks about the bytes.
-
-### `ticli agent resolve --artist A --title T [--limit N]` — 1 request
-**The verb for "the user named a song."** Searches once, ranks locally
-(`--limit` candidates, default 10), answers with a best pick and a strict
-`confident` flag.
-```json
-{"ok": true, "artist": "Folamour", "title": "The Journey", "confident": true,
- "best": {"id": 176427254, "title": "The Journey (feat. Zeke Manyika)",
-          "artists": ["Folamour", "Zeke Manyika"], "album": "The Journey",
-          "duration_seconds": 262, "explicit": false,
-          "artist_match": true, "title_exact": true,
-          "unrequested_qualifier": false, "score": 2},
- "candidates": [ ...same shape, ranked... ]}
-```
-The ranking rules, so you can trust them: artist is a **gate** — a
-wrong-artist candidate never outranks a right-artist one, however exact its
-title. Remixes/edits/live versions you did not ask for are demoted and
-labeled (`unrequested_qualifier`), but still returned when they are all
-there is. `feat.` credits are ignored in matching — a featured guest is the
-same recording. `confident` means: right artist, exact title, no
-unrequested qualifier. Anything less is your judgement call, and the ranked
-`candidates` list is there for you to make it — or to put to the human.
-
-### `ticli agent search QUERY [--type track|album|artist|playlist] [--limit N]` — 1 request
-Raw search when resolve's artist+title shape doesn't fit (browsing, albums,
-finding a playlist on TIDAL). `--type` repeats; one request however many
-types. Default: tracks, limit 10. Output: `{"ok": true, "query": "...",
-"tracks": [...], "albums": [...]}` — only the types you asked for. Tracks
-are resolve's shape minus the ranking fields; albums are `{id, title,
-artists, num_tracks, year}`; artists `{id, name}`; playlists `{id, name,
-num_tracks, description}`.
-
-### `ticli agent playlist list` — 1 request
-All of the user's playlists: `{"ok": true, "playlists": [{"id": "...",
-"name": "...", "num_tracks": 14, "description": ""}]}`. To find one by
-name, list and match locally — case-insensitive; if more than one matches,
-ask the human rather than guessing.
-
-### `ticli agent playlist show ID` — 2 requests
-One playlist and its tracks: `{"ok": true, "playlist": {...},
-"tracks": [...]}`.
-
-### `ticli agent playlist create NAME [--description D]` — 1 request
-Creates empty; answers `{"ok": true, "playlist": {"id": ...}}`. The id is
-what `add` needs — capture it.
-
-### `ticli agent playlist add ID TRACK_ID...` — 2 requests
-However many ids, one add — **batch them, never add in a loop.** The server
-skips duplicates; `{"ok": true, "playlist_id": "...", "requested": 5,
-"added": 5}` tells you what it actually took.
-
-There is no `playlist delete`, no track removal, no destructive verb of any
-kind in this surface yet; when they come they will need the human's "Allow
-dangerous commands". Asked to delete a playlist or remove tracks: report
-that it is done in the TUI (`x` on the track, with a confirmation). Do not
-go looking for another way.
-
-### `ticli agent unblock` — 0 requests
-Clears a trip. **Human-only** — see The trip above. Present it to the user
-as the command *they* run; do not run it for them. Without a terminal on
-stdin it refuses with `human_only`.
-
+TAIL = """
 ## Workflows
 
-**The user names songs; you build a playlist.** resolve each song →
-`playlist create` → one `playlist add` with every id. Done means: every
-track you added came from a `confident` resolve or an explicit human choice
-from `candidates`; anything else you report by name, with what you picked
-instead or why you skipped it. N songs is N+2 requests ≈ 2(N+2) seconds —
-say so if the list is long.
+**The user names songs; you build a playlist.** `resolve` each song, `playlist
+create`, then one `playlist add` with every id (or one `do`). Add only what a
+`confident` resolve returned or the human chose from `candidates`; report the
+rest by name. N songs is about N+2 requests, 2 s each: say so for long lists.
+`resolve` ranks strictly: the artist is a gate, unrequested remixes/live
+versions are demoted (`unrequested_qualifier`), `feat.` credits are ignored;
+`confident` means right artist, exact title, no unrequested qualifier.
 
-**"Add this to my X playlist."** `playlist list` → match X locally →
-resolve the song → `add`. Ambiguous name or non-confident resolve: ask,
-with the candidates. No playlist matches X at all: ask before creating
-one — never auto-create a playlist the user referred to as existing.
+**"Add this to my X playlist."** `playlist list`, match X case-insensitively;
+more than one match or no match: ask. Ask first; never auto-create a playlist the user called existing.
 
-**"What's my setup / can I get FLAC?"** `status`, free. `flac_capable`
-false → the fix is the human running `ticli` and pressing `u` on the
-settings page (PKCE sign-in).
-
-**Anything that touches playback** — play, pause, skip, queue, volume,
-what's playing, downloads, favorites, radio: **not in this surface yet.**
-Say it is not yet supported and point at the TUI; the running player is the
-human's. (Control of the live player is planned, not built yet.) The one
-thing you *can* see
-is `status`'s `player_running` boolean.
-
-Also not here yet: **browsing** (an album's track list, an artist's page —
-`search` returns albums and artists but nothing opens them) and **settings**
-(quality, cache, artwork — TUI-only). Same procedure: say so, point at the
-TUI.
+**Setup questions.** `status` is free: `flow` is `pkce` (FLAC) or `device`
+(AAC only); `flac_capable` false means the human presses `u` in TUI settings.
 
 ## Ground rules
 
-- This surface is the only sanctioned path. Importing ticli's internals or
-  calling TIDAL's API directly bypasses the throttle and is how the owner's
-  IP got blocked; if a task seems to need it, the task is out of scope —
-  report that instead.
-- Playlists you create are real TIDAL playlists, visible in the TUI
-  (`p`) and every TIDAL app, immediately.
-- The TUI and this surface share one login. Never touch the credential
-  store; `not_logged_in` means the human runs `ticli`, nothing else.
+- This is the only sanctioned path. Importing ticli's internals or calling
+  TIDAL directly bypasses the pacing and got the owner's IP blocked.
+- Playlists you create are real TIDAL playlists, visible everywhere at once.
+- One login is shared with the TUI. Never touch the credential store;
+  `not_logged_in` means the human runs `ticli`.
 """
+
+STATUS = """
+### `ticli agent status` — 0 requests
+Setup and what is happening, free, never starts the player. Always answers,
+even with a key set or AI control off.
+```json
+{"ok": true, "ai_control": {"allow_ai_control": true, "allow_dangerous_commands": false,
+ "key_required": false}, "session_stored": true, "flow": "pkce", "flac_capable": true,
+ "player_running": true, "throttle": {"min_interval_seconds": 2.0, "tripped": null},
+ "state": {...}, "pending": [...], "done": [...]}
+```
+`--verify` spends 1 request to confirm the login works (`"verified"`); it proves the login, not the audio.
+"""
+
+LEGACY = """
+### `ticli agent resolve --artist A --title T [--limit N]` — 1 request
+THE verb for "the user named a song". Answers `{"confident": bool, "best": {...},
+"candidates": [...]}`; candidates are `{id, title, artists, album,
+duration_seconds, explicit, artist_match, title_exact, unrequested_qualifier, score}`.
+
+### `ticli agent search QUERY [--type track|album|artist|playlist] [--limit N]` — 1 request
+One request however many `--type`. Output `{"query", "tracks": [...], ...}`: tracks as
+above minus ranking; albums `{id, title, artists, num_tracks, year}`; artists
+`{id, name}`; playlists `{id, name, num_tracks, description}`.
+
+### `ticli agent playlist list|show|create|add`
+`playlist list` (1 request) `{"playlists": [...]}`; `playlist show ID` (2)
+`{"playlist", "tracks"}`; `playlist create NAME [--description D]` (1) answers
+`{"playlist": {"id"}}`, capture the id; `playlist add ID TRACK_ID...` is queued
+and coalesced (2 requests per 100 ids); the reply has `requested`, `queued`, no
+`added` (not known yet): check with `playlist show`.
+
+### `ticli agent docs`, `ticli agent do`, `ticli agent unblock`
+`docs` prints this page (0 requests, markdown). `do` is described above.
+`unblock` is Human-only.
+"""
+
+
+def _cost(spec) -> str:
+    if not spec.tidal:
+        return "0 requests, at once"
+    return "1+ requests, waits its turn, returns data" if spec.read \
+        else "queued, answers at once with position and ETA"
+
+
+def _row(name, spec) -> str:
+    verb = LEGACY_VERBS.get(name, name.replace(".", " "))
+    args = " ".join(f"[{p[:-1]}...]" if p.endswith("*") else f"[{p}]" for p in spec.params)
+    flags = " **DANGEROUS** (needs that switch)" if spec.dangerous else ""
+    return (f"- `ticli agent {verb}{' ' + args if args else ''}` (`{name}`): {_cost(spec)}{flags}")
+
+
+def render() -> str:
+    from ticli.commands import COMMANDS
+    rows = "\n".join(_row(name, spec) for name, spec in COMMANDS.items())
+    return (HEAD + "\nEvery command, generated from the registry. Arguments in order;"
+            " `[x...]` takes several.\n\n" + rows + "\n" + STATUS + LEGACY + TAIL)
