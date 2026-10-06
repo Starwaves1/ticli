@@ -289,7 +289,7 @@ class TestPlayTrackOffUiThread:
         track.get_url = boom
         p._play_track(track)
         deadline = time.monotonic() + 2
-        while p._playing and time.monotonic() < deadline:
+        while (p._playing or p._track_changing) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert p._playing is False
         assert p._track_changing is False
