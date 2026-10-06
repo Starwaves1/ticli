@@ -41,6 +41,8 @@ class _Client:
         self.outbuf = bytearray()
         self.subscribed = False
         self.writing = False
+        self.jobs: collections.deque = collections.deque()
+        self.working = False
 
 
 class PlayerServer:
@@ -57,6 +59,7 @@ class PlayerServer:
         self._posted = collections.deque()
         self._agent_jobs: "queue.Queue" = queue.Queue()
         self._agent_worker: Optional[threading.Thread] = None
+        self._jobs_lock = threading.Lock()
         self.wake_r, self.wake_w = os.pipe()
         os.set_blocking(self.wake_r, False)
         core._wake_r, core._wake_w = self.wake_r, self.wake_w
@@ -256,10 +259,34 @@ class PlayerServer:
         elif spec is not None and spec.read and spec.tidal:
             threading.Thread(target=self._run_posted, args=(client, rid, cmd, args, caller, key),
                              daemon=True).start()
-        else:
+        elif not self._queue_job(client, (rid, cmd, args, caller, key),
+                                 spec is not None and spec.tidal):
+            self._deliver_posted()
             response = self._execute(cmd, args, caller, key)
             self.broadcast()
             self._reply(client, rid, response)
+
+    def _queue_job(self, client: _Client, job: tuple, tidal: bool) -> bool:
+        """A TIDAL call must not freeze the loop for every client: it runs on this
+        client's worker, and the client's later requests queue behind it in order."""
+        with self._jobs_lock:
+            if not (tidal or client.working):
+                return False
+            client.jobs.append(job)
+            if client.working:
+                return True
+            client.working = True
+        threading.Thread(target=self._work, args=(client,), daemon=True).start()
+        return True
+
+    def _work(self, client: _Client) -> None:
+        while True:
+            with self._jobs_lock:
+                if not client.jobs:
+                    client.working = False
+                    return
+                rid, cmd, args, caller, key = client.jobs.popleft()
+            self._run_posted(client, rid, cmd, args, caller, key)
 
     def _execute(self, cmd, args, caller, key) -> dict:
         try:

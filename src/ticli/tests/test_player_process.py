@@ -281,6 +281,52 @@ class TestBrowsingThroughThePlayer:
         assert removed == [1]
 
 
+class _SlowLookup:
+    is_pkce = False
+
+    def __init__(self):
+        self.release = threading.Event()
+
+    def track(self, tid):
+        assert self.release.wait(5)
+        return _track(tid)
+
+    def __getattr__(self, name):
+        raise AssertionError(f"request attempted: {name}")
+
+
+class TestSlowTidal:
+    def _slow(self, running):
+        core = _core(playing=True)
+        core.session = _SlowLookup()
+        running(core)
+        return core
+
+    def test_a_slow_lookup_does_not_hold_up_other_clients(self, running):
+        core = self._slow(running)
+        a, b = ipc.connect(), ipc.connect()
+        played = a.send("play.track", {"track_id": 999})
+        try:
+            started = time.monotonic()
+            assert b.request("pause", timeout=2)["ok"] is True
+            assert time.monotonic() - started < 0.5
+            assert core._playing is False
+        finally:
+            core.session.release.set()
+        assert a.wait_for(played, timeout=3)["ok"] is True
+        assert core._current_track.id == 999
+
+    def test_one_clients_answers_and_actions_keep_their_order(self, running):
+        core = self._slow(running)
+        a = ipc.connect()
+        played = a.send("play.track", {"track_id": 999})
+        paused = a.send("pause")
+        core.session.release.set()
+        assert a.wait_for(paused, timeout=3)["ok"] is True
+        assert [m.get("id") for m in a.held if "id" in m] == [played], "play answered first"
+        assert core._current_track.id == 999 and core._playing is False
+
+
 class TestAgentGateOverTheSocket:
     def test_ai_control_off_refuses_agent_actions(self, running):
         core = _core()
