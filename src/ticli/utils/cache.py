@@ -160,6 +160,14 @@ class _Named:
         self.name = name
 
 
+class _Album(_Named):
+    __slots__ = ("cover",)
+
+    def __init__(self, name, cover=None):
+        super().__init__(name)
+        self.cover = cover
+
+
 def _clean_str(value):
     """A non-empty str, or None. Anything else is corruption, not a value."""
     return value if isinstance(value, str) and value else None
@@ -175,8 +183,8 @@ def _clean_number(value):
 class CachedTrack:
     """A track as far as a list row is concerned. Never raises: `name` a
     non-empty str (else "?"), `duration` a number (else 0), `artists` a list of
-    `_Named` from the non-empty str elements only, `album` a `_Named` or None.
-    `id` is kept verbatim."""
+    `_Named` from the non-empty str elements only, `album` an `_Album` (its
+    `cover` a str or None) or None. `id` is kept verbatim."""
 
     cached = True
     __slots__ = ("id", "name", "duration", "artists", "album")
@@ -192,7 +200,7 @@ class CachedTrack:
                         for artist in (artists if isinstance(artists, list) else [])
                         if _clean_str(artist)]
         album = _clean_str(record.get("album"))
-        self.album = _Named(album) if album else None
+        self.album = _Album(album, _clean_str(record.get("cover"))) if album else None
 
 
 class CachedPlaylist:
@@ -224,6 +232,7 @@ def track_record(track) -> dict:
         "duration": getattr(track, "duration", None),
         "artists": artists,
         "album": getattr(album, "name", None) if album else None,
+        "cover": _clean_str(getattr(album, "cover", None)) if album else None,
     }
 
 

@@ -1847,24 +1847,24 @@ class HeadlessTidalPlayer:
 
         def _run():
             try:
-                # A cached row carries no stream URL; resolve to the real track first
-                real = self._resolve_track(track)
-                if real is None:
-                    if self._play_gen == gen:
-                        self._playing = False
-                    return
-                if real is not track:
-                    queue = self._queue
-                    if track in queue:
-                        self._queue = [real if t is track else t for t in queue]
-                    if self._play_gen == gen:
-                        self._current_track = real
-                # Look for a local copy before asking for the stream URL: replaying a cached
-                # playlist spent a playbackinfo request per track, which got the owner blocked
-                local, badge = self._local_source(real)
+                # Look for a local copy before resolving a cached row or asking for the stream URL:
+                # replaying a cached playlist spent a playbackinfo request per track, which got
+                # the owner blocked, and a row with a file on disk must play with no network
+                local, badge = self._local_source(track)
                 if local:
-                    url, granted = "", None
+                    real, url, granted = track, "", None
                 else:
+                    real = self._resolve_track(track)
+                    if real is None:
+                        if self._play_gen == gen:
+                            self._playing = False
+                        return
+                    if real is not track:
+                        queue = self._queue
+                        if track in queue:
+                            self._queue = [real if t is track else t for t in queue]
+                        if self._play_gen == gen:
+                            self._current_track = real
                     url, granted = (self._take_prefetched(real.id)
                                     or self._stream_description(real))
                 if self._play_gen != gen or not self._playing:

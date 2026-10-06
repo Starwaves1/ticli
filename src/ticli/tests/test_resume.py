@@ -570,7 +570,7 @@ class TestRecordRestore:
         p._save_state()
         saved = json.loads(state_file.read_text())
         assert saved["tracks"] == [{"id": 1, "name": "Track 1", "duration": 0,
-                                    "artists": [], "album": None}]
+                                    "artists": [], "album": None, "cover": None}]
         assert saved["track_ids"] == [1]
 
     def test_a_corrupt_artists_field_neither_crashes_the_restore_nor_the_frame(self, tmp_path, monkeypatch):
@@ -599,7 +599,7 @@ class TestRecordRestore:
         p._save_state()
         saved = json.loads(state_file.read_text())
         assert saved["tracks"] == [{"id": 1, "name": "?", "duration": 200,
-                                    "artists": [], "album": None}]
+                                    "artists": [], "album": None, "cover": None}]
 
     def test_a_record_file_with_a_rowless_dict_falls_back_to_the_ids(self, tmp_path, monkeypatch):
         """A "tracks" entry that is not usable (a row without an id) must not
@@ -678,7 +678,7 @@ class TestRecordRoundTrip:
         assert on_disk["track_ids"] == [1, 2, 3]  # the legacy build's format
         assert on_disk["tracks"][2] == {
             "id": 3, "name": "Track 3", "duration": 203,
-            "artists": ["Artist 3"], "album": "Album 3",
+            "artists": ["Artist 3"], "album": "Album 3", "cover": None,
         }
 
         fresh = self._player()
