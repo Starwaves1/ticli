@@ -38,6 +38,22 @@ from ticli.utils import downloads as downloads_mod
 from ticli.utils import throttle as throttle_mod
 
 
+@pytest.fixture(autouse=True, scope="session")
+def never_the_real_dirs_after_teardown(tmp_path_factory):
+    """A thread a test leaves running outlives that test's monkeypatch, so the
+    per-test fixtures below must restore to a scratch directory, never the real one."""
+    base = tmp_path_factory.mktemp("after-teardown")
+    mp = pytest.MonkeyPatch()
+    from ticli.utils import cache as cache_mod
+    mp.setattr(cache_mod, "CACHE_DIR", base / "cache")
+    mp.setattr(downloads_mod, "DOWNLOAD_ROOT", base / "Music")
+    mp.setattr(player_mod, "STATE_DIR", base / "state")
+    mp.setattr(player_mod, "STATE_FILE", base / "state" / "player_state.json")
+    mp.setattr(throttle_mod, "STATE_DIR", base / "state")
+    mp.setattr(config_mod, "CONFIG_DIR", base / "config")
+    mp.setattr(config_mod, "CONFIG_FILE", base / "config" / "config.json")
+
+
 @pytest.fixture(autouse=True)
 def never_the_real_music_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(downloads_mod, "DOWNLOAD_ROOT", tmp_path / "Music" / "Ticli")
