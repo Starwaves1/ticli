@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import shutil
@@ -262,6 +263,7 @@ from ticli.utils.cache import (
     track_record,
 )
 from ticli.utils import artwork, backend_health, downloads, tags
+from ticli.utils.net import is_transport_failure, tidal_session
 
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
@@ -337,8 +339,10 @@ WORKER_POLL_SECONDS = 0.05
 RATE_SAMPLES = 3
 
 # On these, stop all requests and report; never retry (docs/adr/0001-tidal-rate-limits.md).
-RATE_LIMIT_SIGNS = ("429", "too many requests", "4006",
-                    "does not have streaming privileges")
+# Bare codes only as whole tokens: a URL in a network error carries track ids like 154291836.
+RATE_LIMIT_SIGNS = re.compile(
+    r"(?<![\w/=-])(?:429|4006)(?![\w/=-])|too many requests|does not have streaming privileges",
+    re.IGNORECASE)
 
 
 def _rough_minutes(tracks: int) -> str:
@@ -353,8 +357,33 @@ def _rough_minutes(tracks: int) -> str:
 
 
 def _looks_rate_limited(message: str) -> bool:
-    lowered = (message or "").lower()
-    return any(sign in lowered for sign in RATE_LIMIT_SIGNS)
+    return bool(RATE_LIMIT_SIGNS.search(message or ""))
+
+
+def _rate_limited(exc) -> bool:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 429:
+        return True
+    if status == 401:
+        # tidalapi's HTTPError text is "401 Client Error: Unauthorized"; the 4006 is only in the body.
+        try:
+            if response.json().get("subStatus") == 4006:
+                return True
+        except Exception:
+            pass
+    return _looks_rate_limited(str(exc))
+
+
+OFFLINE_MESSAGE = "couldn't reach TIDAL"
+
+
+def _play_failure_text(exc) -> str:
+    if is_transport_failure(exc):
+        return f"Can't play — {OFFLINE_MESSAGE}"
+    if _rate_limited(exc):
+        return "TIDAL is rate-limiting — playback stopped. Nothing will be retried."
+    return f"Couldn't start the track — {type(exc).__name__}: {str(exc)[:PLAYER_ERROR_CHARS]}"
 
 
 def _restore_sleep(seconds: float) -> None:
@@ -521,6 +550,8 @@ class _PacedRun:
         self._written = 0
         self.consumed = 0
         self.closed = False
+        self.offline = ""
+        self._stopped_by = ""
 
     def run(self) -> tuple:
         threads: dict = {}
@@ -535,12 +566,15 @@ class _PacedRun:
                 if slot is None:
                     return None
                 blocked = self._blocked()
-                if blocked:
+                if blocked or self.offline:
                     break
                 if self.clock[0] is not None:
                     self._pace(self.clock[0])
                     if not self.alive():
                         return None
+                    blocked = self._blocked()
+                    if blocked or self.offline:
+                        break
                 self.clock[0] = time.monotonic()
                 self._flush()
                 try:
@@ -548,13 +582,15 @@ class _PacedRun:
                 except _DownloadSuperseded:
                     return None
                 except Exception as e:
-                    message = str(e)
-                    if _looks_rate_limited(message):
-                        blocked = message[:PLAYER_ERROR_CHARS]
+                    self._note_failure(e)
+                    blocked = self._blocked()
+                    if blocked:
                         break
                     logger.debug("Could not resolve %s: %s", item, e)
-                    self.results.append((False, message, None))
+                    self.results.append((False, str(e), None))
                     self._flush()
+                    if self.offline:
+                        break
                     continue
                 thread = threading.Thread(
                     target=self._work, args=(item, handle, slot), daemon=True)
@@ -567,7 +603,7 @@ class _PacedRun:
                 return None
             # Announce first, then re-check; an append can still slip in, so the caller re-queues pending().
             self.closed = True
-            if blocked or self.consumed >= len(self.items):
+            if blocked or self.offline or self.consumed >= len(self.items):
                 break
             self.closed = False
         blocked = blocked or self._blocked()
@@ -591,6 +627,7 @@ class _PacedRun:
             self.results.append((False, "cancelled", None))
         except Exception as e:
             logger.debug("Fetch of %s failed: %s", item, e)
+            self._note_failure(e)
             self.results.append((False, str(e), None))
         finally:
             if slot is not None and slot.get("state") == "running":
@@ -612,11 +649,14 @@ class _PacedRun:
             time.sleep(min(0.25, remaining))
             remaining -= 0.25
 
+    def _note_failure(self, exc) -> None:
+        if is_transport_failure(exc):
+            self.offline = self.offline or str(exc)[:PLAYER_ERROR_CHARS]
+        elif _rate_limited(exc):
+            self._stopped_by = self._stopped_by or str(exc)[:PLAYER_ERROR_CHARS]
+
     def _blocked(self) -> str:
-        for ok, message, _record in self.results[:]:
-            if not ok and _looks_rate_limited(message):
-                return message[:PLAYER_ERROR_CHARS]
-        return ""
+        return self._stopped_by
 
     def _counts(self) -> tuple:
         results = self.results[:]
@@ -1306,7 +1346,7 @@ class HeadlessTidalPlayer:
 
     def __init__(self, quality: Optional[str] = None, login_flow: Optional[str] = None):
         self.console = Console()
-        self.session = tidalapi.Session()
+        self.session = tidal_session()
         flow = (login_flow or LOGIN_FLOWS[0]).lower()
         self._login_flow = flow if flow in LOGIN_FLOWS else LOGIN_FLOWS[0]
         self._live = None
@@ -1768,11 +1808,12 @@ class HeadlessTidalPlayer:
 
         def _run():
             blocked = ""
+            offline = False
             abandoned = False
             last_start = None
 
             def _fetch(tid):
-                nonlocal blocked, abandoned, last_start
+                nonlocal blocked, offline, abandoned, last_start
                 if last_start is not None:
                     remaining = REFETCH_MIN_INTERVAL - (time.monotonic() - last_start)
                     if remaining > 0:
@@ -1784,7 +1825,10 @@ class HeadlessTidalPlayer:
                 try:
                     return self.session.track(tid)
                 except Exception as e:
-                    if _looks_rate_limited(str(e)):
+                    if is_transport_failure(e):
+                        offline = True
+                        logger.debug("Could not reach TIDAL to restore the queue: %s", e)
+                    elif _rate_limited(e):
                         blocked = str(e)[:PLAYER_ERROR_CHARS]
                     else:
                         logger.debug("Could not restore track %s: %s", tid, e)
@@ -1805,7 +1849,7 @@ class HeadlessTidalPlayer:
                         if current is not None:
                             tracks.append(current)
                         continue
-                    if blocked or abandoned:
+                    if blocked or offline or abandoned:
                         break
                     t = _fetch(tid)
                     if t is not None:
@@ -1816,6 +1860,11 @@ class HeadlessTidalPlayer:
                         "TIDAL is rate-limiting — restore stopped. "
                         "Nothing will be retried.",
                         seconds=PLAYER_ERROR_SECONDS)
+                    self._wake()
+                    return
+                if offline:
+                    self._set_toast(f"Queue not restored — {OFFLINE_MESSAGE}",
+                                    seconds=PLAYER_ERROR_SECONDS)
                     self._wake()
                     return
                 if abandoned:
@@ -1848,11 +1897,9 @@ class HeadlessTidalPlayer:
         def _run():
             try:
                 # A cached row carries no stream URL; resolve to the real track first
-                real = self._resolve_track(track)
+                real = self.session.track(track.id) if getattr(track, "cached", False) else track
                 if real is None:
-                    if self._play_gen == gen:
-                        self._playing = False
-                    return
+                    raise RuntimeError("TIDAL could not find this track")
                 if real is not track:
                     queue = self._queue
                     if track in queue:
@@ -1884,15 +1931,10 @@ class HeadlessTidalPlayer:
                     self._playing = False
                     self._report_player_failure(e.failure)
             except Exception as e:
+                logger.warning("Could not play %s: %r", getattr(track, "id", None), e)
                 if self._play_gen == gen:
                     self._playing = False
-                    self._set_toast(
-                        "TIDAL is rate-limiting — playback stopped. "
-                        "Nothing will be retried." if _looks_rate_limited(str(e))
-                        else f"Couldn't start the track — {type(e).__name__}: "
-                             f"{str(e)[:PLAYER_ERROR_CHARS]}",
-                        seconds=PLAYER_ERROR_SECONDS)
-                    logger.warning("Track start failed: %r", e)
+                    self._set_toast(_play_failure_text(e), seconds=PLAYER_ERROR_SECONDS)
                     self._wake()
             finally:
                 if self._play_gen == gen:
@@ -3517,6 +3559,8 @@ class HeadlessTidalPlayer:
                 row.append("   nothing retried", style="dim")
             elif state == "cancelled":
                 row.append(f"Cancelled after {done}", style="yellow")
+            elif state == "failed":
+                row.append(f"Stopped — {job.get('error')}", style="red")
             else:
                 row.append(f"Saved {done} ✓", style="green")
             if failed:
@@ -4622,7 +4666,7 @@ class HeadlessTidalPlayer:
                 self._wake()
                 return
             done, failed, blocked = outcome
-            if leftover and not blocked and _alive():
+            if leftover and not blocked and not run.offline and _alive():
                 labels = [name for name in ((self._download_job or {}).get("labels") or ()) if name]
                 self._download_job = dict(self._download_job or {}, state="done")
                 self._start_bulk_download_job(
@@ -4636,6 +4680,10 @@ class HeadlessTidalPlayer:
                     "TIDAL is rate-limiting — download stopped. "
                     "Nothing will be retried.",
                     seconds=PLAYER_ERROR_SECONDS)
+            elif run.offline:
+                _update(state="failed", error=OFFLINE_MESSAGE)
+                self._set_toast(f"Download stopped — {OFFLINE_MESSAGE}",
+                                seconds=PLAYER_ERROR_SECONDS)
             else:
                 _update(state="done")
                 short = max((self._download_job or {}).get("tracks", 0) - done - failed, 0)
@@ -4863,7 +4911,7 @@ class HeadlessTidalPlayer:
             self._wake()
 
         def _run():
-            outcome = _PacedRun(
+            run = _PacedRun(
                 items=[("download", k) for k in plan["downloads"]] + [("cache", k) for k in plan["cache"]],
                 resolve=lambda item: item,
                 fetch=lambda item, _h, _s: self._refetch_one(item[0], item[1], tier, gen),
@@ -4871,7 +4919,8 @@ class HeadlessTidalPlayer:
                 report=_update,
                 workers=1,
                 clock=self._api_pace,
-            ).run()
+            )
+            outcome = run.run()
             if outcome is None:
                 self._wake()
                 return
@@ -4882,6 +4931,10 @@ class HeadlessTidalPlayer:
                     "TIDAL is rate-limiting — re-fetch stopped. "
                     "Nothing will be retried.",
                     seconds=PLAYER_ERROR_SECONDS)
+            elif run.offline:
+                _update(state="done")
+                self._set_toast(f"Re-fetch stopped after {done} — {OFFLINE_MESSAGE}",
+                                seconds=PLAYER_ERROR_SECONDS)
             else:
                 _update(state="done")
                 self._set_toast(f"Re-fetched {done} song{'' if done == 1 else 's'} at {tier}"
@@ -4965,12 +5018,13 @@ class HeadlessTidalPlayer:
     def _stream_at_best_tier(self, real, tier: str) -> tuple:
         # TIDAL often quietly grants a lower tier, but can fail outright (region, pulled track); step down the ladder instead.
         # A rate limit (429, or 401 subStatus 4006) is never stepped past: retrying tiers turned one into an edge block (docs/adr/0001-tidal-rate-limits.md).
+        # Nor is an unreachable TIDAL: every lower tier would fail the same way, one request each.
         last = None
         for candidate in self._tier_ladder(tier):
             try:
                 url, granted = self._download_stream_url(real, candidate)
             except Exception as e:
-                if _looks_rate_limited(str(e)):
+                if is_transport_failure(e) or _rate_limited(e):
                     raise
                 logger.debug("No %s stream for this track: %s", candidate, e)
                 last = e
