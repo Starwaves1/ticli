@@ -23,7 +23,9 @@ from ticli.utils.cache import CachedPlaylist, CachedTrack, _Named, playlist_reco
 SOCKET_NAME = "player.sock"
 LOG_NAME = "player.log"
 READY_TIMEOUT = 90.0
-CONNECT_RACE_SECONDS = 10.0
+RACE_POLL_SECONDS = 0.05
+REAP_SECONDS = 5.0
+LOCK_NAME = "instance.lock"
 CALLERS = ("tui", "human", "agent")
 PLAYER_MODULE = "ticli.playerd"
 
@@ -233,16 +235,51 @@ def spawn_player(quality: Optional[str] = None, login_flow: Optional[str] = None
     env["PYTHONPATH"] = os.pathsep.join(p for p in (package_root, env.get("PYTHONPATH")) if p)
     log_fd = os.open(log_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log_fd,
-                         pass_fds=(ready_w,), start_new_session=True, close_fds=True,
-                         cwd="/", env=env)
+        child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=log_fd, pass_fds=(ready_w,), start_new_session=True,
+                                 close_fds=True, cwd="/", env=env)
     finally:
         os.close(log_fd)
         os.close(ready_w)
     try:
-        return read_status(ready_r, timeout)
+        status = read_status(ready_r, timeout)
     finally:
         os.close(ready_r)
+    if status != "ready":
+        try:
+            child.wait(REAP_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    if child.poll() is None:
+        _children.append(child)
+    return status
+
+
+# Players this process started, reaped once they exit so none lingers as a zombie.
+_children: list = []
+
+
+def _reap() -> None:
+    _children[:] = [child for child in _children if child.poll() is None]
+
+
+def _lock_holder_alive() -> bool:
+    try:
+        pid = int((throttle.STATE_DIR / LOCK_NAME).read_text().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    for child in _children:
+        if child.pid == pid:
+            return child.poll() is None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass
+    return True
 
 
 def read_status(fd: int, timeout: float) -> str:
@@ -259,19 +296,28 @@ def read_status(fd: int, timeout: float) -> str:
     return data.split(b"\n", 1)[0].decode(errors="replace").strip()
 
 
-def connect_or_start(quality: Optional[str] = None, login_flow: Optional[str] = None) -> tuple:
-    """(connection, None), or (None, status) when the player could not be reached."""
-    conn = connect()
-    if conn is not None:
-        return conn, None
-    status = spawn_player(quality, login_flow)
-    if status == "ready":
+def connect_or_start(quality: Optional[str] = None, login_flow: Optional[str] = None,
+                     timeout: float = READY_TIMEOUT) -> tuple:
+    """(connection, None), or (None, status) when the player could not be reached.
+
+    "running" means another client's player holds the lock: wait for its socket,
+    and start one again if it leaves first (its starter may have quit at once)."""
+    _reap()
+    deadline = time.monotonic() + timeout
+    while True:
         conn = connect()
-    elif status == "running":
-        # Rare: two clients started a player at once and the other one won the lock.
-        deadline = time.monotonic() + CONNECT_RACE_SECONDS
-        while conn is None and time.monotonic() < deadline:
-            time.sleep(0.05)
+        if conn is not None:
+            return conn, None
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None, "error: the player did not start in time; try again in a moment"
+        status = spawn_player(quality, login_flow, left)
+        if status not in ("ready", "running"):
+            return None, status
+        while time.monotonic() < deadline:
             conn = connect()
-    return (conn, None) if conn is not None else (None, status if status != "ready" else
-                                                  "error: the player started but its socket is gone")
+            if conn is not None:
+                return conn, None
+            if status == "ready" or not _lock_holder_alive():
+                break
+            time.sleep(RACE_POLL_SECONDS)

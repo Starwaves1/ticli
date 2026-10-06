@@ -4,6 +4,7 @@ socket with the player core in a thread. No TIDAL, no audio backend."""
 import io
 import os
 import select
+import subprocess
 import sys
 import threading
 import time
@@ -17,6 +18,7 @@ from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
 from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
+from ticli.utils import throttle
 
 
 @pytest.fixture(autouse=True)
@@ -437,6 +439,68 @@ class TestAutoStart:
         conn, status = ipc.connect_or_start()
         assert conn is None and status.startswith("error:")
         assert time.monotonic() - started < 5
+
+
+LOGIN_PLAYER = """
+import os, sys
+fd = int(sys.argv[sys.argv.index("--ready-fd") + 1])
+os.write(fd, b"login\\n")
+"""
+
+
+class TestStartRace:
+    def _hold_lock(self):
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        throttle.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (throttle.STATE_DIR / ipc.LOCK_NAME).write_text(f"{holder.pid}\n")
+        return holder
+
+    def test_a_starter_that_leaves_at_once_does_not_strand_the_next_client(self, running,
+                                                                           monkeypatch):
+        holder = self._hold_lock()
+        spawns = []
+
+        def spawn(*args, **kwargs):
+            spawns.append(args)
+            if len(spawns) == 1:
+                # The other client's player holds the lock, then exits: its starter already left.
+                threading.Timer(0.2, lambda: (holder.kill(), holder.wait())).start()
+                return "running"
+            running()
+            return "ready"
+
+        monkeypatch.setattr(ipc, "spawn_player", spawn)
+        conn, status = ipc.connect_or_start(timeout=5)
+        assert status is None and conn is not None
+        assert len(spawns) == 2, "the client started a player of its own once the other left"
+        assert conn.request("status", timeout=2)["ok"]
+
+    def test_a_player_slower_than_the_deadline_is_an_error_not_a_hang(self, monkeypatch):
+        holder = self._hold_lock()
+        try:
+            monkeypatch.setattr(ipc, "spawn_player", lambda *a, **k: "running")
+            started = time.monotonic()
+            conn, status = ipc.connect_or_start(timeout=0.5)
+            assert conn is None and status.startswith("error:") and "in time" in status
+            assert time.monotonic() - started < 2
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_a_player_that_exits_at_once_is_reaped(self, tmp_path, monkeypatch):
+        (tmp_path / "login_playerd.py").write_text(LOGIN_PLAYER)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+        monkeypatch.setattr(ipc, "PLAYER_MODULE", "login_playerd")
+        children = []
+        real = subprocess.Popen
+
+        def popen(*args, **kwargs):
+            children.append(real(*args, **kwargs))
+            return children[-1]
+
+        monkeypatch.setattr(ipc.subprocess, "Popen", popen)
+        assert ipc.connect_or_start() == (None, "login")
+        assert children and children[0].returncode is not None, "no zombie left behind"
 
 
 class _Clock:
