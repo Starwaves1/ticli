@@ -46,7 +46,7 @@ _Avoid_: "downloaded" when either tier is meant
 _Avoid_: "index", which means the **metadata index** or the **download index** (`downloads.json`)
 
 **Metadata index**:
-`metadata.json` in the cache directory: every list the user has opened (playlists, album tracks, artist sections, searches, favourites, mixes), never expiring, held to its own 100 MB cap (ADR-0009). A first paint while online; the answer, with its age, while offline.
+`lists/` in the cache directory, one file per list plus a manifest: every list the user has opened (playlists, album tracks, artist sections, searches, favourites, mixes), never expiring, held to its own 100 MB cap (ADR-0009). A first paint while online; the answer, with its age, while offline.
 
 **Connectivity**:
 The player's online / offline / signed_out state, pushed to every client. Offline means TIDAL is unreachable; signed_out means it rejected the stored login and a human must sign in again with [o]. Only an action that needs TIDAL tries to reconnect.

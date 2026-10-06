@@ -8,15 +8,19 @@ losing it forgets the user's whole download library.
 
 The cache is a first paint, never an answer while online: callers pair every
 read with a live fetch that replaces it. Offline it is the answer, with its age
-(ADR-0009): nothing expires, and the index is held to METADATA_CAP_BYTES,
-evicting the least recently opened lists first and the user's own library last.
+(ADR-0009): nothing expires, and the index (one file per list, `lists/`) is held
+to METADATA_CAP_BYTES, evicting the least recently opened lists first and the
+user's own library last.
 Records are flat text so a local search can scan the index.
 """
 
+import contextlib
+import hashlib
 import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -25,6 +29,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 CACHE_VERSION = 1
+MANIFEST_VERSION = 2
 # `_load_tracker` reads a file with a different version as empty, so bumping
 # this forgets every play count. Translate old values at read time instead.
 TRACKER_VERSION = 1
@@ -37,6 +42,9 @@ BYTES_PER_GB = 1024 ** 3
 
 # Metadata has its own cap, separate from the audio budget (ADR-0009).
 METADATA_CAP_BYTES = 100 * 1024 * 1024
+# Eviction goes this far under the cap so it is not paid again on the next write.
+EVICT_TO = 0.9
+ORPHAN_GRACE_SECONDS = 60
 # Evicted last: the lists that are the user's own library.
 LIBRARY_PREFIXES = ("favorites:",)
 LIBRARY_KEYS = ("playlists", "mixes")
@@ -109,8 +117,21 @@ CACHE_DIR = _default_cache_dir()
 
 
 def index_file() -> Path:
-    """Read CACHE_DIR at call time so tests can redirect the whole cache."""
+    """The single-file index of older versions, split into lists_dir() on first load."""
     return CACHE_DIR / "metadata.json"
+
+
+def lists_dir() -> Path:
+    """Read CACHE_DIR at call time so tests can redirect the whole cache."""
+    return CACHE_DIR / "lists"
+
+
+def manifest_file() -> Path:
+    return lists_dir() / "manifest.json"
+
+
+def list_file(key: str) -> Path:
+    return lists_dir() / (hashlib.sha256(key.encode()).hexdigest()[:32] + ".json")
 
 
 def audio_dir() -> Path:
@@ -385,12 +406,39 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """A unique temp file per writer, so two processes never share one."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _file_stamp(path: Path):
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_ino, st.st_mtime_ns, st.st_size
+
+
+def _own_ids(records) -> list:
+    return [str(r.get("id")) for r in records if isinstance(r, dict)]
+
+
 class MetadataCache:
     """The cache the player talks to.
 
-    The index and the tracker are only ever replaced whole, so every read is
-    lock-free and sees one consistent generation. Writes can lose updates:
-    the index has one writer at a time, but the tracker is written from
+    The index is one file per list plus a small manifest of their sizes and
+    use. A read opens only its own list's file; a write replaces that file,
+    then the manifest (so a crash between the two leaves an orphan, never a
+    torn manifest). Every file is only ever replaced whole, so reads are
+    lock-free. Writes can lose updates: the index has one writer at a time
+    per process, but the tracker is written from
     several threads through one shared instance, so `_tracker_lock` serializes
     each load-modify-save inside `_mutate_tracker` (a leaf: held never across
     a disk walk, never by a caller).
@@ -402,10 +450,12 @@ class MetadataCache:
         self.songs = songs
         self.budget_gb = budget_gb
         self.metadata_cap = metadata_cap
-        self._index = None  # loaded from disk on first use
-        # Another process (the player, or the TUI beside it) may have replaced the file since.
-        self._index_stamp = None
-        self._index_lock = threading.Lock()
+        self._manifest = None
+        self._manifest_stamp = None
+        self._lists = {}
+        self._touched = {}
+        self._migrated = False
+        self._index_lock = threading.RLock()
         # Measured on demand; see invalidate_audio_count
         self._audio_count = None
         self._disk_bytes = None
@@ -427,80 +477,157 @@ class MetadataCache:
     def budget_bytes(self) -> int:
         return max(0, int(self.budget_gb)) * BYTES_PER_GB
 
-    @staticmethod
-    def _stamp():
-        try:
-            st = index_file().stat()
-        except OSError:
-            return None
-        return st.st_mtime_ns, st.st_size
-
-    def _load(self) -> dict:
-        """Read the index. Missing, corrupt or wrong version → empty, never raises.
-        Re-read when the file changed under us: the TUI paints from what the player wrote."""
-        stamp = self._stamp()
-        if self._index is not None and stamp == self._index_stamp:
-            return self._index
-        entries = {}
-        try:
-            if stamp is not None:
-                data = json.loads(index_file().read_text())
-                if isinstance(data, dict) and data.get("version") == CACHE_VERSION:
-                    raw = data.get("entries")
-                    if isinstance(raw, dict):
-                        entries = {
-                            k: v for k, v in raw.items()
-                            if isinstance(v, dict) and isinstance(v.get("data"), list)
-                        }
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as e:
-            logger.debug("Unusable metadata cache, starting empty: %s", e)
-        self._index = entries
-        self._index_stamp = stamp
-        return entries
-
-    def _save(self, entries: dict) -> None:
-        """Atomically replace the index, held to the metadata cap. Best effort."""
-        text = json.dumps({"version": CACHE_VERSION, "entries": entries})
-        if len(text) > self.cap_bytes:
-            entries = self._capped(entries)
-            text = json.dumps({"version": CACHE_VERSION, "entries": entries})
-        self._index = entries
-        try:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-            tmp = index_file().with_suffix(".tmp")
-            tmp.write_text(text)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, index_file())
-        except OSError as e:
-            logger.debug("Failed to write metadata cache: %s", e)
-            return
-        self._index_stamp = self._stamp()
-
     @property
     def cap_bytes(self) -> int:
         return METADATA_CAP_BYTES if self.metadata_cap is None else self.metadata_cap
 
-    def _library_keys(self, entries: dict) -> set:
-        own = {f"playlist:{r.get('id')}" for r in (entries.get("playlists") or {}).get("data") or []
-               if isinstance(r, dict)}
-        return {k for k in entries
-                if k in LIBRARY_KEYS or k in own or k.startswith(LIBRARY_PREFIXES)}
+    def _migrate(self) -> None:
+        """Split a single-file index from an older ticli into list files, once."""
+        if self._migrated:
+            return
+        with self._index_lock:
+            if not self._migrated:
+                self._split_old_index()
+                self._migrated = True
 
-    def _capped(self, entries: dict) -> dict:
-        """Evict until the index fits the cap: least recently opened first, the
-        user's own library (playlists, favourites) only after everything else."""
-        sizes = {k: len(json.dumps(v)) + len(json.dumps(k)) + 2 for k, v in entries.items()}
-        total = sum(sizes.values()) + 40
-        cap = self.cap_bytes
-        library = self._library_keys(entries)
-        order = sorted(entries, key=lambda k: (k in library, entries[k].get("used") or 0))
-        kept = dict(entries)
-        for key in order:
-            if total <= cap:
+    def _split_old_index(self) -> None:
+        if not index_file().is_file():
+            return
+        try:
+            data = json.loads(index_file().read_text())
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.debug("Unusable old metadata index, dropping it: %s", e)
+            data = None
+        raw = data.get("entries") if isinstance(data, dict) and data.get("version") == CACHE_VERSION else None
+        if isinstance(raw, dict):
+            manifest = self._load_manifest()
+            entries, own = dict(manifest["entries"]), manifest["own"]
+            for key, entry in raw.items():
+                if key in entries or not (isinstance(entry, dict) and isinstance(entry.get("data"), list)):
+                    continue
+                fetched = _clean_number(entry.get("fetched"))
+                size = self._write_list(key, fetched, entry["data"])
+                if size is None:
+                    return
+                entries[key] = {"fetched": fetched, "used": _clean_number(entry.get("used")) or fetched,
+                                "bytes": size}
+                if key == "playlists":
+                    own = _own_ids(entry["data"])
+            self._commit(own, entries)
+        with contextlib.suppress(OSError):
+            index_file().unlink()
+
+    def _load_manifest(self) -> dict:
+        """`{"own": [playlist ids], "entries": {key: {fetched, used, bytes, library}}}`.
+        Missing or corrupt → empty, never raises; re-read only when another process replaced it."""
+        stamp = _file_stamp(manifest_file())
+        if self._manifest is not None and stamp == self._manifest_stamp:
+            return self._manifest
+        manifest = {"own": [], "entries": {}}
+        try:
+            if stamp is not None:
+                data = json.loads(manifest_file().read_text())
+                if isinstance(data, dict) and data.get("version") == MANIFEST_VERSION:
+                    raw, own = data.get("entries"), data.get("own")
+                    manifest = {"own": own if isinstance(own, list) else [],
+                                "entries": {k: v for k, v in raw.items() if isinstance(v, dict)}
+                                if isinstance(raw, dict) else {}}
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.debug("Unusable metadata manifest, starting empty: %s", e)
+        self._manifest, self._manifest_stamp = manifest, stamp
+        return manifest
+
+    def _write_list(self, key: str, fetched, records: list):
+        text = json.dumps({"key": key, "fetched": fetched, "data": records})
+        try:
+            lists_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+            _atomic_write_text(list_file(key), text)
+        except OSError as e:
+            logger.debug("Failed to write cached list %s: %s", key, e)
+            self._lists[key] = (None, {"fetched": fetched, "data": records})
+            return None
+        self._lists.pop(key, None)
+        return len(text)
+
+    def _read_list(self, key: str):
+        path = list_file(key)
+        stamp = _file_stamp(path)
+        held = self._lists.get(key)
+        if held and held[0] == stamp:
+            return held[1]
+        if stamp is None:
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.debug("Unusable cached list %s: %s", key, e)
+            return None
+        if not (isinstance(data, dict) and data.get("key") == key and isinstance(data.get("data"), list)):
+            return None
+        entry = {"fetched": _clean_number(data.get("fetched")), "data": data["data"]}
+        self._lists[key] = (stamp, entry)
+        return entry
+
+    def _commit(self, own: list, entries: dict) -> None:
+        """Fold in the opens since the last write, evict down from the cap, then
+        replace the manifest; evicted files go only after it no longer names them."""
+        touched, self._touched = self._touched, {}
+        for key, used in touched.items():
+            if key in entries:
+                entries[key] = {**entries[key], "used": max(used, entries[key].get("used") or 0)}
+        own_keys = {f"playlist:{i}" for i in own}
+        for key, entry in entries.items():
+            entry["library"] = key in LIBRARY_KEYS or key in own_keys or key.startswith(LIBRARY_PREFIXES)
+        evicted = self._evicted(entries)
+        for key in evicted:
+            entries.pop(key)
+        text = json.dumps({"version": MANIFEST_VERSION, "own": own, "entries": entries})
+        try:
+            _atomic_write_text(manifest_file(), text)
+        except OSError as e:
+            logger.debug("Failed to write metadata manifest: %s", e)
+            return
+        self._manifest = {"own": own, "entries": entries}
+        self._manifest_stamp = _file_stamp(manifest_file())
+        for key in evicted:
+            self._lists.pop(key, None)
+            with contextlib.suppress(OSError):
+                list_file(key).unlink()
+        if evicted:
+            self._sweep_orphans(entries)
+
+    def _evicted(self, entries: dict) -> list:
+        """Over the cap, the keys to drop to get under EVICT_TO of it: least
+        recently opened first, the user's own library only after everything else."""
+        total = sum(_clean_number(e.get("bytes")) for e in entries.values())
+        if total <= self.cap_bytes:
+            return []
+        evicted = []
+        for key in sorted(entries, key=lambda k: (bool(entries[k].get("library")),
+                                                  _clean_number(entries[k].get("used")))):
+            if total <= self.cap_bytes * EVICT_TO:
                 break
-            kept.pop(key)
-            total -= sizes[key]
-        return kept
+            evicted.append(key)
+            total -= _clean_number(entries[key].get("bytes"))
+        return evicted
+
+    @staticmethod
+    def _sweep_orphans(entries: dict) -> None:
+        """List files no manifest names (a writer that died between the two
+        renames). Only old ones: a fresh one may be another process mid-put."""
+        named = {list_file(k).name for k in entries} | {manifest_file().name}
+        cutoff = time.time() - ORPHAN_GRACE_SECONDS
+        try:
+            paths = list(lists_dir().iterdir())
+        except OSError:
+            return
+        for path in paths:
+            try:
+                if path.name not in named and path.suffix in (".json", ".tmp") \
+                        and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
 
     # ── generic entry access ──
 
@@ -510,15 +637,17 @@ class MetadataCache:
         return entry["data"] if entry else None
 
     def entry(self, key: str):
-        """`{"fetched", "used", "data"}` for a key, marked as opened now (kept in memory
-        until the next write: an open must not rewrite the whole index)."""
+        """`{"fetched", "used", "data"}` for a key, from that list's file alone.
+        Marked as opened now in memory; the manifest learns it on the next write."""
         if not self.enabled:
             return None
-        entry = self._load().get(key)
-        if not entry:
+        self._migrate()
+        entry = self._read_list(key)
+        if entry is None:
             return None
-        entry["used"] = time.time()
-        return entry
+        now = time.time()
+        self._touched[key] = now
+        return {**entry, "used": now}
 
     def fetched_at(self, key: str):
         entry = self.entry(key)
@@ -527,11 +656,18 @@ class MetadataCache:
     def put(self, key: str, records: list) -> None:
         if not self.enabled:
             return
+        self._migrate()
+        records = list(records)
         with self._index_lock:
             now = time.time()
-            entries = dict(self._load())
-            entries[key] = {"fetched": now, "used": now, "data": list(records)}
-            self._save(entries)
+            size = self._write_list(key, now, records)
+            if size is None:
+                return
+            manifest = self._load_manifest()
+            own = _own_ids(records) if key == "playlists" else manifest["own"]
+            entries = dict(manifest["entries"])
+            entries[key] = {"fetched": now, "used": now, "bytes": size}
+            self._commit(own, entries)
 
     def put_items(self, key: str, objs) -> None:
         self.put(key, [item_record(o) for o in objs or []])
@@ -548,12 +684,18 @@ class MetadataCache:
 
     def clear_metadata(self) -> None:
         """Forget the index, on disk too."""
-        self._index = {}
-        self._index_stamp = None
-        try:
-            index_file().unlink()
-        except OSError:
-            pass
+        with self._index_lock:
+            self._manifest = self._manifest_stamp = None
+            self._lists.clear()
+            self._touched.clear()
+            try:
+                paths = [index_file(), *lists_dir().iterdir()]
+            except OSError:
+                paths = [index_file()]
+            for path in paths:
+                if path.suffix in (".json", ".tmp"):
+                    with contextlib.suppress(OSError):
+                        path.unlink()
 
     def clear_audio(self) -> tuple:
         """Delete the cached tracks, by exact path, one at a time. Returns
@@ -632,12 +774,11 @@ class MetadataCache:
         "search my own playlists" (TIDAL has no API for it)."""
         if not self.enabled:
             return
-        for key, entry in self._load().items():
-            if not key.startswith("playlist:"):
-                continue
-            playlist_id = key.split(":", 1)[1]
-            for record in entry.get("data") or []:
-                yield playlist_id, record
+        self._migrate()
+        for key in list(self._load_manifest()["entries"]):
+            entry = self._read_list(key) if key.startswith("playlist:") else None
+            for record in (entry or {}).get("data") or []:
+                yield key.split(":", 1)[1], record
 
     # ── the cache tracker ──
     #

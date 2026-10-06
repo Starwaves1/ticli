@@ -597,7 +597,7 @@ class TestCacheSwitches:
         p.config["cache_metadata"] = False
         p._apply_setting("cache_metadata", False)
         _load_playlists(p)
-        assert not cache_mod.index_file().exists()
+        assert not cache_mod.manifest_file().exists()
 
         warm = _load_playlists(p)
         assert warm >= LATENCY * 0.8, "metadata off must not serve a cached first paint"
@@ -606,11 +606,11 @@ class TestCacheSwitches:
         session = _FakeSession()
         p = _player(session)
         _load_playlists(p)
-        assert cache_mod.index_file().exists()
+        assert cache_mod.manifest_file().exists()
 
         p._apply_setting("cache_metadata", False)
 
-        assert not cache_mod.index_file().exists()
+        assert not cache_mod.manifest_file().exists()
         assert MetadataCache().get_playlists() is None
 
     def test_songs_off_leaves_the_metadata_index_alone(self):
@@ -620,7 +620,7 @@ class TestCacheSwitches:
 
         p._apply_setting("cache_songs", False)
 
-        assert cache_mod.index_file().exists()
+        assert cache_mod.manifest_file().exists()
         assert MetadataCache().get_playlists(), "songs off must not drop the index"
 
     def test_songs_off_stops_keeping_them_without_deleting_them(self):
@@ -1117,7 +1117,7 @@ class TestTheCacheTracker:
         cache = MetadataCache(metadata=False, songs=True)
         cache.note_cached(12, ".m4a", 4096, quality="HIGH")
         assert cache.audio_record(12)["quality"] == "HIGH"
-        assert not cache_mod.index_file().exists()
+        assert not cache_mod.manifest_file().exists()
 
     def test_metadata_only_mode_records_nothing(self):
         cache = MetadataCache(metadata=True, songs=False)

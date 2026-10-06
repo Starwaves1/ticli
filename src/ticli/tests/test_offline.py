@@ -305,9 +305,16 @@ class TestTheTui:
 
 class TestMetadataCache:
     def _entry(self, cache, key, used, size=2000):
-        cache.put(key, [{"id": key, "name": "x" * size}])
-        entries = cache._load()
-        entries[key]["used"] = used
+        real = time.time
+        cache_mod.time.time = lambda: used
+        try:
+            cache.put(key, [{"id": key, "name": "x" * size}])
+        finally:
+            cache_mod.time.time = real
+
+    def _kept(self, *keys):
+        fresh = MetadataCache()
+        return {k for k in keys if fresh.get(k) is not None}
 
     def test_eviction_takes_the_least_recently_opened_first_and_the_library_last(self):
         cache = MetadataCache(metadata_cap=10_000)
@@ -317,10 +324,28 @@ class TestMetadataCache:
         self._entry(cache, "album:old", used=3)
         self._entry(cache, "album:newer", used=4)
         self._entry(cache, "search:q", used=5)
-        keys = set(cache._load())
-        assert "album:old" not in keys, "least recently opened goes first"
-        assert {"playlists", "playlist:mine", "favorites:tracks", "search:q"} <= keys
-        assert index_size() <= 10_000
+        keys = ("playlists", "playlist:mine", "favorites:tracks", "album:old", "album:newer", "search:q")
+        assert self._kept(*keys) == set(keys) - {"album:old"}, "least recently opened goes first"
+        assert lists_size() <= 10_000
+
+    def test_the_library_goes_only_when_nothing_else_is_left(self):
+        cache = MetadataCache(metadata_cap=5_000)
+        cache.put("playlists", [{"id": "mine", "name": "Mine"}])
+        self._entry(cache, "playlist:mine", used=1)
+        self._entry(cache, "album:a", used=2)
+        self._entry(cache, "album:b", used=3)
+        self._entry(cache, "playlist:other", used=4)
+        assert self._kept("playlist:mine", "album:a", "album:b", "playlist:other") == \
+            {"playlist:mine", "playlist:other"}
+
+    def test_eviction_goes_below_the_cap_so_the_next_write_is_free(self):
+        cache = MetadataCache(metadata_cap=10_000)
+        for i in range(5):
+            self._entry(cache, f"album:{i}", used=i + 1)
+        assert lists_size() <= 9_000
+        kept = self._kept(*(f"album:{i}" for i in range(5)))
+        self._entry(cache, "search:tiny", used=6, size=10)
+        assert self._kept(*(f"album:{i}" for i in range(5))) == kept
 
     def test_opening_a_list_protects_it(self):
         cache = MetadataCache(metadata_cap=5_000)
@@ -328,7 +353,27 @@ class TestMetadataCache:
         self._entry(cache, "album:b", used=2)
         cache.get("album:a")
         self._entry(cache, "album:c", used=time.time())
-        assert set(cache._load()) == {"album:a", "album:c"}
+        assert self._kept("album:a", "album:b", "album:c") == {"album:a", "album:c"}
+
+    def test_an_open_writes_nothing(self):
+        cache = MetadataCache()
+        cache.put("album:a", [{"id": 1}])
+        stamps = {f.name: f.stat().st_mtime_ns for f in cache_mod.lists_dir().iterdir()}
+        for _ in range(5):
+            MetadataCache().get("album:a")
+            cache.get("album:a")
+        assert {f.name: f.stat().st_mtime_ns for f in cache_mod.lists_dir().iterdir()} == stamps
+
+    def test_a_read_opens_only_its_own_file(self, monkeypatch):
+        writer = MetadataCache()
+        for key in ("favorites:tracks", "album:1", "album:2", "playlists"):
+            writer.put(key, [{"id": key, "name": key}])
+        opened = []
+        real = cache_mod.Path.read_text
+        monkeypatch.setattr(cache_mod.Path, "read_text",
+                            lambda self, *a, **k: opened.append(self.name) or real(self, *a, **k))
+        assert [t.id for t in MetadataCache().get_items("favorites:tracks")] == ["favorites:tracks"]
+        assert opened == [cache_mod.list_file("favorites:tracks").name]
 
     def test_the_cap_is_100_mb(self):
         assert MetadataCache().cap_bytes == 100 * 1024 * 1024
@@ -352,14 +397,70 @@ class TestMetadataCache:
         assert [p.name for p in cache.get_playlists()] == ["Road trip"]
         assert [t.name for t in cache.get_playlist_tracks("p1")] == ["Song"]
         assert [t.id for t in cache.get_items("playlist:p1")] == [7]
+        assert cache.fetched_at("playlist:p1") == pytest.approx(long_ago)
+
+    def test_an_old_single_file_index_is_split_once_then_removed(self):
+        cache_mod.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_mod.index_file().write_text(json.dumps({"version": 1, "entries": {
+            "playlists": {"fetched": 1, "used": 1, "data": [{"id": "p1", "name": "Mine"}]},
+            "playlist:p1": {"fetched": 1, "used": 1, "data": [{"id": 7, "name": "Song"}]},
+            "album:9": {"fetched": 2, "used": 2, "data": [{"id": 9, "name": "Other"}]}}}))
+        MetadataCache().get("album:9")
+        assert not cache_mod.index_file().exists()
+        for key in ("playlists", "playlist:p1", "album:9"):
+            assert cache_mod.list_file(key).exists()
+        MetadataCache(metadata_cap=150).put("search:x", [])
+        assert self._kept("playlist:p1", "album:9") == {"playlist:p1"}, \
+            "migrated lists are sized, dated and still know the library"
+
+    def test_a_write_that_dies_mid_manifest_never_corrupts_it(self, monkeypatch):
+        cache = MetadataCache()
+        cache.put("album:1", [{"id": 1}])
+        good = cache_mod.manifest_file().read_bytes()
+        real_replace = cache_mod.os.replace
+
+        def crash(src, dst):
+            if str(dst).endswith("manifest.json"):
+                raise OSError("disk pulled")
+            real_replace(src, dst)
+        monkeypatch.setattr(cache_mod.os, "replace", crash)
+        cache.put("album:2", [{"id": 2}])
+        monkeypatch.setattr(cache_mod.os, "replace", real_replace)
+
+        assert cache_mod.manifest_file().read_bytes() == good
+        assert not list(cache_mod.lists_dir().glob(".*.tmp")), "no temp file left behind"
+        fresh = MetadataCache()
+        assert [t.id for t in fresh.get_items("album:1")] == [1]
+        fresh.put("album:3", [{"id": 3}])
+        assert self._kept("album:1", "album:3") == {"album:1", "album:3"}
+
+    def test_a_torn_list_file_is_just_missing(self):
+        cache = MetadataCache()
+        cache.put("album:1", [{"id": 1}])
+        cache.put("album:2", [{"id": 2}])
+        path = cache_mod.list_file("album:1")
+        path.write_text(path.read_text()[:10])
+        assert MetadataCache().get("album:1") is None
+        assert [t.id for t in MetadataCache().get_items("album:2")] == [2]
 
     def test_another_process_s_write_is_seen(self):
         reader, writer = MetadataCache(), MetadataCache()
         assert reader.get("album:1") is None
-        time.sleep(0.01)
         writer.put_items("album:1", [_track(1)])
         assert [t.id for t in reader.get_items("album:1")] == [1]
+        writer.put_items("album:1", [_track(2)])
+        assert [t.id for t in reader.get_items("album:1")] == [2]
+        writer.clear_metadata()
+        assert reader.get("album:1") is None
+
+    def test_another_process_s_eviction_is_seen(self):
+        reader, writer = MetadataCache(), MetadataCache(metadata_cap=3_000)
+        self._entry(writer, "album:old", used=1)
+        assert reader.get("album:old") is not None
+        self._entry(writer, "album:new", used=2)
+        assert reader.get("album:old") is None
 
 
-def index_size() -> int:
-    return cache_mod.index_file().stat().st_size
+def lists_size() -> int:
+    return sum(f.stat().st_size for f in cache_mod.lists_dir().glob("*.json")
+               if f.name != "manifest.json")
