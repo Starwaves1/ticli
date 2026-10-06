@@ -163,6 +163,12 @@ class FakeTidal:
     def requests(self):
         return self.request_session.calls
 
+    def load_oauth_session(self, token_type, access_token, refresh_token=None, expiry_time=None,
+                           is_pkce=False):
+        self.access_token = access_token
+        self.http("GET", "sessions")
+        return True
+
     def http(self, method, path):
         response = self.request_session.request(method, path)
         if response.status_code >= 400:

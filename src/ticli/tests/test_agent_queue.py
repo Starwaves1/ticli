@@ -13,6 +13,7 @@ import time
 import pytest
 
 from ticli import agentq
+from ticli import player as player_mod
 from ticli.tests.agent_harness import GYM, ROAD, Harness
 from ticli.tests.fakes import FakeClock, FakeResponse, FakeTidal, fake_track
 from ticli.utils import throttle
@@ -161,7 +162,8 @@ class TestTheTrip:
         human = h.human("search", {"query": "z"})
         assert human["ok"] and len(h.session.requests) == calls + 1
 
-    def test_a_4006_trips_and_a_plain_401_does_not(self, player):
+    def test_a_4006_trips_and_a_plain_401_does_not(self, player, monkeypatch):
+        monkeypatch.setattr(player_mod, "load_tokens", lambda: {"token_type": "Bearer", "access_token": "a"})
         h = player()
         h.session.request_session.answers = [FakeResponse(401)]
         assert h.agent("search", {"query": "x"})["code"] == "auth_failed"
