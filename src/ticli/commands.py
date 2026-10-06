@@ -431,10 +431,13 @@ def _play_list(p, tracks, index) -> dict:
     if not 0 <= index < len(tracks):
         raise CommandError("bad_args", f"index must be 0..{len(tracks) - 1}.")
     if p._connectivity != ONLINE:
-        # Offline, start at the first entry from here that plays from disk (no reconnect for that).
         owned = {row["id"] for row in downloads.present()}
-        local = [i for i in range(index, len(tracks)) if p._has_local_copy(tracks[i], owned)]
-        index = local[0] if local else index
+        if not p._has_local_copy(tracks[index], owned) and p._reconnect() != ONLINE:
+            local = [i for i in range(index, len(tracks)) if p._has_local_copy(tracks[i], owned)]
+            if not local:
+                raise offline_error(p)
+            p._toast_skipped(local[0] - index)
+            index = local[0]
     p._queue = list(tracks)
     p._play_queue_index(index)
     return {"queue_length": len(tracks), "index": index}

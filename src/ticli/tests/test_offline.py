@@ -241,12 +241,49 @@ class TestPlaybackOffline:
         assert "nothing further" in p._toast
         assert p.session.calls == ["sessions"]
 
+    def _pick_from_album(self, p, index):
+        p._run = lambda name, **args: p.commands.execute(name, args, caller=HUMAN)
+        p._browse_tracks = [_track(11), _track(12), _track(13)]
+        p._lists[("album", "9")] = list(p._browse_tracks)
+        p._browse_source = ("album", "9")
+        p._play_browse(index)
+
+    def test_picking_a_track_with_no_local_copy_tries_the_network_then_skips(self, tokens):
+        p = _offline_player(tokens, fail=_dead())
+        _download(13, "Thirteen")
+        self._pick_from_album(p, 0)
+        assert p.session.calls.count("sessions") == 2, "one reconnect attempt for the pick"
+        assert p._plays == [13] and p._queue_index == 2
+        assert p._toast == "Offline — skipped 2 tracks with no local copy"
+
+    def test_picking_a_track_when_the_network_is_back_plays_that_track(self, tokens):
+        p = _offline_player(tokens, fail=None)
+        p._load_favorites = lambda: None
+        _download(13, "Thirteen")
+        self._pick_from_album(p, 0)
+        assert p._connectivity == ONLINE
+        assert p._plays == [11] and p._queue_index == 0
+
+    def test_picking_a_local_copy_offline_needs_no_network(self, tokens):
+        p = _offline_player(tokens, fail=_dead())
+        _download(12, "Twelve")
+        self._pick_from_album(p, 1)
+        assert p.session.calls == ["sessions"]
+        assert p._plays == [12]
+
     def test_a_list_played_offline_starts_on_its_first_local_copy(self, tokens):
         p = _offline_player(tokens, fail=_dead())
         _download(12, "Twelve")
         p._cache.put_items("album:9", [_track(11), _track(12)])
         assert p.commands.execute("play.album", {"id": 9}, caller=HUMAN)["result"]["index"] == 1
         assert p._plays == [12]
+        assert "skipped 1 track" in p._toast
+
+    def test_a_list_with_nothing_local_is_refused_offline(self, tokens):
+        p = _offline_player(tokens, fail=_dead())
+        p._cache.put_items("album:9", [_track(11)])
+        assert p.commands.execute("play.album", {"id": 9})["code"] == "offline"
+        assert p._plays == []
 
     def test_a_low_tier_cached_copy_still_plays_offline(self, tokens):
         p = _offline_player(tokens, fail=_dead())

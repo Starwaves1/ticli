@@ -2553,12 +2553,15 @@ class HeadlessTidalPlayer:
                 self._set_toast("Offline — nothing further in the queue has a local copy",
                                 seconds=PLAYER_ERROR_SECONDS)
             return False
-        if skipped:
-            self._set_toast(f"Offline — skipped {skipped} track{'' if skipped == 1 else 's'} "
-                            "with no local copy", seconds=PLAYER_ERROR_SECONDS)
+        self._toast_skipped(skipped)
         self._queue_index = index
         self._play_track(self._queue[index], **({"automatic": True} if automatic else {}))
         return True
+
+    def _toast_skipped(self, skipped: int) -> None:
+        if skipped:
+            self._set_toast(f"Offline — skipped {skipped} track{'' if skipped == 1 else 's'} "
+                            "with no local copy", seconds=PLAYER_ERROR_SECONDS)
 
     def _restart_current_track(self):
         self._seek_target = None
