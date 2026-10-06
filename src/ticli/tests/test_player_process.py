@@ -98,8 +98,34 @@ class _Running:
         self.core = core
         self.server = playerd.PlayerServer(core)
         self.server.listen()
+        self.passes = 0
+        self._passed = threading.Condition()
+        step = self.server.step
+
+        def counted(timeout=None):
+            step(timeout)
+            with self._passed:
+                self.passes += 1
+                self._passed.notify_all()
+
+        self.server.step = counted
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
+
+    def stays_after_clients_leave(self, timeout=2.0) -> bool:
+        """True once every client has gone and the loop has since decided, at least
+        once, not to leave; False if it left. Two passes: one may be mid-way."""
+        with self._passed:
+            if not self._passed.wait_for(lambda: not self.server.clients, timeout):
+                return False
+            target = self.passes + 2
+        deadline = time.monotonic() + timeout
+        while self.thread.is_alive() and time.monotonic() < deadline:
+            self.server.wake()
+            with self._passed:
+                if self._passed.wait_for(lambda: self.passes >= target, 0.05):
+                    return self.thread.is_alive()
+        return False
 
     def _serve(self):
         try:
@@ -393,13 +419,23 @@ class TestAgentGateOverTheSocket:
         assert conn.held[0]["state"]["switches"]["ai_control_key"] is True
 
 
+class TestTestHooks:
+    def test_the_session_hook_needs_its_flag(self, monkeypatch):
+        from ticli.utils import testhooks
+        monkeypatch.setenv("TICLI_TEST_SESSION", "ticli.tests.fake_tidal:session")
+        monkeypatch.delenv("TICLI_TEST_HOOKS", raising=False)
+        assert testhooks.session_factory() is None
+        monkeypatch.setenv("TICLI_TEST_HOOKS", "1")
+        from ticli.tests import fake_tidal
+        assert testhooks.session_factory() is fake_tidal.session
+
+
 class TestLifecycle:
     def test_closing_the_tui_keeps_playing(self, running):
         run = running()
         ui = _tui()
         ui.remote.close()
-        time.sleep(0.1)
-        assert run.thread.is_alive()
+        assert run.stays_after_clients_leave()
         assert run.core._playing is True
         assert run.core.audio.stopped == 0
 
@@ -413,8 +449,7 @@ class TestLifecycle:
     def test_the_last_track_ending_unattended_means_exit(self, running):
         run = running()
         _tui().remote.close()
-        time.sleep(0.05)
-        assert run.thread.is_alive()
+        assert run.stays_after_clients_leave()
         run.core._playing = False
         run.server._tick()
         run.thread.join(2)
@@ -424,8 +459,7 @@ class TestLifecycle:
         run = running(_core(playing=False))
         run.core._download_job = {"state": "running"}
         _tui().remote.close()
-        time.sleep(0.1)
-        assert run.thread.is_alive()
+        assert run.stays_after_clients_leave()
         run.core._download_job = {"state": "done"}
         run.server.wake()
         run.thread.join(2)
@@ -710,7 +744,8 @@ class TestTheRealLoop:
                 ui._show_artwork = False
                 threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM)).start()
                 ui.run()
-                code = 0 if run.thread.is_alive() and run.core.audio.stopped == 0 else 2
+                # Paused and unattended, the player then leaves on its own; the TUI must not stop it.
+                code = 0 if run.core.audio.stopped == 0 and not ui._quitting else 2
             finally:
                 os._exit(code)
         deadline = time.monotonic() + 5
@@ -729,4 +764,4 @@ class TestTheRealLoop:
             os.waitpid(pid, 0)
             pytest.fail("SIGTERM did not end a paused TUI")
         os.close(fd)
-        assert os.waitstatus_to_exitcode(status) == 0, "the player must outlive its TUI"
+        assert os.waitstatus_to_exitcode(status) == 0, "a signal detaches; only quitting stops"
