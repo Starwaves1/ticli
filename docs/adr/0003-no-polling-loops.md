@@ -1,0 +1,3 @@
+# No new polling loops, timers or probes
+
+Near-zero idle power is a product goal. Periodic work rides the monitor thread's existing 0.5 s tick, background work wakes the input loop through a self-pipe, and an unchanged frame is never repainted, so an idle player writes nothing to the terminal. A feature that wants periodic work piggybacks on the tick rather than adding a thread or timer. This also rules out network reachability probes or heartbeats: they are new wakeups, captive portals answer them with 200 while `api.tidal.com` is unreachable, and they are unrequested traffic against an API whose rate limit has already blocked the owner (ADR-0001).
