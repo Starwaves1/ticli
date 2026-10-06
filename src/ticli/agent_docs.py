@@ -57,8 +57,8 @@ agents, **requests 2 s apart**; you never pace by hand and cannot bypass it.
   run at once.
 - **Coalescing**: waiting adds to one playlist merge into one add (up to 100 ids
   per request, plus TIDAL's re-read: 2 requests for 1-100 ids); waiting likes
-  merge too. The reply says so in `result.merged`. 
-  Batch them, never add in a loop.
+  merge too. The reply says so in `result.merged`:
+  batch them, never add in a loop.
 - **`ticli agent do`** runs a JSON array in order with one combined reply, local
   commands first, TIDAL ones queued together so they coalesce:
   `ticli agent do '["playlist add ID 1 2", "like 3", "queue list"]'` (or the
