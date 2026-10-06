@@ -93,7 +93,7 @@ def home(monkeypatch):
     shutil.rmtree(home, ignore_errors=True)
 
 
-def test_start_play_pause_seek_two_tuis_detach_and_stop(home):
+def test_start_play_pause_seek_two_tuis_and_closing_the_last_stops(home):
     a, status = ipc.connect_or_start()
     assert status is None and a is not None, status
     assert os.stat(ipc.socket_path()).st_mode & 0o777 == 0o600
@@ -125,15 +125,11 @@ def test_start_play_pause_seek_two_tuis_detach_and_stop(home):
     assert _wait(lambda: 19 <= _status(a)["position"] <= 25)
 
     a.close()
-    b.close()
-    time.sleep(0.5)
-    c = ipc.connect()
-    assert c is not None and _status(c)["playing"], "detached, it keeps playing"
+    assert _wait(lambda: _status(b)["playing"]), "one TUI left: it keeps playing"
     assert _pid() == pid and _mpv_running(home)
 
-    assert c.request("stop", timeout=5)["ok"]
-    c.close()
-    assert _wait(lambda: _exited(pid)), "stopped and nobody attached: it leaves"
+    b.close()
+    assert _wait(lambda: _exited(pid)), "the last TUI closed: the music stops and it leaves"
     assert not ipc.socket_path().exists()
     assert _wait(lambda: not _mpv_running(home), 5)
 

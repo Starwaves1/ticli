@@ -156,6 +156,15 @@ def running():
         run.stop()
 
 
+def _wait_until(fn, timeout=2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not fn():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 def _tui(**flags):
     conn = ipc.connect()
     assert conn is not None
@@ -439,13 +448,31 @@ class TestTestHooks:
 
 
 class TestLifecycle:
-    def test_closing_the_tui_keeps_playing(self, running):
+    def test_closing_the_last_tui_stops_the_music_and_the_player(self, running):
         run = running()
         ui = _tui()
         ui.remote.close()
+        run.thread.join(2)
+        assert not run.thread.is_alive()
+        assert run.core._playing is False and run.core.audio.stopped >= 1
+
+    def test_closing_one_of_two_tuis_keeps_playing(self, running):
+        run = running()
+        first, second = _tui(), _tui()
+        first.remote.close()
+        assert _wait_until(lambda: len(run.server.clients) == 1)
+        assert run.core._playing is True and run.core.audio.stopped == 0
+        second.remote.close()
+        run.thread.join(2)
+        assert not run.thread.is_alive()
+
+    def test_music_started_without_a_tui_keeps_playing(self, running):
+        run = running()
+        cli = ipc.connect()
+        assert cli.request("status", timeout=2)["ok"]
+        cli.close()
         assert run.stays_after_clients_leave()
-        assert run.core._playing is True
-        assert run.core.audio.stopped == 0
+        assert run.core._playing is True and run.core.audio.stopped == 0
 
     def test_paused_and_nobody_left_means_exit(self, running):
         run = running(_core(playing=False))
@@ -456,7 +483,7 @@ class TestLifecycle:
 
     def test_the_last_track_ending_unattended_means_exit(self, running):
         run = running()
-        _tui().remote.close()
+        ipc.connect().close()
         assert run.stays_after_clients_leave()
         run.core._playing = False
         run.server._tick()
@@ -746,14 +773,14 @@ class TestTheRealLoop:
                 # pytest's capture objects stand in for these; the child needs the pty itself.
                 sys.stdin = os.fdopen(0, "r")
                 sys.stdout = os.fdopen(1, "w")
-                run = _Running(_core(playing=False))
+                _Running(_core(playing=False))
                 ui = HeadlessTidalPlayer(remote=ipc.connect())
                 ui.console = Console(file=sys.stdout, force_terminal=True, width=80, height=24)
                 ui._show_artwork = False
                 threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM)).start()
                 ui.run()
-                # Paused and unattended, the player then leaves on its own; the TUI must not stop it.
-                code = 0 if run.core.audio.stopped == 0 and not ui._quitting else 2
+                # Returning at all is the point: a closed terminal must not leave the TUI hanging.
+                code = 0
             finally:
                 os._exit(code)
         deadline = time.monotonic() + 5
@@ -772,4 +799,4 @@ class TestTheRealLoop:
             os.waitpid(pid, 0)
             pytest.fail("SIGTERM did not end a paused TUI")
         os.close(fd)
-        assert os.waitstatus_to_exitcode(status) == 0, "a signal detaches; only quitting stops"
+        assert os.waitstatus_to_exitcode(status) == 0, "a signal ends the TUI"

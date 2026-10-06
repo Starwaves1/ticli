@@ -56,6 +56,7 @@ class PlayerServer:
         self.sel = selectors.DefaultSelector()
         self.clients: dict = {}
         self.had_client = False
+        self._closing = False
         self.listener: Optional[socket.socket] = None
         self.sent: dict = {}
         self._clock = None
@@ -149,6 +150,7 @@ class PlayerServer:
             self.wake()
 
     def close(self) -> None:
+        self._closing = True
         if command_layer.idle_hook == self.wake:
             command_layer.idle_hook = None
         for client in list(self.clients.values()):
@@ -196,6 +198,11 @@ class PlayerServer:
         except (KeyError, ValueError):
             pass
         client.sock.close()
+        # Closing the last TUI (q, the window, a crash) stops the music; should_exit then ends the player.
+        core = self.core
+        if (client.subscribed and not self._closing and not self._subscribers()
+                and (core._playing or getattr(core.audio, "is_paused", False))):
+            core._stop_playback()
 
     def _read(self, client: _Client) -> None:
         try:

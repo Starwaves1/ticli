@@ -6412,7 +6412,7 @@ class HeadlessTidalPlayer:
         elif self._quitting:
             self.console.print("[dim]Player closed.[/dim]")
         else:
-            self.console.print("[dim]Detached; the player keeps playing. Run ticli to return.[/dim]")
+            self.console.print("[dim]Player closed.[/dim]")
 
 
 def run_tui(quality: Optional[str] = None, login_flow: Optional[str] = None) -> None:
