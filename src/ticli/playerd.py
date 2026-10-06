@@ -149,6 +149,20 @@ class PlayerServer:
         if not self.clients or any(c.subscribed for c in self.clients.values()):
             self.wake()
 
+    def stop_listening(self) -> None:
+        if self.listener is None:
+            return
+        try:
+            self.sel.unregister(self.listener)
+        except (KeyError, ValueError):
+            pass
+        self.listener.close()
+        self.listener = None
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
     def close(self) -> None:
         self._closing = True
         if command_layer.idle_hook == self.wake:
@@ -632,6 +646,7 @@ def main(argv=None) -> int:
         server.serve()
     finally:
         core.running = False
+        server.stop_listening()  # a client arriving now spawns a fresh player, not a dying one
         core._shutdown()
         server.close()
     return 0

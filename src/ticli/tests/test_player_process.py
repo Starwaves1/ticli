@@ -447,6 +447,14 @@ class TestTestHooks:
                 testhooks.session_factory()
 
 
+class TestShutdownStopsListeningFirst:
+    def test_a_dying_player_takes_no_new_clients(self, running):
+        run = running()
+        run.server.stop_listening()
+        assert not ipc.socket_path().exists()
+        assert ipc.connect() is None, "a shutting-down player must not accept connections"
+
+
 class TestLifecycle:
     def test_closing_the_last_tui_stops_the_music_and_the_player(self, running):
         run = running()
