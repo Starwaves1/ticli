@@ -28,6 +28,7 @@ import pytest
 
 from ticli import player as player_mod
 from ticli.utils import backend_health as backend_health_mod
+from ticli.utils import config as config_mod
 from ticli.utils import downloads as downloads_mod
 from ticli.utils import throttle as throttle_mod
 
@@ -47,6 +48,13 @@ def never_the_real_state_dir(tmp_path, monkeypatch):
     # `ticli agent --help`). Redirected here with the rest, because a test
     # that touches the throttle must never read or trip the owner's real one.
     monkeypatch.setattr(throttle_mod, "STATE_DIR", state)
+
+
+@pytest.fixture(autouse=True)
+def never_the_real_config(tmp_path, monkeypatch):
+    # `ticli agent` reads the AI control switches from config.json; the owner's must never decide a test.
+    monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(config_mod, "CONFIG_FILE", tmp_path / "config" / "config.json")
 
 
 @pytest.fixture(autouse=True)

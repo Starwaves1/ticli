@@ -278,6 +278,8 @@ class TestCliContract:
         out = json.loads(result.output)
         assert out == {
             "ok": True,
+            "ai_control": {"allow_ai_control": True, "allow_dangerous_commands": False,
+                           "key_required": False},
             "session_stored": True,
             "flow": "pkce",
             "flac_capable": True,
@@ -464,3 +466,72 @@ class TestDocsGapFixes:
         assert "it proves the login, not the audio" in docs  # sim 4: --verify
         assert "not_found" in docs                   # audit: error codes
         assert "Also not here yet" in docs           # audit: browse/settings
+
+
+class TestPermissions:
+    """`ticli agent` obeys the human's switches before it spends a request."""
+
+    @pytest.fixture
+    def no_session(self, monkeypatch):
+        opened = []
+        monkeypatch.setattr(agent_mod, "_session", lambda: opened.append(1) or None)
+        return opened
+
+    def _settings(self, **values):
+        from ticli.utils import config as config_mod
+        config_mod.save_config({**config_mod.DEFAULTS, **values})
+
+    def test_ai_control_off_refuses_tidal_verbs(self, stored_tokens, no_session):
+        self._settings(allow_ai_control=False)
+        result = CliRunner().invoke(cli, ["agent", "search", "x"])
+        payload = json.loads(result.output)
+        assert result.exit_code == 1 and payload["error"] == "ai_control_off"
+        assert "never edit config.json" in payload["hint"]
+        assert no_session == []
+
+    def test_ai_control_off_answers_playlist_list_from_disk(self, stored_tokens, no_session):
+        self._settings(allow_ai_control=False)
+        result = CliRunner().invoke(cli, ["agent", "playlist", "list"])
+        payload = json.loads(result.output)
+        assert payload["ok"] and payload["source"] == "disk"
+        assert no_session == []
+
+    def test_a_set_key_is_required(self, stored_tokens, no_session):
+        from ticli.utils.config import hash_ai_key
+        self._settings(ai_control_key=hash_ai_key("open sesame"))
+        missing = json.loads(CliRunner().invoke(cli, ["agent", "playlist", "list"]).output)
+        assert missing["error"] == "key_required"
+        assert no_session == []
+
+    def test_the_key_comes_from_the_environment_or_the_flag(self, monkeypatch, stored_tokens):
+        from ticli.utils.config import hash_ai_key
+        self._settings(ai_control_key=hash_ai_key("open sesame"))
+
+        class FakeUser:
+            def playlists(self):
+                return []
+
+        class FakeSession:
+            user = FakeUser()
+
+        monkeypatch.setattr(agent_mod, "_session", lambda: FakeSession())
+        monkeypatch.setattr(agent_mod, "_acquire", lambda: None)
+        by_env = CliRunner().invoke(cli, ["agent", "playlist", "list"],
+                                    env={"TICLI_AI_KEY": "open sesame"})
+        by_flag = CliRunner().invoke(cli, ["agent", "--key", "open sesame", "playlist", "list"])
+        assert json.loads(by_env.output)["ok"] and json.loads(by_flag.output)["ok"]
+
+    def test_status_is_never_gated_and_reports_the_switches(self, stored_tokens):
+        from ticli.utils.config import hash_ai_key
+        self._settings(allow_ai_control=False, ai_control_key=hash_ai_key("k"))
+        payload = json.loads(CliRunner().invoke(cli, ["agent", "status"]).output)
+        assert payload["ok"]
+        assert payload["ai_control"] == {"allow_ai_control": False,
+                                         "allow_dangerous_commands": False,
+                                         "key_required": True}
+
+    def test_docs_state_the_honour_system(self):
+        from ticli.agent_docs import DOCS
+        for phrase in ("Only the\nhuman can change them", "never edit `config.json`",
+                       "TICLI_AI_KEY", "ask\nyour human", "dangerous_off", "key_required"):
+            assert phrase in DOCS, phrase

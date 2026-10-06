@@ -196,11 +196,11 @@ def _status(p, args) -> dict:
         "playing": bool(p._playing),
         "position": round(p._get_position(), 1) if track else 0,
         "queue": {"length": len(p._queue), "index": p._queue_index},
-        "switches": _switches(cfg),
+        "switches": switches(cfg),
     }
 
 
-def _switches(cfg) -> dict:
+def switches(cfg) -> dict:
     return {"allow_ai_control": bool(cfg.get("allow_ai_control", True)),
             "allow_dangerous_commands": bool(cfg.get("allow_dangerous_commands", False)),
             "key_required": bool(coerce(get_spec("ai_control_key"), cfg.get("ai_control_key")))}
@@ -639,7 +639,7 @@ def _disk_status(cfg, args) -> dict:
     return {"track": tracks[index] if 0 <= index < len(tracks) else None,
             "playing": False, "position": state.get("position", 0),
             "queue": {"length": len(tracks), "index": index},
-            "switches": _switches(cfg), "source": "disk"}
+            "switches": switches(cfg), "source": "disk"}
 
 
 def _disk_queue_list(cfg, args) -> dict:

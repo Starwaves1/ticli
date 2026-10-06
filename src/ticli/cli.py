@@ -59,15 +59,19 @@ def cli(ctx, quality, login_flow):
 
 
 @cli.group()
-def agent():
+@click.option("--key", envvar="TICLI_AI_KEY", default=None, help="The AI control key, if your human set one (or TICLI_AI_KEY).")
+@click.pass_context
+def agent(ctx, key):
     """Headless verbs for programs. Start with `ticli agent docs`.
 
     stdout is always one JSON object (docs excepted). Every verb is
     rate-limited by a cross-process throttle; a TIDAL 429 or bot-detection
     response stops ALL agent requests until a human runs `ticli agent
     unblock`. Errors are structured: {"ok": false, "error": <code>,
-    "message": ..., "hint": ...} with a nonzero exit.
+    "message": ..., "hint": ...} with a nonzero exit. The human's TUI
+    settings decide what agents may do; a refusal says what to ask them.
     """
+    ctx.obj = {"key": key}
 
 
 @agent.command()

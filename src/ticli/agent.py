@@ -53,6 +53,29 @@ def fail(error: str, message: str, hint: str = "", **extra) -> "SystemExit":
 
 
 # ---------------------------------------------------------------------------
+# Permissions (ADR-0007): the human's switches, read from config on every call
+
+
+def _permit(verb: str, offline: str = "") -> dict:
+    """Refuse what the switches don't allow. With AI control off, a verb that
+    has an `offline` twin is answered from disk instead (returned), never TIDAL."""
+    import click
+
+    from ticli.commands import AGENT, gate, offline_read
+    from ticli.utils.config import load_config
+
+    ctx = click.get_current_context(silent=True)
+    key = ((ctx.obj if ctx else None) or {}).get("key")
+    cfg = load_config()
+    refused = gate(verb, AGENT, key, cfg, read=bool(offline))
+    if refused:
+        raise fail(refused["code"], refused["reason"], hint=refused["fix"])
+    if offline and not cfg["allow_ai_control"]:
+        return offline_read(offline, cfg=cfg)["result"]
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Session
 
 
@@ -229,9 +252,13 @@ def _playlist_json(p) -> dict:
 def status(verify: bool) -> None:
     """Zero requests by default: report what is knowable without the network.
     `--verify` spends exactly one on `check_login`."""
+    from ticli.commands import switches
+    from ticli.utils.config import load_config
+
     data = load_tokens()
     payload = {
         "ok": True,
+        "ai_control": switches(load_config()),
         "session_stored": bool(data),
         "flow": ("pkce" if data.get("is_pkce") else "device") if data else None,
         # PKCE is the only flow TIDAL streams FLAC to; device gets AAC.
@@ -243,6 +270,7 @@ def status(verify: bool) -> None:
         },
     }
     if verify:
+        _permit("status.verify")
         if not data:
             raise fail("not_logged_in", "No stored TIDAL session.",
                        hint="Run `ticli` interactively to log in.")
@@ -287,6 +315,7 @@ def search(query: str, types: tuple, limit: int) -> None:
     per-type server-side, the same property the TUI's reservoir leans on."""
     import tidalapi
 
+    _permit("search")
     wanted = list(types) or ["track"]
     models = {"track": tidalapi.Track, "album": tidalapi.Album,
               "artist": tidalapi.Artist, "playlist": tidalapi.Playlist}
@@ -338,6 +367,7 @@ def resolve(artist: str, title: str, limit: int) -> None:
     """
     import tidalapi
 
+    _permit("resolve")
     session = _session()
     results = _api_call(
         session.search, f"{artist} {title}",
@@ -381,12 +411,17 @@ def resolve(artist: str, title: str, limit: int) -> None:
 
 
 def playlist_list() -> None:
+    disk = _permit("playlist.list", offline="library.playlists")
+    if disk:
+        emit({"ok": True, **disk})
+        return
     session = _session()
     playlists = _api_call(session.user.playlists)
     emit({"ok": True, "playlists": [_playlist_json(p) for p in playlists]})
 
 
 def playlist_show(playlist_id: str) -> None:
+    _permit("playlist.show")
     session = _session()
     pl = _api_call(session.playlist, playlist_id)
     tracks = _api_call(pl.tracks)
@@ -395,6 +430,7 @@ def playlist_show(playlist_id: str) -> None:
 
 
 def playlist_create(name: str, description: str) -> None:
+    _permit("playlist.create")
     session = _session()
     pl = _api_call(session.user.create_playlist, name, description or "")
     emit({"ok": True, "playlist": _playlist_json(pl)})
@@ -403,6 +439,7 @@ def playlist_create(name: str, description: str) -> None:
 def playlist_add(playlist_id: str, track_ids: tuple) -> None:
     """Two requests (fetch the playlist, add the tracks). The server skips
     duplicates; `added` reports what it actually took."""
+    _permit("playlist.add")
     session = _session()
     pl = _api_call(session.playlist, playlist_id)
     added = _api_call(pl.add, [str(t) for t in track_ids])
