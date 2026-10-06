@@ -40,7 +40,7 @@ def _fake(tmp_path, name, body):
     """An executable sh script standing in for a player binary."""
     path = tmp_path / name
     path.write_text("#!/bin/sh\n" + body + "\n")
-    path.chmod(0o755)
+    path.chmod(0o700)
     return str(path)
 
 
@@ -163,7 +163,7 @@ class TestProbe:
 
     def test_a_binary_without_its_execute_bit_is_not_runnable(self, tmp_path):
         mpv = _fake(tmp_path, "mpv", "echo hi")
-        os.chmod(mpv, 0o644)
+        os.chmod(mpv, 0o600)
         assert bh.probe_backend("mpv", mpv).failure.code == bh.NOT_RUNNABLE
 
     def test_only_installed_backends_are_probed_in_preference_order(
