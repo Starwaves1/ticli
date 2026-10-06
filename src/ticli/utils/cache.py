@@ -576,8 +576,8 @@ class MetadataCache:
             if key in entries:
                 entries[key] = {**entries[key], "used": max(used, entries[key].get("used") or 0)}
         own_keys = {f"playlist:{i}" for i in own}
-        for key, entry in entries.items():
-            entry["library"] = key in LIBRARY_KEYS or key in own_keys or key.startswith(LIBRARY_PREFIXES)
+        entries = {key: {**entry, "library": key in LIBRARY_KEYS or key in own_keys
+                         or key.startswith(LIBRARY_PREFIXES)} for key, entry in entries.items()}
         evicted = self._evicted(entries)
         for key in evicted:
             entries.pop(key)
