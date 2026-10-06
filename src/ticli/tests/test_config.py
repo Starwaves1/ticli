@@ -7,6 +7,7 @@ No TIDAL session or network needed.
 
 import json
 import os
+import types
 
 import pytest
 from click.testing import CliRunner
@@ -556,7 +557,17 @@ class TestSettingsKeyHandler:
         p._settings_cursor = 0
         p._handle_settings_key(player_mod.KEY_LEFT)  # HIGH → MEDIUM
         assert p._quality_name == "MEDIUM"
-        assert p.session.audio_quality == tidalapi.Quality.low_320k
+        asked = []
+
+        def _stream():
+            asked.append(p.session.audio_quality)
+            return types.SimpleNamespace(
+                audio_quality=asked[-1],
+                get_stream_manifest=lambda: types.SimpleNamespace(
+                    is_bts=True, get_urls=lambda: ["http://127.0.0.1/1.mp4"]))
+
+        p._stream_url(types.SimpleNamespace(id=1, get_stream=_stream))
+        assert asked == [tidalapi.Quality.low_320k], "the next stream ignored the new quality"
 
     def test_page_size_change_applies_live_and_saves(self, config_file):
         p = self._player()

@@ -1332,6 +1332,9 @@ class HeadlessTidalPlayer:
         # Leaf lock held across one whole load-modify-save of player_state.json; nothing inside may retake it
         # (_save_state reaches the merge through its unlocked _locked half).
         self._state_lock = threading.Lock()
+        # Leaf lock: tidalapi keeps one quality per session and get_stream reads it, so setting the tier and
+        # building the request must not interleave. The UI thread never takes it; a request can hang.
+        self._quality_lock = threading.Lock()
         # Never closed: the kernel releases the lock at exit, crashes included
         self._instance_lock_fd: Optional[int] = None
         self._liked_ids: set = set()
@@ -1971,8 +1974,12 @@ class HeadlessTidalPlayer:
     def _stream_url(self, track) -> str:
         return self._stream_description(track)[0]
 
-    def _stream_description(self, track) -> tuple:
-        stream = track.get_stream()
+    def _stream_description(self, track, quality=None) -> tuple:
+        with self._quality_lock:
+            wanted = quality or self.QUALITY_MAP.get(self._quality_name)
+            if wanted:
+                self.session.audio_quality = wanted
+            stream = track.get_stream()
         granted = getattr(stream, "audio_quality", None)
         self._note_granted_quality(granted)
         manifest = stream.get_stream_manifest()
@@ -4981,14 +4988,7 @@ class HeadlessTidalPlayer:
         raise last or RuntimeError("no tier could be streamed")
 
     def _download_stream_url(self, track, tier: str) -> tuple:
-        wanted = self.QUALITY_MAP.get(tier)
-        previous = self.session.audio_quality
-        try:
-            if wanted:
-                self.session.audio_quality = wanted
-            return self._stream_description(track)
-        finally:
-            self.session.audio_quality = previous
+        return self._stream_description(track, self.QUALITY_MAP.get(tier))
 
     def _cover_bytes(self, track):
         # Plain GET from resources.tidal.com, not an API request, so it cannot add to a rate limit.
@@ -5160,7 +5160,6 @@ class HeadlessTidalPlayer:
     def _apply_setting(self, key: str, value):
         if key == "quality":
             self._quality_name = value
-            self.session.audio_quality = self.QUALITY_MAP[value]
         elif key == "page_size":
             self._page_size = value
         elif key == "progress_bar_max":
