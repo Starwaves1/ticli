@@ -261,7 +261,7 @@ from ticli.utils.cache import (
     is_owned_audio,
     track_record,
 )
-from ticli.utils import artwork, downloads, tags
+from ticli.utils import artwork, backend_health, downloads, tags
 
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
@@ -889,27 +889,35 @@ class AudioPlayer:
             self._stderr_path = None
             return subprocess.DEVNULL
 
-    def _last_stderr(self) -> str:
+    def _spawn(self, cmd: list) -> subprocess.Popen:
+        try:
+            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=self._open_stderr())
+        except OSError as e:
+            # Own type: OSError is also the base of every requests failure, which callers handle differently.
+            raise backend_health.SpawnError(
+                backend_health.classify_spawn_error(self.player_cmd, e)) from e
+
+    def _stderr_text(self) -> str:
         if not self._stderr_path:
             return ""
         try:
-            lines = Path(self._stderr_path).read_text(errors="replace").splitlines()
+            return Path(self._stderr_path).read_text(errors="replace")
         except OSError:
             return ""
-        said = [ln.strip() for ln in lines if ln.strip()]
-        return said[-1][:PLAYER_ERROR_CHARS] if said else ""
 
-    def failure(self) -> Optional[str]:
+    def failure(self) -> Optional[backend_health.PlayerFailure]:
+        # Signals count as failures: every kill of ours drops or replaces _process under this lock,
+        # so a signal on a held handle came from elsewhere (e.g. dyld's SIGABRT for an unloadable binary).
         with self._lock:
             process = self._process
             if process is None:
                 return None
             code = process.poll()
-            if code is None or code <= 0:
+            if code is None or code == 0:
                 return None
-            detail = self._last_stderr()
-        return f"{self.player_cmd} error: {detail}" if detail else \
-            f"{self.player_cmd} exited with status {code}"
+            stderr = self._stderr_text()
+        return backend_health.classify_exit(self.player_cmd, code, stderr,
+                                            limit=PLAYER_ERROR_CHARS)
 
     def _hls_flags(self) -> list:
         if self.player_cmd == "mpv":
@@ -980,11 +988,7 @@ class AudioPlayer:
         else:
             self._ipc_path = None
             cmd = self._ffplay_cmd(source, seek)
-        self._process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=self._open_stderr(),
-        )
+        self._process = self._spawn(cmd)
         return have_kept, self._download_gen
 
     def _ffplay_cmd(self, source: str, seek: float) -> list:
@@ -998,11 +1002,9 @@ class AudioPlayer:
         return cmd
 
     def _spawn_ffplay(self, source: str, seek: float):
-        self._process = subprocess.Popen(
-            self._ffplay_cmd(source, seek),
-            stdout=subprocess.DEVNULL,
-            stderr=self._open_stderr(),
-        )
+        # Drop the handle first: if _spawn raises, a stale _process would make failure() read our own SIGTERM as an outside kill.
+        self._process = None
+        self._process = self._spawn(self._ffplay_cmd(source, seek))
 
     def _play_from_cache(self, seek: float):
         self._spawn_ffplay(self._cache_file, seek)
@@ -1877,9 +1879,21 @@ class HeadlessTidalPlayer:
                 self._playing = True
                 self._play_start_time = time.time()
                 self._play_offset = seek
-            except Exception:
+            except backend_health.SpawnError as e:
                 if self._play_gen == gen:
                     self._playing = False
+                    self._report_player_failure(e.failure)
+            except Exception as e:
+                if self._play_gen == gen:
+                    self._playing = False
+                    self._set_toast(
+                        "TIDAL is rate-limiting — playback stopped. "
+                        "Nothing will be retried." if _looks_rate_limited(str(e))
+                        else f"Couldn't start the track — {type(e).__name__}: "
+                             f"{str(e)[:PLAYER_ERROR_CHARS]}",
+                        seconds=PLAYER_ERROR_SECONDS)
+                    logger.warning("Track start failed: %r", e)
+                    self._wake()
             finally:
                 if self._play_gen == gen:
                     self._track_changing = False
@@ -2048,6 +2062,12 @@ class HeadlessTidalPlayer:
                 if not (self.audio and self.audio.seek_to(target)):
                     self._play_track(track, seek=target)
                 self._seek_applied = target
+            except backend_health.SpawnError as e:
+                # Mark delivered anyway: retrying each tick would repeat the failure and the probe
+                self._seek_applied = target
+                if self._play_gen == gen:
+                    self._playing = False
+                    self._report_player_failure(e.failure)
             finally:
                 self._seek_applying = False
 
@@ -2070,11 +2090,20 @@ class HeadlessTidalPlayer:
             return
         if not self._current_track:
             return
-        if self.audio and self.audio.is_paused and self.audio.resume():
-            self._playing = True
-            self._play_start_time = time.time()
-        else:
-            self._start_current_from_position()
+        if self.audio and self.audio.is_paused:
+            try:
+                resumed = self.audio.resume()
+            except backend_health.SpawnError as e:
+                self._playing = False
+                # Off the UI thread: the report runs a version probe per backend
+                threading.Thread(target=self._report_player_failure,
+                                 args=(e.failure,), daemon=True).start()
+                return
+            if resumed:
+                self._playing = True
+                self._play_start_time = time.time()
+                return
+        self._start_current_from_position()
 
     def _start_current_from_position(self):
         seek = self._get_position()
@@ -2178,11 +2207,9 @@ class HeadlessTidalPlayer:
                 failure = self.audio.failure() if self.audio else None
                 if (failure and self.audio and not self.audio.source_vanished()
                         and self._track_has_time_left()):
-                    self._set_toast(f"Playback failed — {failure}",
-                                    seconds=PLAYER_ERROR_SECONDS)
-                    logger.warning("Playback failed: %s", failure)
                     self._playing = False
                     self._play_start_time = None
+                    self._report_player_failure(failure)
                 elif (self.audio and self._current_track is not None
                         and self.audio.source_vanished()
                         and self._track_has_time_left()):
@@ -2207,6 +2234,7 @@ class HeadlessTidalPlayer:
                     self._playing = False
                     self._play_start_time = None
                     self._play_offset = position
+                    self._report_player_failure(None)
                 elif self._queue and self._queue_index < len(self._queue) - 1:
                     self._play_queue_index(self._queue_index + 1)
                 else:
@@ -2234,6 +2262,22 @@ class HeadlessTidalPlayer:
 
     def _track_duration(self):
         return getattr(self._current_track, "duration", 0) or 0
+
+    def _report_player_failure(self, failure) -> None:
+        # Probes only after a failure, never at startup (a subprocess per backend). Never call on the UI thread.
+        probes = backend_health.probe_backends(AUDIO_PLAYERS)
+        if failure is None:
+            player = getattr(self.audio, "player_cmd", None)
+            active = next((p for p in probes if p.player == player), None)
+            if active is None or active.ok:
+                return
+            failure = active.failure
+        message = backend_health.describe(failure, probes)
+        self._set_toast(f"Playback failed — {message}",
+                        seconds=PLAYER_ERROR_SECONDS)
+        logger.warning("Playback failed [%s]: %s (%s)",
+                       failure.code, message, failure.detail)
+        self._wake()
 
     def _track_has_time_left(self) -> bool:
         duration = self._track_duration()
@@ -5648,11 +5692,10 @@ class HeadlessTidalPlayer:
         self._instance_lock_fd, other = _take_instance_lock()
         if other is not None:
             named = f" (pid {other})" if other else ""
-            self.console.print(
-                f"[red]ticli is already running{named}.[/red]\n"
-                "Only one copy can run at a time: two play over each other, "
-                "and each one's saved position overwrites the other's.\n"
-                "Quit the running copy first, or use the terminal it is in.")
+            # SIGTERM exits through the same save-and-stop path as quitting
+            stop = f", or stop it with: kill {other}" if other else "."
+            self.console.print(f"[red]ticli is already running{named}.[/red]\n"
+                               f"Switch to its terminal{stop}")
             return
 
         player_cmd = _find_audio_player()

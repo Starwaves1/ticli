@@ -19,6 +19,7 @@ import tidalapi
 from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
 from ticli.tests.fakes import patch_get
+from ticli.utils import backend_health
 from ticli.utils import config as config_mod
 from ticli.utils import credential_store as store
 
@@ -648,25 +649,55 @@ class TestFailedPlaybackIsVisible:
         open(audio._stderr_path, "w").write(
             "[ffmpeg/demuxer] mov,mp4: trun track id unknown, no tfhd was found\n")
         audio._process = types.SimpleNamespace(poll=lambda: 3)
-        assert "no tfhd was found" in audio.failure()
+        failure = audio.failure()
+        assert failure.code == backend_health.EXIT_STATUS
+        assert "no tfhd was found" in failure.summary
 
     def test_a_player_that_died_silently_still_reports_its_status(self, tmp_path):
         audio = self._audio(tmp_path)
         open(audio._stderr_path, "w").write("\n  \n")
         audio._process = types.SimpleNamespace(poll=lambda: 3)
-        assert audio.failure() == "mpv exited with status 3"
+        assert audio.failure().summary == "mpv exited with status 3"
 
     def test_a_track_that_simply_ended_is_not_a_failure(self, tmp_path):
         audio = self._audio(tmp_path)
         audio._process = types.SimpleNamespace(poll=lambda: 0)
         assert audio.failure() is None
 
-    def test_a_player_we_killed_ourselves_is_not_a_failure(self, tmp_path):
-        # stop() and ffplay's pause both terminate the process; a negative
-        # return code is a signal, which is us, not the stream
+    def test_a_signal_on_a_held_process_is_a_failure(self, tmp_path):
+        """This used to assert the opposite — "a negative return code is us".
+        It never was: stop(), ffplay's pause and a scrub's respawn all drop or
+        replace `_process` under the lock, so a signalled process still held
+        was signalled by someone else. Believing otherwise is what turned a
+        player dyld refused to load into "stopped early at 0:00"."""
         audio = self._audio(tmp_path)
         audio._process = types.SimpleNamespace(poll=lambda: -15)
+        failure = audio.failure()
+        assert failure.code == backend_health.KILLED
+        assert "SIGTERM" in failure.summary
+
+    def test_a_player_we_stopped_ourselves_is_not_a_failure(self, tmp_path):
+        audio = player_mod.AudioPlayer("mpv", cache=None)
+        audio._process = types.SimpleNamespace(poll=lambda: -15)
+        audio._ipc_path = None
+        audio._reap_process = lambda: None
+        audio.stop()
         assert audio.failure() is None
+
+    def test_a_player_dyld_refused_names_the_missing_library(self, tmp_path):
+        """2026-10-05, verbatim in shape: SIGABRT, and the useful line first —
+        followed by dyld's search path, which is what used to be shown."""
+        audio = self._audio(tmp_path)
+        open(audio._stderr_path, "w").write(
+            "dyld[2430]: Library not loaded: "
+            "/opt/homebrew/opt/libunibreak/lib/libunibreak.7.dylib\n"
+            "  Referenced from: <6646> /opt/homebrew/Cellar/libass/0.17.5/lib/libass.9.dylib\n"
+            "  Reason: tried: '/opt/homebrew/opt/libunibreak/lib/libunibreak.7.dylib' (no such file)\n")
+        audio._process = types.SimpleNamespace(poll=lambda: -6)
+        failure = audio.failure()
+        assert failure.code == backend_health.BROKEN_INSTALL
+        assert "libunibreak.7.dylib" in failure.summary
+        assert failure.detail.startswith("dyld[2430]: Library not loaded")
 
     def test_a_running_player_is_not_a_failure(self, tmp_path):
         audio = self._audio(tmp_path)
@@ -677,7 +708,9 @@ class TestFailedPlaybackIsVisible:
         audio = self._audio(tmp_path)
         open(audio._stderr_path, "w").write("x" * 500 + "\n")
         audio._process = types.SimpleNamespace(poll=lambda: 1)
-        assert len(audio._last_stderr()) == player_mod.PLAYER_ERROR_CHARS
+        failure = audio.failure()
+        assert failure.summary == "mpv error: " + "x" * player_mod.PLAYER_ERROR_CHARS
+        assert failure.detail == "x" * 500   # the log keeps it whole
 
     def test_the_monitor_toasts_the_failure_instead_of_skipping_on(
             self, token_file, monkeypatch):
@@ -694,7 +727,9 @@ class TestFailedPlaybackIsVisible:
         player._play_queue_index = lambda i: advanced.append(i)
         player.audio = types.SimpleNamespace(
             is_paused=False, is_playing=False,
-            failure=lambda: "mpv error: Failed to recognize file format.",
+            failure=lambda: backend_health.PlayerFailure(
+                backend_health.EXIT_STATUS, "mpv",
+                "mpv error: Failed to recognize file format."),
             source_vanished=lambda: False,
             get_time_pos=lambda: None,
             poll_media_key=lambda: None,

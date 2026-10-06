@@ -210,7 +210,8 @@ class TestRunRefusesTheSecondInstance:
         said = capsys.readouterr().out
         assert "already running" in said
         assert str(os.getpid()) in said, "name the process to go and quit"
-        assert "Quit" in said, "an error with no way forward is half an error"
+        assert f"kill {os.getpid()}" in said, \
+            "an error with no way forward is half an error"
 
     def test_the_first_instance_is_not_refused(self, monkeypatch):
         """The guard must not stand in the way of the normal case."""
