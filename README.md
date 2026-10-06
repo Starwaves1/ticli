@@ -58,8 +58,10 @@ On first run you'll get a URL to authorize with your TIDAL account. After that, 
 Verbs that talk to the running player, one line of output each (`ticli --help` lists them all):
 
 ```bash
-ticli status | pause | resume | next | prev          # "nothing playing" if no player is running; never starts one
+ticli status | pause | resume | next | prev          # "nothing playing" if no player is running; only resume starts one, for the saved track
+ticli play                                           # bare: the same as resume ("nothing to play" if nothing was playing)
 ticli start playlist edm                             # play it, then open the TUI here (--no-tui: just play)
+ticli start                                          # bare: resume what was playing, then open the TUI
 ticli playlist create "Road trip"
 ticli playlist add "Road trip" "daft punk - one more time"
 ticli like                                           # the playing track

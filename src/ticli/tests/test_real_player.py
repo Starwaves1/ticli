@@ -176,3 +176,84 @@ def test_offline_start_reconnects_only_on_an_action(home, monkeypatch):
     refused = a.request("like", {"track_ids": [1]}, caller="agent", timeout=10)
     assert refused["code"] == "offline"
     a.close()
+
+
+def _saved_paused_track(home) -> None:
+    """A saved, paused track on disk and no player running, the way a quit leaves it."""
+    a, status = ipc.connect_or_start()
+    assert status is None and a is not None, status
+    pid = _pid()
+    assert a.request("play.track", {"track_ids": [1]}, timeout=10)["ok"]
+    assert _wait(lambda: _status(a)["playing"] and _status(a)["position"] > 0.3)
+    assert a.request("seek", {"position": 20}, timeout=5)["ok"]
+    assert a.request("pause", timeout=5)["ok"]
+    os.kill(pid, signal.SIGTERM)
+    assert _wait(lambda: _exited(pid))
+    assert _wait(lambda: not _mpv_running(home), 5)
+    a.close()
+    saved = json.loads((throttle.STATE_DIR / "player_state.json").read_text())
+    assert saved["track_ids"] == [1] and saved["position"] > 0
+
+
+def _human_cli(home, *words, timeout=20.0):
+    """`ticli WORDS` as the human from a shell: stdin, stdout and stderr all one terminal."""
+    import pty
+    import select
+    import sys
+    primary, secondary = pty.openpty()
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+    started = time.monotonic()
+    proc = subprocess.Popen([sys.executable, "-m", "ticli.cli", *words], stdin=secondary,
+                            stdout=secondary, stderr=secondary, env=env, cwd=str(home),
+                            start_new_session=True)
+    os.close(secondary)
+    out = b""
+    try:
+        deadline = started + timeout
+        while proc.poll() is None and time.monotonic() < deadline:
+            if select.select([primary], [], [], 0.05)[0]:
+                try:
+                    out += os.read(primary, 4096)
+                except OSError:
+                    break
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+            raise AssertionError(f"`ticli {' '.join(words)}` hung: {out!r}")
+        while select.select([primary], [], [], 0.05)[0]:
+            try:
+                chunk = os.read(primary, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+    finally:
+        os.close(primary)
+    return proc.returncode, out.decode(errors="replace").replace("\r\n", "\n"), \
+        time.monotonic() - started
+
+
+def test_human_resume_starts_the_player_says_so_and_answers_at_once(home):
+    _saved_paused_track(home)
+    code, out, took = _human_cli(home, "resume")
+    assert code == 0 and "resumed" in out, out
+    assert "starting the player" in out, "a start is never a silent wait"
+    assert took < 5, took
+    assert _wait(lambda: _mpv_running(home), 5), "the saved track plays"
+
+
+def test_human_resume_gives_up_readably_on_a_player_that_does_not_answer(home):
+    a, status = ipc.connect_or_start()
+    assert status is None and a is not None, status
+    assert a.request("play.track", {"track_ids": [1]}, timeout=10)["ok"]
+    assert a.request("pause", timeout=5)["ok"]
+    pid = _pid()
+    os.kill(pid, signal.SIGSTOP)  # its socket still takes connections; nothing answers
+    try:
+        code, out, took = _human_cli(home, "resume", timeout=30)
+    finally:
+        os.kill(pid, signal.SIGCONT)
+    assert code == 1 and "has not answered" in out and "ticli status" in out, out
+    assert took < 10, took
+    a.close()

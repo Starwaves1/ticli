@@ -147,14 +147,16 @@ class HumanGroup(RegistryGroup):
         def callback(words):
             from ticli import humancli
             if not words:
-                raise click.UsageError("ticli play NAME: an album, playlist, track or artist name, a TIDAL URL, or a number to pick.")
+                humancli.play_saved()
+                return
             humancli.play(words)
         return click.Command("play", callback=callback,
                              params=[click.Argument(["words"], nargs=-1, type=click.UNPROCESSED)],
                              context_settings={"ignore_unknown_options": True},
                              help="Play anything: an album, playlist, track or artist by name, or a TIDAL URL. "
                                   "Your playlists match first with no request; else one TIDAL search. "
-                                  "`ticli play album NAME` etc. still work.")
+                                  "`ticli play album NAME` etc. still work. Bare `ticli play` resumes "
+                                  "what was playing, like `ticli resume`.")
 
     def run(self, dotted, tokens) -> None:
         from ticli import humancli
@@ -205,16 +207,22 @@ for _name, _doc in (("pause", "Pause playback. One line, then exit; never starts
 
 
 @cli.command()
-@click.argument("kind", type=click.Choice(["playlist", "album", "artist"]))
-@click.argument("name", nargs=-1, required=True)
+@click.argument("kind", type=click.Choice(["playlist", "album", "artist"]), required=False)
+@click.argument("name", nargs=-1)
 @click.option("--no-tui", is_flag=True, help="Only start playback; don't open the TUI.")
 def start(kind, name, no_tui):
     """Play a playlist, album or artist by name, then open the TUI here.
 
     Your own playlists match case-insensitively with no TIDAL request; anything
     else is one TIDAL search. Several matches print a numbered top 5: run
-    `ticli start playlist 2` to pick."""
+    `ticli start playlist 2` to pick. Bare `ticli start` resumes what was
+    playing (if anything), then opens the TUI."""
     from ticli import humancli
+    if kind is None:
+        humancli.start_saved(no_tui)
+        return
+    if not name:
+        raise click.UsageError(f"ticli start {kind} NAME: the {kind}'s name or id.")
     humancli.start(kind, " ".join(name), no_tui)
 
 

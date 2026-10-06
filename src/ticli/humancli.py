@@ -39,6 +39,11 @@ PICK = re.compile(r"[1-9]\d?")
 PICK_TTL_SECONDS = 600
 PAGE = 100
 CONFIRM_ABOVE = 200
+# How long a human verb waits: for a start, for a reply (a TIDAL read may queue), and
+# for a transport verb's reply, which the player gives before any stream is fetched.
+START_SECONDS = 30.0
+REPLY_SECONDS = 60.0
+TRANSPORT_REPLY_SECONDS = 5.0
 URL = re.compile(r"(?:^|/)(track|album|playlist)/([0-9A-Za-z-]+)")
 
 
@@ -89,26 +94,45 @@ class Link:
         probe.close()
         return True
 
-    def ask(self, cmd: str, args=None) -> dict:
+    def ask(self, cmd: str, args=None, timeout: float = REPLY_SECONDS) -> dict:
         args = args or {}
         if self.who == AGENT:
             from ticli import agent
             return agent.call(cmd, args)
-        from ticli import agent, ipc
+        from ticli import ipc
         from ticli.agentq import render
         if self.conn is None:
-            self.conn, status = ipc.connect_or_start()
-            if self.conn is None:
-                return agent._start_error(status)
-        response = self.conn.request(cmd, args, caller="human", timeout=60)
+            self.conn = ipc.connect()
+        if self.conn is None:
+            failed = self._start()
+            if failed:
+                return failed
+        response = self.conn.request(cmd, args, caller="human", timeout=timeout)
         if response is None:
-            self.conn = None
-            return refusal("player_gone", "The player closed the connection.",
-                           "Run `ticli status`; the action may still have run.")
+            closed = self.conn.closed
+            self.close()
+            if closed:
+                return refusal("player_gone", "The player closed the connection.",
+                               "Run `ticli status`; the action may still have run.")
+            return refusal("player_slow", f"The player has not answered in {timeout:g} s.",
+                           "It may still do it; run `ticli status` in a moment.")
         response.pop("id", None)
         if response.get("ok"):
             response["result"] = render(response.get("result"))
         return response
+
+    def _start(self):
+        """Start the player, saying so first: signing in to TIDAL can take seconds, and
+        a silent wait reads as a hang. None once connected, else the refusal."""
+        from ticli import agent, ipc
+        click.echo("starting the player...", err=True)
+        self.conn, status = ipc.connect_or_start(timeout=START_SECONDS)
+        if self.conn is not None:
+            return None
+        if status and "did not start in time" in status:
+            return refusal("player_slow", f"The player did not start within {START_SECONDS:g} s.",
+                           "It may still be signing in; run the command again in a moment.")
+        return agent._start_error(status)
 
     def close(self) -> None:
         if self.conn is not None:
@@ -576,9 +600,64 @@ def transport(cmd: str) -> None:
             click.echo("nothing playing")
             raise SystemExit(0 if cmd == "status" else 1)
     try:
-        say(who, cmd, link.ask(cmd))
+        say(who, cmd, link.ask(cmd, timeout=TRANSPORT_REPLY_SECONDS))
     finally:
         link.close()
+
+
+def _resume_saved(who: str):
+    """Resume what was playing: the running player's track, else the saved one (the
+    player starts for it). None when there is nothing to resume."""
+    link = Link(who)
+    try:
+        if link.running():
+            status = link.ask("status", timeout=TRANSPORT_REPLY_SECONDS)
+            track = ((status.get("state") or {}).get("track")
+                     or (status.get("result") or {}).get("track"))
+            if status.get("ok") and not track:
+                return None
+            if not status.get("ok"):
+                return status
+        elif not _saved_status().get("track"):
+            return None
+        return link.ask("resume", timeout=TRANSPORT_REPLY_SECONDS)
+    finally:
+        link.close()
+
+
+def play_saved() -> None:
+    """Bare `ticli play`: what `ticli resume` does, or "nothing to play"."""
+    who = caller()
+    try:
+        guard("resume", who)
+    except Stop as stop:
+        raise fail(stop.reply)
+    reply = _resume_saved(who)
+    if reply is None:
+        click.echo("nothing to play")
+        raise SystemExit(1)
+    say(who, "resume", reply)
+
+
+def start_saved(no_tui: bool) -> None:
+    """Bare `ticli start`: resume like bare `ticli play`, then the TUI; with nothing
+    to resume, just the TUI."""
+    who = caller()
+    try:
+        guard("resume", who)
+    except Stop as stop:
+        raise fail(stop.reply)
+    reply = _resume_saved(who)
+    if reply is not None:
+        say(who, "resume", reply)
+    if who == HUMAN and not no_tui:
+        _open_tui()
+
+
+def _open_tui() -> None:
+    root = click.get_current_context().find_root().params
+    from ticli.player import run_tui
+    run_tui(quality=root.get("quality"), login_flow=root.get("login_flow"))
 
 
 def search(words, types, limit) -> None:
@@ -607,9 +686,7 @@ def start(kind: str, name: str, no_tui: bool) -> None:
     else:
         say(who, f"play.{kind}", reply)
     if who == HUMAN and not no_tui and reply.get("ok"):
-        root = click.get_current_context().find_root().params
-        from ticli.player import run_tui
-        run_tui(quality=root.get("quality"), login_flow=root.get("login_flow"))
+        _open_tui()
 
 
 PLAY_ORDER = ("album", "playlist", "track", "artist")

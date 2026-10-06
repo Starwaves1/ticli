@@ -267,6 +267,71 @@ class TestStart:
         assert [t.id for t in h.core._queue] == [61, 62]
 
 
+def _save_paused_track():
+    from ticli.utils import throttle
+    throttle.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (throttle.STATE_DIR / "player_state.json").write_text(json.dumps(
+        {"tracks": [{"id": 7, "name": "Saved", "duration": 200}], "queue_index": 0,
+         "position": 30}))
+
+
+class TestBarePlayAndStart:
+    @pytest.fixture
+    def tui(self, monkeypatch):
+        opened = []
+        from ticli import player as player_mod
+        monkeypatch.setattr(player_mod, "run_tui", lambda **kw: opened.append(kw))
+        return opened
+
+    def test_bare_play_resumes_like_resume(self, player, tty):
+        h = player()
+        assert ticli("pause").exit_code == 0 and h.core._playing is False
+        result = ticli("play")
+        assert result.exit_code == 0 and result.output.strip() == "resumed"
+        assert h.core._playing is True
+
+    def test_bare_play_with_nothing_saved_says_so_and_starts_nothing(self, tty, spawned):
+        result = ticli("play")
+        assert result.exit_code == 1 and result.output.strip() == "nothing to play"
+        assert spawned == []
+
+    def test_bare_play_starts_the_player_for_a_saved_track(self, tty, spawned):
+        _save_paused_track()
+        result = ticli("play")
+        assert len(spawned) == 1, "the player is started to resume the saved track"
+        assert "starting the player" in result.stderr
+        assert result.exit_code == 1 and "error: no player" in result.stderr
+
+    def test_bare_play_with_a_running_player_and_no_track_has_nothing_to_play(self, player, tty):
+        h = player()
+        h.core._current_track = None
+        h.core._playing = False
+        result = ticli("play")
+        assert result.exit_code == 1 and result.output.strip() == "nothing to play"
+
+    def test_bare_start_resumes_then_opens_the_tui(self, player, tty, tui):
+        h = player()
+        ticli("pause")
+        result = ticli("start")
+        assert result.exit_code == 0 and result.output.strip() == "resumed"
+        assert h.core._playing is True and len(tui) == 1
+
+    def test_bare_start_with_nothing_saved_just_opens_the_tui(self, tty, spawned, tui):
+        result = ticli("start")
+        assert result.exit_code == 0 and result.output.strip() == ""
+        assert len(tui) == 1 and spawned == []
+
+    def test_bare_start_no_tui_only_resumes(self, player, tty, tui):
+        h = player()
+        ticli("pause")
+        assert ticli("start", "--no-tui").exit_code == 0
+        assert h.core._playing is True and tui == []
+
+    def test_start_kind_without_a_name_is_a_usage_error(self, tty, tui):
+        result = ticli("start", "playlist")
+        assert result.exit_code == 2 and "NAME" in result.output and tui == []
+
+
 class TestPlayAnything:
     def test_an_exact_album_name_plays_the_album_with_one_search(self, player, tty):
         album = fake_album(4242, "How to Listen to This Album", "Artist",
@@ -484,7 +549,8 @@ class TestSavedQueueWithNoPlayer:
         monkeypatch.setattr(ipc, "spawn_player", spawn)
         try:
             result = ticli("resume")
-            assert result.exit_code == 0 and result.output.strip() == "resumed"
+            assert result.exit_code == 0 and result.stdout.strip() == "resumed"
+            assert result.stderr.strip() == "starting the player..."
             assert len(made) == 1 and made[0].core._playing is True
         finally:
             for h in made:
