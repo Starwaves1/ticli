@@ -1713,7 +1713,13 @@ class AudioPlayer:
         return cmd
 
     def _play_from_cache(self, seek: float):
-        """Resume ffplay from local cached file at given position."""
+        """Resume ffplay from local cached file at given position.
+
+        Only reached from resume(), whose pause already killed the process and
+        dropped `_process`. If the spawn raises `SpawnError`, nothing below it
+        runs: `_process` stays None and `_paused` stays True, so the failure
+        is reported and the next press of space simply tries again.
+        """
         self._process = self._spawn(self._ffplay_cmd(self._cache_file, seek))
         self._play_start = time.time()
         self._paused = False
@@ -1913,6 +1919,13 @@ class AudioPlayer:
             if not source:
                 return False
             self._reap_process()
+            # Dropped before the respawn, not replaced by it: if ffplay can no
+            # longer be started, `_spawn` raises SpawnError and the assignment
+            # below never happens. `_process` would then still name the
+            # process just killed, and failure() — which trusts that every
+            # kill drops or replaces the handle — would read our own SIGTERM
+            # as "killed from outside" instead of "can't be started".
+            self._process = None
             self._process = self._spawn(self._ffplay_cmd(source, position))
             self._seek_offset = position
             self._play_start = time.time()
@@ -3426,6 +3439,18 @@ class HeadlessTidalPlayer:
                     # to start the track there
                     self._play_track(track, seek=target)
                 self._seek_applied = target
+            except backend_health.SpawnError as e:
+                # ffplay's scrub respawns the process, and the binary can be
+                # gone by then (uninstalled mid-session). Uncaught, this
+                # printed a traceback over the TUI and left the monitor to
+                # misreport the dead process. Said the way _play_track says
+                # it — this is a daemon thread, where the probe may run. The
+                # position counts as delivered: retrying it on every monitor
+                # tick would only repeat the same failure and the same probe.
+                self._seek_applied = target
+                if self._play_gen == gen:
+                    self._playing = False
+                    self._report_player_failure(e.failure)
             finally:
                 self._seek_applying = False
 
@@ -3457,7 +3482,18 @@ class HeadlessTidalPlayer:
         else:
             if self._current_track and self.audio and self.audio.is_paused:
                 # Resume from paused position
-                if self.audio.resume():
+                try:
+                    resumed = self.audio.resume()
+                except backend_health.SpawnError as e:
+                    # A paused ffplay resumes by spawning a new process, and
+                    # the binary may be gone by now. This is the UI thread:
+                    # the failure is said off it, because the report runs a
+                    # version probe per backend (seconds, if one hangs).
+                    self._playing = False
+                    threading.Thread(target=self._report_player_failure,
+                                     args=(e.failure,), daemon=True).start()
+                    return
+                if resumed:
                     self._playing = True
                     self._play_start_time = time.time()
                 else:

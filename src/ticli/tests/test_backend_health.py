@@ -319,3 +319,102 @@ class TestTheMonitorSaysWhatBroke:
 
         assert "libass.so.9" in player._toast
         assert "stopped early" not in player._toast
+
+
+class _DyingProcess:
+    """A live player process that dies when it is told to."""
+
+    def __init__(self):
+        self.alive = True
+
+    def poll(self):
+        return None if self.alive else -signal.SIGTERM
+
+    def terminate(self):
+        self.alive = False
+
+    def kill(self):
+        self.alive = False
+
+    def wait(self, timeout=None):
+        return -signal.SIGTERM
+
+
+class TestARespawnThatCannotStart:
+    """ffplay has no runtime control, so a scrub and a resume each start a
+    new process — and the binary can be gone by then. Neither may leave a
+    handle to the process just killed, raise out of its thread, or say
+    anything but "can't be started"."""
+
+    def _player(self, monkeypatch, paused, cache_file=None):
+        def _popen(cmd, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", cmd[0])
+        monkeypatch.setattr(player_mod.subprocess, "Popen", _popen)
+        monkeypatch.setattr(player_mod.AudioPlayer, "_open_stderr",
+                            lambda self: subprocess.DEVNULL)
+        audio = player_mod.AudioPlayer("ffplay", cache=None)
+        audio._current_url = "http://cdn/track.m4a"
+        audio._cache_file = cache_file
+        if paused:
+            audio._paused = True
+            audio._seek_offset = 30.0
+        else:
+            audio._process = _DyingProcess()
+        player = HeadlessTidalPlayer()
+        player.audio = audio
+        player._current_track = types.SimpleNamespace(id=7, duration=150)
+        player._playing = not paused
+        player._play_start_time = time.time() if not paused else None
+        player._play_offset = 30.0
+        player._wake = lambda: None
+        player.restarts = []
+        player._play_track = lambda track, seek=0: player.restarts.append(seek)
+        return player
+
+    @staticmethod
+    def _wait_for(cond, timeout=3.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cond():
+                return True
+            time.sleep(0.005)
+        return False
+
+    def test_a_scrub_on_a_playing_ffplay(self, monkeypatch):
+        escaped = []
+        monkeypatch.setattr(player_mod.threading, "excepthook",
+                            lambda args: escaped.append(args.exc_type))
+        player = self._player(monkeypatch, paused=False)
+        player._seek_target = 42.0
+        player._last_seek_apply = 0.0
+
+        player._flush_seek()
+
+        assert self._wait_for(lambda: not player._seek_applying)
+        assert escaped == []
+        assert player.audio._process is None
+        assert player._playing is False
+        assert player.restarts == []
+        assert "can't be started" in player._toast
+        # Delivered, not pending: the monitor must not retry it every tick
+        assert not player._seek_pending()
+
+    def test_space_on_a_paused_ffplay(self, monkeypatch, tmp_path):
+        escaped = []
+        monkeypatch.setattr(player_mod.threading, "excepthook",
+                            lambda args: escaped.append(args.exc_type))
+        # A copy on disk, so resume takes the respawn-from-cache path
+        cached = tmp_path / "7.m4a"
+        cached.write_bytes(b"audio")
+        player = self._player(monkeypatch, paused=True, cache_file=str(cached))
+
+        player._toggle_play()  # must not raise on the UI thread
+
+        assert self._wait_for(lambda: "can't be started" in (player._toast or ""))
+        assert escaped == []
+        assert player._playing is False
+        assert player.audio._process is None
+        # Still paused at the same place, so the next press tries again
+        assert player.audio.is_paused
+        assert player.audio._seek_offset == 30.0
+        assert player.restarts == []
