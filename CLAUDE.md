@@ -24,7 +24,7 @@ Package in `src/ticli`; entry point `ticli = ticli.cli:main`.
 - `utils/backend_health.py`: classifies backend exits; post-failure version probe.
 - `utils/config.py`: settings and config migrations; `SETTINGS_SPEC` drives the settings page.
 - `utils/credential_store.py`: tokens (keyring, or a `~/.config/ticli` fallback).
-- `utils/cache.py`: metadata index, cached audio, budget and eviction.
+- `utils/cache.py`: metadata index (no expiry, 100 MB cap, ADR-0009), cached audio, budget and eviction; the list-row shims the socket also uses.
 - `utils/downloads.py` + `utils/tags.py`: user-owned downloads and stdlib tagging.
 - `utils/artwork.py`: stdlib JPEG decode to half-block pixel art.
 - `utils/testhooks.py`: env hooks (only with `TICLI_TEST_HOOKS=1`) that run a real `ticli.playerd` on a fake TIDAL session, tokens off the keyring.
