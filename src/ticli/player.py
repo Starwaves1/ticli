@@ -1411,7 +1411,6 @@ class HeadlessTidalPlayer:
         # online / offline / signed_out, pushed to every client. Only an action that needs
         # TIDAL tries to leave offline (ADR-0003); a dead token waits for a human sign-in.
         self._connectivity = ONLINE
-        self._session_loaded = False
         self._reconnect_lock = threading.Lock()
         self.session = tidal_session()
         self._watch_transport()
@@ -1579,7 +1578,6 @@ class HeadlessTidalPlayer:
                 if self.session.check_login():
                     if self.session.access_token != previous_token:
                         self._save_session()
-                    self._session_loaded = True
                     self._user_display_name = self._get_user_display_name()
                     return True
             except Exception as e:
@@ -1634,7 +1632,6 @@ class HeadlessTidalPlayer:
         for field in ("token_type", "access_token", "refresh_token", "expiry_time"):
             setattr(self.session, field, data.get(field))
         self.session.is_pkce = bool(data.get("is_pkce", False))
-        self._session_loaded = False
         self._connectivity = OFFLINE
         user = self._read_state_dict().get("user")
         self._user_display_name = user if isinstance(user, str) else ""
@@ -1696,7 +1693,6 @@ class HeadlessTidalPlayer:
             self._save_session()
         if want == ONLINE:
             return ONLINE
-        self._session_loaded = True
         self._connectivity = ONLINE
         self._user_display_name = self._get_user_display_name()
         self._set_toast("Back online")
@@ -1945,7 +1941,6 @@ class HeadlessTidalPlayer:
             data["token_type"], data["access_token"], data.get("refresh_token"),
             data.get("expiry_time"), is_pkce=data.get("is_pkce", False))
         was = self._connectivity
-        self._session_loaded = True
         self._connectivity = ONLINE
         self._user_display_name = self._get_user_display_name()
         self._quality_ceiling = None
