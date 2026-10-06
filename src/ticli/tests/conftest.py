@@ -34,6 +34,7 @@ from ticli import ipc as ipc_mod
 from ticli import player as player_mod
 from ticli.utils import backend_health as backend_health_mod
 from ticli.utils import config as config_mod
+from ticli.utils import credential_store as credential_store_mod
 from ticli.utils import downloads as downloads_mod
 from ticli.utils import throttle as throttle_mod
 
@@ -52,6 +53,9 @@ def never_the_real_dirs_after_teardown(tmp_path_factory):
     mp.setattr(throttle_mod, "STATE_DIR", base / "state")
     mp.setattr(config_mod, "CONFIG_DIR", base / "config")
     mp.setattr(config_mod, "CONFIG_FILE", base / "config" / "config.json")
+    mp.setattr(credential_store_mod, "keyring", None)
+    mp.setattr(credential_store_mod, "FALLBACK_DIR", base / "credentials")
+    mp.setattr(credential_store_mod, "FALLBACK_FILE", base / "credentials" / "session.json")
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +80,14 @@ def never_the_real_config(tmp_path, monkeypatch):
     # `ticli agent` reads the AI control switches from config.json; the owner's must never decide a test.
     monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path / "config")
     monkeypatch.setattr(config_mod, "CONFIG_FILE", tmp_path / "config" / "config.json")
+
+
+@pytest.fixture(autouse=True)
+def never_the_real_tokens(tmp_path, monkeypatch):
+    # The owner's keychain and ~/.config/ticli/session.json hold a real TIDAL login.
+    monkeypatch.setattr(credential_store_mod, "keyring", None)
+    monkeypatch.setattr(credential_store_mod, "FALLBACK_DIR", tmp_path / "credentials")
+    monkeypatch.setattr(credential_store_mod, "FALLBACK_FILE", tmp_path / "credentials" / "session.json")
 
 
 @pytest.fixture(autouse=True)
