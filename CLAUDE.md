@@ -407,6 +407,20 @@ in the scrollback.
 | `utils/cache.py` | Metadata cache, cached audio, budget + eviction |
 | `utils/artwork.py` | JPEG decoder, cover art rendering + its own disk cache |
 
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues on `odonald/ticli`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `GLOSSARY.md` and `docs/adr/` at the repo root, created lazily. See `docs/agents/domain.md`.
+
 ## Testing
 
 Tests use Click's `CliRunner` and subprocess calls to verify CLI help text and argument parsing. No running TIDAL instance needed.
