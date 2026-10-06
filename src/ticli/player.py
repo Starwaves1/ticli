@@ -213,14 +213,8 @@ class _Fit:
                 self.page_rows = max(1, self.page_rows - over)
                 self._levers.insert(0, lever)
                 return True
-            if lever == "artwork" and self.artwork:
-                self.artwork = False
-                return True
-            if lever == "prose" and self.prose:
-                self.prose = False
-                return True
-            if lever == "chrome" and self.chrome:
-                self.chrome = False
+            if lever in ("artwork", "prose", "chrome") and getattr(self, lever):
+                setattr(self, lever, False)
                 return True
             if lever == "hint_rows" and self.hint_rows > 1:
                 self.hint_rows = 1
@@ -500,7 +494,7 @@ def fetch_to_file(sources: list, part: str, abandoned=None, progress=None) -> st
                         try:
                             total = int(response.headers.get("Content-Length") or 0)
                         except (TypeError, ValueError):
-                            total = 0
+                            pass
                 for chunk in response.iter_content(DOWNLOAD_CHUNK):
                     if abandoned is not None and abandoned():
                         raise _DownloadSuperseded()
@@ -578,16 +572,14 @@ class _PacedRun:
             self.closed = False
         blocked = blocked or self._blocked()
         self._flush()
-        done = sum(1 for ok, _m, _r in self.results[:] if ok)
-        return done, len(self.results) - done, blocked
+        done, failed = self._counts()
+        return done, failed, blocked
 
     def pending(self) -> list:
         return self.items[self.consumed:]
 
     def add(self, items) -> bool:
-        items = list(items)
-        if items:
-            self.items = self.items + items
+        self.items = self.items + list(items)
         return not self.closed
 
     def _work(self, item, handle, index) -> None:
@@ -626,10 +618,14 @@ class _PacedRun:
                 return message[:PLAYER_ERROR_CHARS]
         return ""
 
-    def _tally(self) -> None:
+    def _counts(self) -> tuple:
         results = self.results[:]
         done = sum(1 for ok, _m, _r in results if ok)
-        self.report(done=done, failed=len(results) - done)
+        return done, len(results) - done
+
+    def _tally(self) -> None:
+        done, failed = self._counts()
+        self.report(done=done, failed=failed)
 
     def _flush(self) -> None:
         results = self.results[:]
@@ -649,10 +645,9 @@ def _empty_search_pool() -> dict:
 
 def _empty_search_reservoir() -> dict:
     return {
-        "tracks": [], "albums": [], "artists": [], "playlists": [],
+        **_empty_search_pool(),
         "offset": 0,
-        "exhausted": {"tracks": False, "albums": False,
-                      "artists": False, "playlists": False},
+        "exhausted": dict.fromkeys(("tracks", "albums", "artists", "playlists"), False),
         "stopped": False,
         "message": "",
     }
@@ -893,18 +888,16 @@ class AudioPlayer:
         except OSError:
             self._stderr_path = None
             return subprocess.DEVNULL
+
     def _last_stderr(self) -> str:
         if not self._stderr_path:
             return ""
         try:
-            lines = [ln.strip() for ln in
-                     Path(self._stderr_path).read_text(errors="replace").splitlines()]
+            lines = Path(self._stderr_path).read_text(errors="replace").splitlines()
         except OSError:
             return ""
-        said = [ln for ln in lines if ln]
-        if not said:
-            return ""
-        return said[-1][:PLAYER_ERROR_CHARS]
+        said = [ln.strip() for ln in lines if ln.strip()]
+        return said[-1][:PLAYER_ERROR_CHARS] if said else ""
 
     def failure(self) -> Optional[str]:
         with self._lock:
@@ -1004,14 +997,25 @@ class AudioPlayer:
         cmd.append(source)
         return cmd
 
-    def _play_from_cache(self, seek: float):
+    def _spawn_ffplay(self, source: str, seek: float):
         self._process = subprocess.Popen(
-            self._ffplay_cmd(self._cache_file, seek),
+            self._ffplay_cmd(source, seek),
             stdout=subprocess.DEVNULL,
             stderr=self._open_stderr(),
         )
+
+    def _play_from_cache(self, seek: float):
+        self._spawn_ffplay(self._cache_file, seek)
         self._play_start = time.time()
         self._paused = False
+
+    @property
+    def _process_alive(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    @property
+    def _mpv_ipc_active(self) -> bool:
+        return self.player_cmd == "mpv" and bool(self._ipc_path)
 
     def _reap_process(self):
         self._process.terminate()
@@ -1028,15 +1032,15 @@ class AudioPlayer:
 
     def pause(self):
         with self._lock:
-            if not self._process or self._process.poll() is not None or self._paused:
+            if self._paused or not self._process_alive:
                 return
-            if self.player_cmd == "mpv" and self._ipc_path:
+            if self._mpv_ipc_active:
                 # IPC socket takes ~100ms to come up after spawn; retry so an early pause isn't lost
                 for _ in range(5):
                     if self._mpv_command({"command": ["set_property", "pause", True]}):
                         self._paused = True
                         return
-                    if not self._process or self._process.poll() is not None:
+                    if not self._process_alive:
                         return
                     time.sleep(0.1)
             else:
@@ -1052,7 +1056,7 @@ class AudioPlayer:
         with self._lock:
             if not self._paused:
                 return False
-            if self.player_cmd == "mpv" and self._ipc_path:
+            if self._mpv_ipc_active:
                 if self._mpv_command({"command": ["set_property", "pause", False]}):
                     self._paused = False
                     return True
@@ -1115,7 +1119,7 @@ class AudioPlayer:
         if self.player_cmd != "mpv":
             return None
         with self._lock:
-            if self._paused or not self._process or self._process.poll() is not None:
+            if self._paused or not self._process_alive:
                 return None
             reply = self._mpv_request({"command": ["get_property", "time-pos"]}, timeout=0.2)
         if reply and reply.get("error") == "success" and isinstance(reply.get("data"), (int, float)):
@@ -1125,15 +1129,14 @@ class AudioPlayer:
     def set_volume(self, value: int):
         with self._lock:
             self.volume = value
-            if (self.player_cmd == "mpv" and self._ipc_path
-                    and self._process and self._process.poll() is None):
+            if self._mpv_ipc_active and self._process_alive:
                 self._mpv_command({"command": ["set_property", "volume", value]})
 
     def seek_to_start(self) -> bool:
         if self.player_cmd != "mpv":
             return False
         with self._lock:
-            if self._paused or not self._process or self._process.poll() is not None:
+            if self._paused or not self._process_alive:
                 return False
             if not self._mpv_command({"command": ["seek", 0, "absolute"]}):
                 return False
@@ -1144,8 +1147,8 @@ class AudioPlayer:
     def seek_to(self, position: float) -> bool:
         position = max(0.0, position)
         with self._lock:
-            alive = self._process is not None and self._process.poll() is None
-            if self.player_cmd == "mpv" and self._ipc_path and alive:
+            alive = self._process_alive
+            if self._mpv_ipc_active and alive:
                 if not self._mpv_command({"command": ["seek", position, "absolute"]}):
                     return False
                 self._seek_offset = position
@@ -1161,21 +1164,17 @@ class AudioPlayer:
             if not source:
                 return False
             self._reap_process()
-            self._process = subprocess.Popen(
-                self._ffplay_cmd(source, position),
-                stdout=subprocess.DEVNULL,
-                stderr=self._open_stderr(),
-            )
+            self._spawn_ffplay(source, position)
             self._seek_offset = position
             self._play_start = time.time()
             return True
 
     def _bind_media_keys(self) -> bool:
-        for key, action in MEDIA_KEY_ACTIONS.items():
-            if not self._mpv_command(
-                {"command": ["keybind", key, f"set {MEDIA_KEY_PROP} {action}"]}
-            ):
-                return False
+        if not all(
+            self._mpv_command({"command": ["keybind", key, f"set {MEDIA_KEY_PROP} {action}"]})
+            for key, action in MEDIA_KEY_ACTIONS.items()
+        ):
+            return False
         if self._media_title:
             self._mpv_command(
                 {"command": ["set_property", "force-media-title", self._media_title]}
@@ -1206,10 +1205,7 @@ class AudioPlayer:
                 self._reap_process()
             self._process = None
         if self._cache_file and not self._cache_persistent:
-            try:
-                os.unlink(self._cache_file)
-            except OSError:
-                pass
+            self._unlink_quietly(self._cache_file)
         self._cache_file = None
         self._cache_persistent = False
         self._paused = False
@@ -1217,31 +1213,30 @@ class AudioPlayer:
         self._seek_offset = 0
         self._media_keys_bound = False
         if self._ipc_path:
-            try:
-                os.unlink(self._ipc_path)
-            except OSError:
-                pass
+            self._unlink_quietly(self._ipc_path)
             self._ipc_path = None
 
+    @staticmethod
+    def _unlink_quietly(path: str):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
     def source_vanished(self) -> bool:
-        path = self._cache_file if self._cache_persistent else None
-        return bool(path) and not os.path.exists(path)
+        return bool(self._cache_persistent and self._cache_file) and not os.path.exists(self._cache_file)
 
     @property
     def is_playing(self) -> bool:
         with self._lock:
-            if self._paused:
-                return True
-            return self._process is not None and self._process.poll() is None
+            return self._paused or self._process_alive
 
     @property
     def is_paused(self) -> bool:
         with self._lock:
             if not self._paused:
                 return False
-            if self.player_cmd == "mpv":
-                return self._process is not None and self._process.poll() is None
-            return True
+            return self.player_cmd != "mpv" or self._process_alive
 
 class HeadlessTidalPlayer:
     MODE_PLAYER = "player"
@@ -1440,18 +1435,10 @@ class HeadlessTidalPlayer:
         if not u:
             return "Unknown"
         first = getattr(u, "first_name", None)
-        last = getattr(u, "last_name", None)
-        if first and last:
-            return f"{first} {last}"
         if first:
-            return first
-        username = getattr(u, "username", None)
-        if username:
-            return username
-        email = getattr(u, "email", None)
-        if email:
-            return email
-        return f"User {u.id}"
+            last = getattr(u, "last_name", None)
+            return f"{first} {last}" if last else first
+        return getattr(u, "username", None) or getattr(u, "email", None) or f"User {u.id}"
 
     def _login(self) -> bool:
         data = load_tokens()
@@ -1912,9 +1899,6 @@ class HeadlessTidalPlayer:
                 return cached, None
         return None, None
 
-    def _local_copy(self, track) -> Optional[str]:
-        return self._local_source(track)[0]
-
     def _download_badge(self, granted) -> Optional[str]:
         label = self._tier_label(granted)
         return f"{label} · downloaded" if label else "downloaded"
@@ -1956,7 +1940,7 @@ class HeadlessTidalPlayer:
         if track_id is None:
             return
         self._prefetch_id = track_id
-        if self._local_copy(nxt) is not None:
+        if self._local_source(nxt)[0] is not None:
             return
 
         def _run():
@@ -2014,15 +1998,13 @@ class HeadlessTidalPlayer:
             self._play_track(self._queue[index])
 
     def _next_track(self):
-        if self._queue and self._queue_index < len(self._queue) - 1:
-            self._play_queue_index(self._queue_index + 1)
+        self._play_queue_index(self._queue_index + 1)
 
     def _prev_track(self):
         if self._current_track is not None and self._get_position() > PREV_RESTART_SECONDS:
             self._restart_current_track()
             return
-        if self._queue and self._queue_index > 0:
-            self._play_queue_index(self._queue_index - 1)
+        self._play_queue_index(self._queue_index - 1)
 
     def _restart_current_track(self):
         self._seek_target = None
@@ -2035,7 +2017,7 @@ class HeadlessTidalPlayer:
     def _seek_by(self, delta: float):
         if self._current_track is None:
             return
-        duration = getattr(self._current_track, "duration", 0) or 0
+        duration = self._track_duration()
         target = max(0.0, self._get_position() + delta)
         if duration > 0:
             target = min(target, max(0.0, duration - SEEK_END_MARGIN))
@@ -2075,9 +2057,8 @@ class HeadlessTidalPlayer:
         now = time.monotonic()
         repeat = now - self._last_toggle_key < KEY_REPEAT_WINDOW
         self._last_toggle_key = now
-        if repeat:
-            return
-        self._toggle_play()
+        if not repeat:
+            self._toggle_play()
 
     def _toggle_play(self):
         if self._playing:
@@ -2086,19 +2067,18 @@ class HeadlessTidalPlayer:
             if self._play_start_time:
                 self._play_offset += time.time() - self._play_start_time
                 self._play_start_time = None
+            return
+        if not self._current_track:
+            return
+        if self.audio and self.audio.is_paused and self.audio.resume():
+            self._playing = True
+            self._play_start_time = time.time()
         else:
-            if self._current_track and self.audio and self.audio.is_paused:
-                if self.audio.resume():
-                    self._playing = True
-                    self._play_start_time = time.time()
-                else:
-                    self._start_current_from_position()
-            elif self._current_track:
-                self._start_current_from_position()
+            self._start_current_from_position()
 
     def _start_current_from_position(self):
         seek = self._get_position()
-        duration = getattr(self._current_track, "duration", 0) or 0
+        duration = self._track_duration()
         # Clamp unconditionally: an unknown duration must not let a stale
         # offset seek past EOF (mpv exits instantly on that)
         if seek < 1 or seek >= duration - 2:
@@ -2216,7 +2196,7 @@ class HeadlessTidalPlayer:
                     # silent retry against a dead URL is the same silence with more requests,
                     # and [space] refetches a fresh URL.
                     position = self._get_position()
-                    duration = getattr(self._current_track, "duration", 0) or 0
+                    duration = self._track_duration()
                     self._set_toast(
                         "Playback stopped early — the stream ended at "
                         f"{format_time(position)} of {format_time(duration)}."
@@ -2252,11 +2232,12 @@ class HeadlessTidalPlayer:
                 self._handle_media_key(self.audio.poll_media_key())
             time.sleep(0.5)
 
+    def _track_duration(self):
+        return getattr(self._current_track, "duration", 0) or 0
+
     def _track_has_time_left(self) -> bool:
-        duration = getattr(self._current_track, "duration", None) or 0
-        if duration <= 0:
-            return True
-        return self._get_position() < duration - 2.0
+        duration = self._track_duration()
+        return duration <= 0 or self._get_position() < duration - 2.0
 
     def _maybe_count_play(self) -> None:
         if self._play_counted == self._play_gen or not self._playing:
@@ -2277,13 +2258,8 @@ class HeadlessTidalPlayer:
             logger.debug("Could not record a play: %s", e)
 
     def _stream_ended_early(self) -> bool:
-        track = self._current_track
-        if track is None:
-            return False
-        duration = getattr(track, "duration", None) or 0
-        if duration <= 0:
-            return False
-        return self._get_position() < duration - STREAM_TRUNCATED_MARGIN
+        duration = self._track_duration()
+        return duration > 0 and self._get_position() < duration - STREAM_TRUNCATED_MARGIN
 
     def _get_position(self) -> float:
         if self._play_start_time and self._playing:
@@ -2474,6 +2450,11 @@ class HeadlessTidalPlayer:
                        style="dim")
         return row
 
+    @staticmethod
+    def _mark_cursor(content: Text, selected: bool) -> None:
+        content.append("  ▸ " if selected else "    ",
+                       style="bold cyan" if selected else "")
+
     def _page_footer(self, content: Text, cursor: int, total: int, page: int):
         if total > page:
             page_num = (cursor // page) + 1
@@ -2499,14 +2480,11 @@ class HeadlessTidalPlayer:
             page = self._page_rows()
             page_start = (self._search_cursor // page) * page
             page_end = min(page_start + page, total)
-            content.append("\n", style="")
+            content.append("\n")
             for i in range(page_start, page_end):
                 item = self._search_results[i]
                 content.append("\n")
-                if i == self._search_cursor:
-                    content.append("  \u25b8 ", style="bold cyan")
-                else:
-                    content.append("    ", style="")
+                self._mark_cursor(content, i == self._search_cursor)
                 self._download_mark(
                     content, getattr(item.get("obj"), "id", None)
                     if item["type"] == "track" else None)
@@ -2542,12 +2520,9 @@ class HeadlessTidalPlayer:
             content.append("\n")
             for i in range(page_start, min(page_start + page, len(rows))):
                 content.append("\n")
-                if i == self._search_history_cursor:
-                    content.append("  ▸ ", style="bold cyan")
-                    content.append(rows[i], style="bold white")
-                else:
-                    content.append("    ", style="")
-                    content.append(rows[i], style="white")
+                selected = i == self._search_history_cursor
+                self._mark_cursor(content, selected)
+                content.append(rows[i], style="bold white" if selected else "white")
 
         return content
 
@@ -2565,7 +2540,7 @@ class HeadlessTidalPlayer:
             page_start = max(0, ((self._browse_cursor - 1) // page) * page) if self._browse_cursor > 0 else 0
             page_end = min(page_start + page, total)
             content.append(f"  ({total} tracks)", style="dim")
-            content.append("\n", style="")
+            content.append("\n")
 
             if self._browse_cursor <= 0 or page_start == 0:
                 content.append("\n")
@@ -2579,10 +2554,7 @@ class HeadlessTidalPlayer:
             for i in range(page_start, page_end):
                 track = self._browse_tracks[i]
                 content.append("\n")
-                if i == self._browse_cursor:
-                    content.append("  \u25b8 ", style="bold cyan")
-                else:
-                    content.append("    ", style="")
+                self._mark_cursor(content, i == self._browse_cursor)
                 self._download_mark(content, getattr(track, "id", None))
                 content.append(f"{i+1:>2}. ", style="dim")
                 content.append(track.name, style="bold white" if i == self._browse_cursor else "white")
@@ -2623,7 +2595,7 @@ class HeadlessTidalPlayer:
         page_start = (cursor // page) * page
         page_end = min(page_start + page, total)
         content.append(f"  ({total})", style="dim")
-        content.append("\n", style="")
+        content.append("\n")
         type_styles = {"track": "bold green", "album": "bold magenta",
                        "playlist": "bold cyan", "artist": "bold yellow"}
         for i in range(page_start, page_end):
@@ -2631,8 +2603,7 @@ class HeadlessTidalPlayer:
             obj = row["obj"]
             selected = (i == cursor)
             content.append("\n")
-            content.append("  ▸ " if selected else "    ",
-                           style="bold cyan" if selected else "")
+            self._mark_cursor(content, selected)
             self._download_mark(
                 content, getattr(obj, "id", None)
                 if row["type"] == "track" else None)
@@ -2675,14 +2646,14 @@ class HeadlessTidalPlayer:
             page_start = (self._queue_cursor // page) * page
             page_end = min(page_start + page, total)
             content.append(f"  ({total} tracks)", style="dim")
-            content.append("\n", style="")
+            content.append("\n")
             for i in range(page_start, page_end):
                 track = self._queue[i]
                 content.append("\n")
                 is_current = (i == self._queue_index)
                 is_cursor = (i == self._queue_cursor)
                 if is_cursor:
-                    content.append("  \u25b8 ", style="bold cyan")
+                    self._mark_cursor(content, True)
                 elif is_current:
                     content.append("  \u266b ", style="bold cyan")
                 else:
@@ -2717,14 +2688,11 @@ class HeadlessTidalPlayer:
             page_start = (self._playlists_cursor // page) * page
             page_end = min(page_start + page, total)
             content.append(f"  ({total})", style="dim")
-            content.append("\n", style="")
+            content.append("\n")
             for i in range(page_start, page_end):
                 pl = self._playlists[i]
                 content.append("\n")
-                if i == self._playlists_cursor:
-                    content.append("  \u25b8 ", style="bold cyan")
-                else:
-                    content.append("    ", style="")
+                self._mark_cursor(content, i == self._playlists_cursor)
                 pl_name = pl.name if hasattr(pl, "name") else "?"
                 num_tracks = pl.num_tracks if hasattr(pl, "num_tracks") else ""
                 creator = ""
@@ -2754,7 +2722,7 @@ class HeadlessTidalPlayer:
             content.append(f"‹ {self._picker_new_name}▏›", style="bold yellow")
         else:
             selected = self._picker_cursor < 0
-            content.append("  ▸ " if selected else "    ", style="bold cyan" if selected else "")
+            self._mark_cursor(content, selected)
             content.append("+ New playlist", style="bold white" if selected else "white")
 
         playlists = self._picker_playlists()
@@ -2765,14 +2733,11 @@ class HeadlessTidalPlayer:
             page = self._page_rows()
             page_start = (max(self._picker_cursor, 0) // page) * page
             page_end = min(page_start + page, total)
-            content.append("\n", style="")
+            content.append("\n")
             for i in range(page_start, page_end):
                 pl = playlists[i]
                 content.append("\n")
-                if i == self._picker_cursor:
-                    content.append("  ▸ ", style="bold cyan")
-                else:
-                    content.append("    ", style="")
+                self._mark_cursor(content, i == self._picker_cursor)
                 pl_name = pl.name if hasattr(pl, "name") else "?"
                 num_tracks = pl.num_tracks if hasattr(pl, "num_tracks") else ""
                 content.append(pl_name, style="bold white" if i == self._picker_cursor else "white")
@@ -2826,10 +2791,9 @@ class HeadlessTidalPlayer:
         return len(rows), sum(row["bytes"] for row in rows)
 
     def _download_mark(self, content: Text, track_id) -> None:
-        if self._downloaded(track_id):
-            content.append("↓ ", style="dim cyan")
-        else:
-            content.append("  ", style="")
+        downloaded = self._downloaded(track_id)
+        content.append("↓ " if downloaded else "  ", style="dim cyan" if downloaded else "")
+
     def _build_settings_display(self) -> Text:
         content = Text()
         content.append("   Settings", style="bold magenta")
@@ -2841,16 +2805,13 @@ class HeadlessTidalPlayer:
                                len(SETTINGS_ROWS) - room))
             content.append(f"  ({self._settings_cursor + 1}/{len(SETTINGS_ROWS)})",
                            style="dim")
-        content.append("\n", style="")
+        content.append("\n")
 
         for i in range(first, first + room):
             spec = SETTINGS_ROWS[i]
             selected = (i == self._settings_cursor)
             content.append("\n")
-            if selected:
-                content.append("  ▸ ", style="bold cyan")
-            else:
-                content.append("    ", style="")
+            self._mark_cursor(content, selected)
             label = f"{spec['label']:<20}" if self._fit.inner >= 46 else spec["label"] + " "
             content.append(label, style="bold white" if selected else "white")
             value = self.config.get(spec["key"], spec["default"])
@@ -2977,10 +2938,10 @@ class HeadlessTidalPlayer:
             f"  ({total} · "
             f"{downloads.format_bytes(sum(r['bytes'] for r in rows))})",
             style="dim")
-        content.append("\n", style="")
-        for i in range(page_start, page_end):
-            row = rows[i]
-            selected = (i == self._downloads_cursor)
+        content.append("\n")
+        for index in range(page_start, page_end):
+            row = rows[index]
+            selected = (index == self._downloads_cursor)
             content.append("\n")
             content.append("  ▸ " if selected else "    ",
                            style="bold cyan" if selected else "")
@@ -2996,15 +2957,21 @@ class HeadlessTidalPlayer:
         self._page_footer(content, self._downloads_cursor, total, page)
         return content
 
+    @staticmethod
+    def _styled(*parts) -> Text:
+        content = Text()
+        for text, style in parts:
+            content.append(text, style=style)
+        return content
+
     def _build_delete_download_confirm(self) -> Text:
         row = self._downloads_delete or {}
-        content = Text()
-        content.append(f"\n   Delete {row.get('title') or 'this download'}"
-                       " from your music folder?", style="bold yellow")
-        content.append("\n   ", style="")
-        content.append("y", style="bold")
-        content.append(" to confirm, any other key to cancel", style="dim")
-        return content
+        return self._styled(
+            (f"\n   Delete {row.get('title') or 'this download'}"
+             " from your music folder?", "bold yellow"),
+            ("\n   ", ""),
+            ("y", "bold"),
+            (" to confirm, any other key to cancel", "dim"))
 
     def _delete_download(self) -> None:
         row = self._downloads_delete
@@ -3052,45 +3019,39 @@ class HeadlessTidalPlayer:
         return line
 
     def _build_quit_confirm(self) -> Text:
-        content = Text()
-        content.append("\n   Quit player? ", style="bold yellow")
-        content.append("Press ", style="dim")
-        content.append("Esc", style="bold")
-        content.append(" again to confirm, any other key to cancel", style="dim")
-        return content
+        return self._styled(
+            ("\n   Quit player? ", "bold yellow"),
+            ("Press ", "dim"),
+            ("Esc", "bold"),
+            (" again to confirm, any other key to cancel", "dim"))
 
     def _build_logout_confirm(self) -> Text:
-        content = Text()
-        content.append("\n   Log out and clear saved tokens? ", style="bold yellow")
-        content.append("Press ", style="dim")
-        content.append("y", style="bold")
-        content.append(" to confirm, any other key to cancel", style="dim")
-        return content
+        return self._styled(
+            ("\n   Log out and clear saved tokens? ", "bold yellow"),
+            ("Press ", "dim"),
+            ("y", "bold"),
+            (" to confirm, any other key to cancel", "dim"))
 
     def _build_disable_songs_confirm(self) -> Text:
-        content = Text()
-        content.append("\n   Clear cached songs as well? ", style="bold yellow")
-        content.append("y", style="bold")
-        content.append(" clear, ", style="dim")
-        content.append("n", style="bold")
-        content.append(" keep them, ", style="dim")
-        content.append("Esc", style="bold")
-        content.append(" cancel", style="dim")
-        return content
+        return self._styled(
+            ("\n   Clear cached songs as well? ", "bold yellow"),
+            ("y", "bold"),
+            (" clear, ", "dim"),
+            ("n", "bold"),
+            (" keep them, ", "dim"),
+            ("Esc", "bold"),
+            (" cancel", "dim"))
 
     def _build_download_line(self) -> Optional["Text"]:
         job = self._download_job or {}
         state = job.get("state")
         if state == "blocked":
-            line = Text("Download stopped — TIDAL is rate-limiting. ",
+            return Text("Download stopped — TIDAL is rate-limiting. "
+                        f"{job.get('done', 0)} done, nothing retried.",
                         style="red")
-            line.append(f"{job.get('done', 0)} done, nothing retried.",
-                        style="red")
-            return line
         if state == "failed":
-            line = Text(f"Download failed — {job.get('error') or 'unknown'}",
+            return Text(f"Download failed — {job.get('error') or 'unknown'}",
                         style="red")
-            return line
         if state != "running":
             if state == "done" and job.get("failed"):
                 return Text(f"Download finished — {job['failed']} failed",
@@ -3161,20 +3122,18 @@ class HeadlessTidalPlayer:
         if plan.get("unknown"):
             content.append(f" {plan['unknown']} of unrecorded quality,"
                            " left alone.", style="dim")
-        content.append("\n   ", style="")
+        content.append("\n   ")
         content.append("y", style="bold")
         content.append(" to start, any other key to cancel", style="dim")
         return content
 
     def _build_clear_cache_confirm(self) -> Text:
-        content = Text()
         songs = self._cache.audio_count()
-        content.append(
-            f"\n   Delete {songs} cached song{'' if songs == 1 else 's'}? ",
-            style="bold yellow")
-        content.append("y", style="bold")
-        content.append(" to confirm, any other key to cancel", style="dim")
-        return content
+        return self._styled(
+            (f"\n   Delete {songs} cached song{'' if songs == 1 else 's'}? ",
+             "bold yellow"),
+            ("y", "bold"),
+            (" to confirm, any other key to cancel", "dim"))
 
     def _mode_hints(self) -> list:
         if self._footer_hidden:
@@ -3187,9 +3146,7 @@ class HeadlessTidalPlayer:
         return hints
 
     def _screen_hints(self) -> list:
-        if self._mini_player:
-            return []
-        if self._download_open:
+        if self._mini_player or self._download_open:
             return []
         if self._mode == self.MODE_SEARCH:
             hints = [
@@ -3199,8 +3156,8 @@ class HeadlessTidalPlayer:
             ]
             if self._search_results:
                 hints.append(Hint("Space", "pause/play", "pause", 4))
-            hints.append(Hint("\u2190/Esc", "back", None, 1))
-            hints.append(Hint("Bksp", "delete", "del", 5))
+            hints += [Hint("\u2190/Esc", "back", None, 1),
+                      Hint("Bksp", "delete", "del", 5)]
             return hints
         if self._mode == self.MODE_BROWSE:
             hints = [
@@ -3209,9 +3166,9 @@ class HeadlessTidalPlayer:
                 Hint("Space", "pause/play", "pause", 4),
                 Hint("a", "play all", "all", 5),
                 Hint("y", "add to playlist", "add", 6),
+                Hint("d", "download", "get", 7),
+                Hint("D", "download all", "all", 9),
             ]
-            hints.append(Hint("d", "download", "get", 7))
-            hints.append(Hint("D", "download all", "all", 9))
             if self._browse_playlist is not None:
                 hints.append(Hint("x", "remove", "del", 8))
             hints.append(Hint("v", "volume", "vol", 3))
@@ -3264,9 +3221,9 @@ class HeadlessTidalPlayer:
             hints = [Hint("\u2191/\u2193", "navigate", "move", 1)]
             if self._downloads():
                 hints.append(Hint("x", "delete", "del", 0))
-            hints.append(Hint("Space", "pause/play", "pause", 4))
-            hints.append(Hint("v", "volume", "vol", 3))
-            hints.append(Hint("\u2190/Esc", "back", None, 2))
+            hints += [Hint("Space", "pause/play", "pause", 4),
+                      Hint("v", "volume", "vol", 3),
+                      Hint("\u2190/Esc", "back", None, 2)]
             return hints
         if self._mode == self.MODE_SETTINGS:
             return [
@@ -3277,9 +3234,7 @@ class HeadlessTidalPlayer:
                 Hint("o", "log out", "out", 5),
                 Hint("Esc", "back", None, 2),
             ]
-        hints = [
-            Hint("space", "play/pause", "play", 0),
-        ]
+        hints = [Hint("space", "play/pause", "play", 0)]
         if self._player_focus:
             hints += [
                 Hint("\u2190/\u2192", f"seek {SEEK_STEP_SECONDS}s", "seek", 1),
@@ -3679,44 +3634,27 @@ class HeadlessTidalPlayer:
         return max(int(width), 1), max(int(height), 1)
 
     def _push_nav(self):
-        if self._mode == self.MODE_SEARCH:
-            self._nav_history.append({
-                "mode": self.MODE_SEARCH,
-                "query": self._search_query,
-                "filter": self._search_filter,
-                "cursor": self._search_cursor,
-            })
-        elif self._mode == self.MODE_BROWSE:
-            self._nav_history.append({
-                "mode": self.MODE_BROWSE,
-                "title": self._browse_title,
-                "tracks": list(self._browse_tracks),
-                "cursor": self._browse_cursor,
-            })
-        elif self._mode == self.MODE_ARTIST:
-            self._nav_history.append({
-                "mode": self.MODE_ARTIST,
-                "artist": self._artist,
-                "section": self._artist_section,
-                "cursor": self._artist_cursor,
-            })
-        elif self._mode == self.MODE_QUEUE:
-            self._nav_history.append({
-                "mode": self.MODE_QUEUE,
-                "cursor": self._queue_cursor,
-            })
-        elif self._mode == self.MODE_PLAYLISTS:
-            self._nav_history.append({
-                "mode": self.MODE_PLAYLISTS,
-                "cursor": self._playlists_cursor,
-            })
-        elif self._mode == self.MODE_SETTINGS:
-            self._nav_history.append({
-                "mode": self.MODE_SETTINGS,
-                "cursor": self._settings_cursor,
-            })
+        mode = self._mode
+        state = {"mode": mode}
+        if mode == self.MODE_SEARCH:
+            state.update(query=self._search_query, filter=self._search_filter,
+                         cursor=self._search_cursor)
+        elif mode == self.MODE_BROWSE:
+            state.update(title=self._browse_title,
+                         tracks=list(self._browse_tracks),
+                         cursor=self._browse_cursor)
+        elif mode == self.MODE_ARTIST:
+            state.update(artist=self._artist, section=self._artist_section,
+                         cursor=self._artist_cursor)
+        elif mode == self.MODE_QUEUE:
+            state.update(cursor=self._queue_cursor)
+        elif mode == self.MODE_PLAYLISTS:
+            state.update(cursor=self._playlists_cursor)
+        elif mode == self.MODE_SETTINGS:
+            state.update(cursor=self._settings_cursor)
         else:
-            self._nav_history.append({"mode": self.MODE_PLAYER})
+            state = {"mode": self.MODE_PLAYER}
+        self._nav_history.append(state)
 
     def _go_back(self):
         if not self._nav_history:
@@ -3758,12 +3696,11 @@ class HeadlessTidalPlayer:
             self._mode = self.MODE_PLAYER
 
     def _add_to_history(self, query: str):
-        q = query.strip()
-        if not q:
+        query = query.strip()
+        if not query:
             return
-        self._search_history = [h for h in self._search_history if h.lower() != q.lower()]
-        self._search_history.insert(0, q)
-        self._search_history = self._search_history[:200]
+        kept = [item for item in self._search_history if item.lower() != query.lower()]
+        self._search_history = [query, *kept][:200]
 
     def _history_rows(self) -> list:
         if (self._search_query or self._search_results
@@ -3857,10 +3794,6 @@ class HeadlessTidalPlayer:
     def _search_done(self) -> bool:
         return self._search_scope_done(self._search_filter)
 
-    @_search_done.setter
-    def _search_done(self, value: bool):
-        self._search_reservoir = {**self._search_reservoir, "stopped": bool(value)}
-
     def _search_scope_done(self, scope: str) -> bool:
         # TIDAL has nothing past SEARCH_MAX_OFFSET (300); no categories (My Playlists) is done.
         reservoir = self._search_reservoir
@@ -3892,6 +3825,7 @@ class HeadlessTidalPlayer:
                          for obj in reservoir[kind][start:start + take])
             rest[kind] = start + take
         return items, rest
+
     @staticmethod
     def _pool_size(pool: dict) -> int:
         return sum(len(v) for v in pool.values())
@@ -3961,8 +3895,7 @@ class HeadlessTidalPlayer:
             self._search_own_playlists(query)
             return
         if self._search_reservoir["message"]:
-            self._put_search_view(scope, loading=False,
-                                  message=self._search_reservoir["message"])
+            self._put_search_view(scope, loading=False, message=self._search_reservoir["message"])
             return
         if self._search_servable(scope):
             self._put_search_view(scope, cached=True)
@@ -3987,8 +3920,7 @@ class HeadlessTidalPlayer:
                 if gen != self._search_gen:
                     return
                 reservoir = self._search_reservoir
-                found = {kind: list(results.get(kind) or [])
-                         for kind in ("tracks", "albums", "artists", "playlists")}
+                found = {kind: list(results.get(kind) or []) for kind in ("tracks", "albums", "artists", "playlists")}
                 # There is never more than 300 items behind a query.
                 self._search_reservoir = {
                     **reservoir,
@@ -4001,8 +3933,7 @@ class HeadlessTidalPlayer:
             except Exception as e:
                 if gen == self._search_gen:
                     message = f"Search failed: {e}"
-                    self._search_reservoir = {
-                        **self._search_reservoir, "stopped": True, "message": message}
+                    self._search_reservoir = {**self._search_reservoir, "stopped": True, "message": message}
                     self._fail_waiting_search_views(message)
             finally:
                 # Only while this is still the query being searched: a superseded fetch must not open the gate.
@@ -4013,10 +3944,8 @@ class HeadlessTidalPlayer:
         threading.Thread(target=_run, daemon=True).start()
 
     def _search_more(self):
-        if self._search_loading or self._search_fetching:
-            return
         scope = self._search_filter
-        if scope == "playlists":
+        if self._search_loading or self._search_fetching or scope == "playlists":
             return
         if self._search_servable(scope):
             self._fill_search_view(scope)
@@ -4042,8 +3971,7 @@ class HeadlessTidalPlayer:
         names = {p.id: p.name for p in (self._cache.get_playlists() or [])}
         needle = query.lower()
         by_title, by_artist, by_album, by_playlist = [], [], [], []
-        matched_playlists = {pid for pid, pname in names.items()
-                             if needle in (pname or "").lower()}
+        matched_playlists = {pid for pid, pname in names.items() if needle in (pname or "").lower()}
         scanned = 0
         for playlist_id, record in self._cache.iter_tracks():
             scanned += 1
@@ -4060,13 +3988,8 @@ class HeadlessTidalPlayer:
                 bucket = by_playlist
             else:
                 continue
-            bucket.append({
-                "type": "track",
-                "name": name,
-                "artist": artists,
-                "playlist": names.get(playlist_id, "Playlist"),
-                "obj": CachedTrack(record),
-            })
+            bucket.append({"type": "track", "name": name, "artist": artists,
+                           "playlist": names.get(playlist_id, "Playlist"), "obj": CachedTrack(record)})
         results = by_title + by_artist + by_album + by_playlist
         self._put_search_view(
             "playlists", loading=False, results=results, cursor=0, cached=False,
@@ -4079,19 +4002,16 @@ class HeadlessTidalPlayer:
             return
         item = self._search_results[self._search_cursor]
         obj = item["obj"]
-
-        if item["type"] == "track":
+        opener = {"album": self._open_album, "artist": self._open_artist,
+                  "playlist": self._open_playlist}.get(item["type"])
+        if opener:
+            opener(obj)
+        elif item["type"] == "track":
             self._queue = [obj]
             self._queue_index = 0
             self._play_track(obj)
             self._mode = self.MODE_PLAYER
             self._nav_history.clear()
-        elif item["type"] == "album":
-            self._open_album(obj)
-        elif item["type"] == "artist":
-            self._open_artist(obj)
-        elif item["type"] == "playlist":
-            self._open_playlist(obj)
 
     def _open_album(self, album):
         self._push_nav()
@@ -4105,8 +4025,7 @@ class HeadlessTidalPlayer:
 
         def _run():
             try:
-                tracks = album.tracks()
-                self._browse_tracks = list(tracks)
+                self._browse_tracks = list(album.tracks())
                 if not self._browse_tracks:
                     self._browse_message = "No tracks found"
             except Exception:
@@ -4124,8 +4043,24 @@ class HeadlessTidalPlayer:
         self._artist_cursor = self._artist_cursors.get(self._artist_key(), 0)
         self._load_artist_section()
 
+    @staticmethod
+    def _obj_id(obj) -> str:
+        return str(getattr(obj, "id", "") or "")
+
+    @staticmethod
+    def _rows(kind: str, objs) -> list:
+        return [{"type": kind, "obj": obj} for obj in objs]
+
+    @staticmethod
+    def _track_estimate(track, tier: str) -> int:
+        return downloads.estimate_bytes(getattr(track, "duration", 0), tier)
+
+    def _artist_row(self):
+        rows = self._artist_rows()
+        return rows[self._artist_cursor] if 0 <= self._artist_cursor < len(rows) else None
+
     def _artist_key(self, section: Optional[str] = None):
-        return (str(getattr(self._artist, "id", "") or ""), section or self._artist_section)
+        return (self._obj_id(self._artist), section or self._artist_section)
 
     def _artist_record(self):
         return self._artist_sections.get(self._artist_key())
@@ -4143,15 +4078,13 @@ class HeadlessTidalPlayer:
             return
         section = self._artist_section
         limit = max(20, self._page_size)
-        self._artist_sections = {
-            **self._artist_sections, key: {"state": "loading", "items": [], "message": ""}}
+        self._artist_sections = {**self._artist_sections, key: {"state": "loading", "items": [], "message": ""}}
 
         def _run():
             try:
                 items = self._fetch_artist_section(artist, section, limit)
             except Exception:
-                record = {"state": "failed", "items": [],
-                          "message": self.ARTIST_SECTION_FAILED[section]}
+                record = {"state": "failed", "items": [], "message": self.ARTIST_SECTION_FAILED[section]}
             else:
                 record = {"state": "ready", "items": items,
                           "message": "" if items else self.ARTIST_SECTION_EMPTY[section]}
@@ -4163,14 +4096,11 @@ class HeadlessTidalPlayer:
 
     def _fetch_artist_section(self, artist, section: str, limit: int) -> list:
         if section == "tracks":
-            return [{"type": "track", "obj": t}
-                    for t in (artist.get_top_tracks(limit=limit) or [])]
+            return self._rows("track", artist.get_top_tracks(limit=limit) or [])
         if section == "albums":
-            return [{"type": "album", "obj": a}
-                    for a in (artist.get_albums(limit=limit) or [])]
+            return self._rows("album", artist.get_albums(limit=limit) or [])
         if section == "playlists":
-            return [{"type": "playlist", "obj": p}
-                    for p in self._artist_page_playlists(artist)]
+            return self._rows("playlist", self._artist_page_playlists(artist))
         return self._artist_suggestions(artist, limit)
 
     def _artist_page_playlists(self, artist) -> list:
@@ -4182,7 +4112,7 @@ class HeadlessTidalPlayer:
             for item in (getattr(category, "items", None) or []):
                 if not isinstance(item, tidalapi.Playlist):
                     continue
-                pid = str(getattr(item, "id", "") or "")
+                pid = self._obj_id(item)
                 if pid and pid in seen:
                     continue
                 seen.add(pid)
@@ -4193,13 +4123,11 @@ class HeadlessTidalPlayer:
         rows = []
         failed = 0
         try:
-            rows += [{"type": "track", "obj": t}
-                     for t in (artist.get_radio(limit=limit) or [])]
+            rows += self._rows("track", artist.get_radio(limit=limit) or [])
         except Exception:
             failed += 1
         try:
-            rows += [{"type": "artist", "obj": a}
-                     for a in (artist.get_similar() or [])]
+            rows += self._rows("artist", artist.get_similar() or [])
         except Exception:
             failed += 1
         if failed == 2:
@@ -4226,17 +4154,13 @@ class HeadlessTidalPlayer:
             return
         row = rows[self._artist_cursor]
         obj = row["obj"]
-        if row["type"] == "album":
-            self._open_album(obj)
-        elif row["type"] == "playlist":
-            self._open_playlist(obj)
-        elif row["type"] == "artist":
-            self._open_artist(obj)
+        opener = {"album": self._open_album, "playlist": self._open_playlist,
+                  "artist": self._open_artist}.get(row["type"])
+        if opener:
+            opener(obj)
         else:
-            tracks = self._artist_section_tracks()
-            index = sum(1 for r in rows[:self._artist_cursor] if r["type"] == "track")
-            self._queue = tracks
-            self._queue_index = index
+            self._queue = self._artist_section_tracks()
+            self._queue_index = sum(1 for r in rows[:self._artist_cursor] if r["type"] == "track")
             self._play_track(obj)
 
     def _play_all_artist(self):
@@ -4269,8 +4193,7 @@ class HeadlessTidalPlayer:
 
         def _run():
             try:
-                playlists = self.session.user.playlists()
-                fresh = list(playlists) if playlists else []
+                fresh = list(self.session.user.playlists() or [])
                 self._playlists = fresh
                 if self._playlists_cursor >= len(fresh):
                     self._playlists_cursor = max(0, len(fresh) - 1)
@@ -4289,7 +4212,7 @@ class HeadlessTidalPlayer:
     def _open_playlist(self, playlist):
         self._push_nav()
         self._mode = self.MODE_BROWSE
-        playlist_id = str(getattr(playlist, "id", "") or "")
+        playlist_id = self._obj_id(playlist)
         self._browse_playlist = playlist if isinstance(playlist, tidalapi.UserPlaylist) else None
         self._browse_title = playlist.name if hasattr(playlist, "name") else "Playlist"
         cached = self._cache.get_playlist_tracks(playlist_id) if playlist_id else None
@@ -4313,8 +4236,7 @@ class HeadlessTidalPlayer:
                 if self._browse_title != title:
                     return
                 self._browse_tracks = tracks
-                if self._browse_cursor >= len(tracks):
-                    self._browse_cursor = len(tracks) - 1
+                self._browse_cursor = min(self._browse_cursor, len(tracks) - 1)
                 if not tracks:
                     self._browse_message = "Playlist is empty"
             except Exception:
@@ -4335,18 +4257,16 @@ class HeadlessTidalPlayer:
         if removing_before_current:
             self._queue_index -= 1
         elif removing_current:
-            if self._queue and self._queue_index < len(self._queue):
-                self._play_track(self._queue[self._queue_index])
-            elif self._queue and self._queue_index > 0:
-                self._queue_index = len(self._queue) - 1
+            if self._queue:
+                self._queue_index = min(self._queue_index, len(self._queue) - 1)
                 self._play_track(self._queue[self._queue_index])
             else:
                 self._playing = False
                 self._current_track = None
                 if self.audio:
                     self.audio.stop()
-        if self._queue_cursor >= len(self._queue) and self._queue:
-            self._queue_cursor = len(self._queue) - 1
+        if self._queue:
+            self._queue_cursor = min(self._queue_cursor, len(self._queue) - 1)
 
     def _remove_from_browse_playlist(self):
         pl = self._browse_playlist
@@ -4363,8 +4283,7 @@ class HeadlessTidalPlayer:
                 if pl.remove_by_index(index):
                     remaining = [t for i, t in enumerate(self._browse_tracks) if i != index]
                     self._browse_tracks = remaining
-                    if self._browse_cursor >= len(remaining):
-                        self._browse_cursor = len(remaining) - 1
+                    self._browse_cursor = min(self._browse_cursor, len(remaining) - 1)
                     self._set_toast(f'Removed "{track.name}" from {pl.name}')
                 else:
                     self._set_toast("Failed to remove from playlist")
@@ -4385,11 +4304,9 @@ class HeadlessTidalPlayer:
         if self._mode == self.MODE_BROWSE and self._browse_tracks and self._browse_cursor >= 0:
             return self._browse_tracks[self._browse_cursor]
         if self._mode == self.MODE_ARTIST:
-            rows = self._artist_rows()
-            if rows and 0 <= self._artist_cursor < len(rows):
-                row = rows[self._artist_cursor]
-                if row["type"] == "track":
-                    return row["obj"]
+            row = self._artist_row()
+            if row and row["type"] == "track":
+                return row["obj"]
         return self._current_track
 
     def _picker_playlists(self) -> list:
@@ -4397,10 +4314,10 @@ class HeadlessTidalPlayer:
         pid = self._last_playlist_id
         if not pid or not playlists:
             return playlists
-        pinned = [p for p in playlists if str(getattr(p, "id", "") or "") == pid]
+        pinned = [p for p in playlists if self._obj_id(p) == pid]
         if not pinned:
             return playlists
-        return pinned + [p for p in playlists if str(getattr(p, "id", "") or "") != pid]
+        return pinned + [p for p in playlists if self._obj_id(p) != pid]
 
     def _download_target(self, whole: bool = False) -> tuple:
         if self._mode == self.MODE_BROWSE and self._browse_tracks:
@@ -4413,9 +4330,7 @@ class HeadlessTidalPlayer:
             if self._queue_cursor < len(self._queue):
                 return [self._queue[self._queue_cursor]], ""
         if self._mode == self.MODE_ARTIST:
-            rows = self._artist_rows()
-            row = (rows[self._artist_cursor]
-                   if rows and 0 <= self._artist_cursor < len(rows) else None)
+            row = self._artist_row()
             if row is not None and row["type"] == "track" and not whole:
                 return [row["obj"]], ""
             section = self._artist_section_tracks()
@@ -4437,17 +4352,16 @@ class HeadlessTidalPlayer:
         self._download_tracks = tracks
         self._download_label = label if len(tracks) > 1 else ""
         self._download_track = track
-        try:
-            self._download_cursor = QUALITY_CHOICES.index(self._quality_name)
-        except ValueError:
-            self._download_cursor = 0
+        self._download_cursor = (QUALITY_CHOICES.index(self._quality_name)
+                                 if self._quality_name in QUALITY_CHOICES else 0)
         job = self._download_job
         running = bool(job) and job.get("state") == "running"
-        if job and not running and job.get("track_id") != getattr(track, "id", None):
+        track_id = getattr(track, "id", None)
+        if job and not running and job.get("track_id") != track_id:
             self._download_job = None
         if not running:
             # Exact name only: the one deletion this feature ever performs under the music folder.
-            self._discard_staging(getattr(track, "id", None))
+            self._discard_staging(track_id)
 
     def _cancel_download(self):
         job = self._download_job
@@ -4461,16 +4375,14 @@ class HeadlessTidalPlayer:
         return QUALITY_CHOICES[self._download_cursor % len(QUALITY_CHOICES)]
 
     def _download_estimate(self, tier: str) -> int:
-        return downloads.estimate_bytes(
-            getattr(self._download_track, "duration", 0), tier)
+        return self._track_estimate(self._download_track, tier)
 
     def _download_bulk(self) -> bool:
         return len(self._download_tracks) > 1
 
     def _download_bulk_estimate(self, tier: str) -> int:
         # No network: 53 playbackinfo calls in 2.8 s got the IP blocked (docs/adr/0001-tidal-rate-limits.md).
-        return sum(downloads.estimate_bytes(getattr(t, "duration", 0), tier)
-                   for t in self._download_tracks)
+        return sum(self._track_estimate(track, tier) for track in self._download_tracks)
 
     def _download_facts(self) -> tuple:
         track_id = getattr(self._download_track, "id", None)
@@ -4480,10 +4392,9 @@ class HeadlessTidalPlayer:
         sizes, owned = {}, None
 
         def note(granted, size):
-            for name, quality in self.QUALITY_MAP.items():
-                if granted == quality and size:
-                    sizes[name] = int(size)
-                    return
+            name = next((n for n, quality in self.QUALITY_MAP.items() if granted == quality), None)
+            if name and size:
+                sizes[name] = int(size)
 
         if track_id is not None:
             record = self._cache.audio_record(track_id) or {}
@@ -4506,19 +4417,16 @@ class HeadlessTidalPlayer:
         track = self._download_track
         if track is None:
             return
-        if (self._download_run is not None
-                and (self._download_job or {}).get("state") == "running"):
-            self._start_bulk_download_job(
-                tier, tracks=[track], label=getattr(track, "name", "") or "")
+        running = (self._download_job or {}).get("state") == "running"
+        if running and self._download_run is not None:
+            self._start_bulk_download_job(tier, tracks=[track], label=getattr(track, "name", "") or "")
             return
-        job = self._download_job
-        if job and job.get("state") == "running":
+        if running:
             self._set_toast("A download is already running — [x] stops it")
             return
         self._download_job_gen = gen = self._download_job_gen + 1
-        track_id = getattr(track, "id", None)
         self._download_job = {
-            "state": "running", "tier": tier, "track_id": track_id,
+            "state": "running", "tier": tier, "track_id": getattr(track, "id", None),
             "done": 0, "total": 0, "path": None, "error": "", "tags": "",
         }
 
@@ -4574,8 +4482,7 @@ class HeadlessTidalPlayer:
 
     def _start_bulk_download_job(self, tier: str, tracks=None,
                                  label: Optional[str] = None):
-        tracks = list(self._download_tracks if tracks is None else tracks)
-        tracks = [t for t in tracks if t is not None]
+        tracks = [t for t in (self._download_tracks if tracks is None else tracks) if t is not None]
         if not tracks:
             return
         if (self._refetch_job or {}).get("state") == "running":
@@ -4609,8 +4516,7 @@ class HeadlessTidalPlayer:
             "state": "running", "bulk": True, "tier": tier, "track_id": None,
             "tracks": len(items), "done": 0, "failed": 0, "slots": slots,
             "error": "", "labels": (label,) if label else (),
-            "estimate": sum(downloads.estimate_bytes(
-                getattr(t, "duration", 0), tr) for t, tr, _i in items),
+            "estimate": sum(self._track_estimate(t, tr) for t, tr, _i in items),
         }
 
         def _alive():
@@ -4628,8 +4534,7 @@ class HeadlessTidalPlayer:
             track, item_tier, _tid = item
             slot.update(title=plan["title"] or str(plan["track_id"]),
                         done=0, total=0, size=0, samples=(), mark=None,
-                        estimate=downloads.estimate_bytes(
-                            getattr(track, "duration", 0), item_tier),
+                        estimate=self._track_estimate(track, item_tier),
                         state="running")
             last = [0.0]
 
@@ -4674,10 +4579,8 @@ class HeadlessTidalPlayer:
                 return
             done, failed, blocked = outcome
             if leftover and not blocked and _alive():
-                labels = [l for l in ((self._download_job or {}).get("labels")
-                                      or ()) if l]
-                self._download_job = dict(self._download_job or {},
-                                          state="done")
+                labels = [name for name in ((self._download_job or {}).get("labels") or ()) if name]
+                self._download_job = dict(self._download_job or {}, state="done")
                 self._start_bulk_download_job(
                     leftover[0][1], tracks=[t for t, _q, _i in leftover],
                     label=labels[-1] if labels else "")
@@ -4691,8 +4594,7 @@ class HeadlessTidalPlayer:
                     seconds=PLAYER_ERROR_SECONDS)
             else:
                 _update(state="done")
-                short = max((self._download_job or {}).get("tracks", 0)
-                            - done - failed, 0)
+                short = max((self._download_job or {}).get("tracks", 0) - done - failed, 0)
                 self._set_toast(
                     f"Downloaded {done} song{'' if done == 1 else 's'}"
                     f" to {downloads.display_dir()}"
@@ -4706,8 +4608,7 @@ class HeadlessTidalPlayer:
                              label: Optional[str]) -> None:
         job = dict(self._download_job or {})
         if not items:
-            self._set_toast(f"Already queued — all {asked} of them"
-                            if asked > 1 else "Already queued")
+            self._set_toast(f"Already queued — all {asked} of them" if asked > 1 else "Already queued")
             return
         run.add(items)
         labels = tuple(job.get("labels") or ())
@@ -4716,15 +4617,12 @@ class HeadlessTidalPlayer:
         job.update(
             tracks=(job.get("tracks") or 0) + len(items),
             estimate=(job.get("estimate") or 0) + sum(
-                downloads.estimate_bytes(getattr(t, "duration", 0), tr)
-                for t, tr, _i in items),
+                self._track_estimate(t, tr) for t, tr, _i in items),
             labels=labels,
         )
         self._download_job = job
         skipped = asked - len(items)
-        self._set_toast(
-            f"Queued {len(items)} more"
-            + (f" · {skipped} already queued" if skipped else ""))
+        self._set_toast(f"Queued {len(items)} more" + (f" · {skipped} already queued" if skipped else ""))
         self._wake()
 
     def _sample_download_rates(self) -> None:
@@ -4742,8 +4640,7 @@ class HeadlessTidalPlayer:
                 slot["mark"] = (now, done)
                 continue
             then, before = mark
-            slot["samples"] = (slot["samples"]
-                               + ((done - before) / (now - then),))[-RATE_SAMPLES:]
+            slot["samples"] = (slot["samples"] + ((done - before) / (now - then),))[-RATE_SAMPLES:]
             slot["mark"] = (now, done)
 
     @staticmethod
@@ -4765,8 +4662,7 @@ class HeadlessTidalPlayer:
         if real is None:
             raise RuntimeError("track could not be resolved")
         # Extension unknown until the CDN answers: write under a provisional per-track name, rename after.
-        staging = (downloads.download_dir()
-                   / f".ticli-{track_id}{downloads.PART_SUFFIX}")
+        staging = downloads.download_dir() / f".ticli-{track_id}{downloads.PART_SUFFIX}"
         staging.parent.mkdir(parents=True, exist_ok=True)
         ext, granted = self._promote_cached_copy(track_id, tier, staging)
         sources = None
@@ -4774,9 +4670,8 @@ class HeadlessTidalPlayer:
             url, granted, tier = self._stream_at_best_tier(real, tier)
             sources = stream_sources(url)
         return {"track_id": track_id, "real": real, "staging": staging,
-                "meta": downloads.track_metadata(real), "tier": tier,
-                "ext": ext, "granted": granted, "sources": sources,
-                "title": getattr(real, "name", None) or ""}
+                "meta": downloads.track_metadata(real), "tier": tier, "ext": ext,
+                "granted": granted, "sources": sources, "title": getattr(real, "name", None) or ""}
 
     def _download_deliver(self, plan: dict, abandoned, progress=None,
                           record=True):
@@ -4800,14 +4695,13 @@ class HeadlessTidalPlayer:
                     previous.unlink()
                 except OSError:
                     pass
-            written = tags.write_tags(final, plan["meta"],
-                                      self._cover_bytes(plan["real"]))
+            written = tags.write_tags(final, plan["meta"], self._cover_bytes(plan["real"]))
             size = final.stat().st_size
             relative = final.relative_to(downloads.download_dir())
             tier, granted = plan["tier"], plan["granted"]
+
             def _commit():
-                downloads.record(track_id, relative, tier, size,
-                                 granted=granted)
+                downloads.record(track_id, relative, tier, size, granted=granted)
                 self._drop_superseded_cache_copy(track_id)
 
             # Both halves rewrite a whole JSON file, so both belong on the runner's single thread (see record=False).
@@ -4873,20 +4767,14 @@ class HeadlessTidalPlayer:
             return ceiling
         return wanted
 
-    @staticmethod
-    def _is_upgrade(stored, target) -> bool:
-        if target not in QUALITY_RANK or stored not in QUALITY_RANK:
-            return False
-        return QUALITY_RANK[target] > QUALITY_RANK[stored]
     def _refetch_candidates(self) -> dict:
         target = self._upgrade_target()
-        plan = {"downloads": [], "cache": [], "skipped": 0, "unknown": 0,
-                "bytes": 0}
+        plan = {"downloads": [], "cache": [], "skipped": 0, "unknown": 0, "bytes": 0}
 
         def classify(stored, key, size, bucket):
             if stored not in QUALITY_RANK:
                 plan["unknown"] += 1
-            elif not self._is_upgrade(stored, target):
+            elif target not in QUALITY_RANK or QUALITY_RANK[target] <= QUALITY_RANK[stored]:
                 plan["skipped"] += 1
             else:
                 bucket.append(key)
@@ -4895,15 +4783,13 @@ class HeadlessTidalPlayer:
         for key, entry in downloads.load_index().items():
             if downloads._entry_path(entry) is None:
                 continue
-            classify(entry.get("granted"), key, entry.get("bytes"),
-                     plan["downloads"])
+            classify(entry.get("granted"), key, entry.get("bytes"), plan["downloads"])
         if self._cache.keeps_audio:
             downloaded = set(plan["downloads"])
             for key, record in self._cache._load_tracker().items():
                 if key in downloaded:
                     continue
-                classify(record.get("quality"), key, record.get("bytes"),
-                         plan["cache"])
+                classify(record.get("quality"), key, record.get("bytes"), plan["cache"])
         return plan
 
     def _start_refetch_job(self) -> None:
@@ -4921,10 +4807,8 @@ class HeadlessTidalPlayer:
             return
         tier = self._quality_name
         self._refetch_gen = gen = self._refetch_gen + 1
-        self._refetch_job = {
-            "state": "running", "tier": tier, "done": 0, "total": total,
-            "failed": 0, "error": "",
-        }
+        self._refetch_job = {"state": "running", "tier": tier, "done": 0, "total": total,
+                             "failed": 0, "error": ""}
 
         def _update(**changes):
             if self._refetch_gen != gen:
@@ -4936,11 +4820,9 @@ class HeadlessTidalPlayer:
 
         def _run():
             outcome = _PacedRun(
-                items=([("download", k) for k in plan["downloads"]]
-                       + [("cache", k) for k in plan["cache"]]),
+                items=[("download", k) for k in plan["downloads"]] + [("cache", k) for k in plan["cache"]],
                 resolve=lambda item: item,
-                fetch=lambda item, _h, _s: self._refetch_one(
-                    item[0], item[1], tier, gen),
+                fetch=lambda item, _h, _s: self._refetch_one(item[0], item[1], tier, gen),
                 alive=lambda: self._refetch_gen == gen,
                 report=_update,
                 workers=1,
@@ -4958,10 +4840,8 @@ class HeadlessTidalPlayer:
                     seconds=PLAYER_ERROR_SECONDS)
             else:
                 _update(state="done")
-                self._set_toast(
-                    f"Re-fetched {done} song{'' if done == 1 else 's'}"
-                    f" at {tier}"
-                    + (f" · {failed} failed" if failed else ""))
+                self._set_toast(f"Re-fetched {done} song{'' if done == 1 else 's'} at {tier}"
+                                + (f" · {failed} failed" if failed else ""))
             self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
@@ -4972,8 +4852,7 @@ class HeadlessTidalPlayer:
                 raise _DownloadSuperseded()
             return False
 
-        real = self.session.track(int(key)) if str(key).isdigit() \
-            else self.session.track(key)
+        real = self.session.track(int(key) if str(key).isdigit() else key)
         if real is None:
             raise RuntimeError("track could not be resolved")
         if kind == "download":
@@ -4995,8 +4874,7 @@ class HeadlessTidalPlayer:
         path = base + ext
         os.replace(part, path)
         self.audio._drop_other_copies(base, path)
-        self._cache.note_cached(track_id, ext, os.path.getsize(path),
-                                quality=granted)
+        self._cache.note_cached(track_id, ext, os.path.getsize(path), quality=granted)
         self._cache.invalidate_audio_count()
         self.audio._sweep_cache()
 
@@ -5009,8 +4887,7 @@ class HeadlessTidalPlayer:
 
     def _discard_staging(self, track_id) -> None:
         try:
-            (downloads.download_dir()
-             / f".ticli-{track_id}{downloads.PART_SUFFIX}").unlink()
+            (downloads.download_dir() / f".ticli-{track_id}{downloads.PART_SUFFIX}").unlink()
         except OSError:
             pass
 
@@ -5021,7 +4898,7 @@ class HeadlessTidalPlayer:
         wanted = self.QUALITY_MAP.get(tier)
         record = self._cache.audio_record(track_id) or {}
         granted = record.get("quality")
-        if not wanted or not granted or granted != wanted:
+        if not wanted or granted != wanted:
             return None, None
         source = cached_audio_path(track_id)
         if not source:
@@ -5122,10 +4999,8 @@ class HeadlessTidalPlayer:
             try:
                 added = playlist.add([str(track.id)])
                 self._remember_last_playlist(playlist)
-                if added:
-                    self._set_toast(f'Added to "{playlist.name}"')
-                else:
-                    self._set_toast(f'Already in "{playlist.name}"')
+                self._set_toast(
+                    f'{"Added to" if added else "Already in"} "{playlist.name}"')
             except Exception:
                 self._set_toast("Failed to add to playlist")
             finally:
@@ -5270,8 +5145,7 @@ class HeadlessTidalPlayer:
     def _handle_key(self, key: str):
         # Any other key un-hides: a bound-keys list would be a second copy of the mode dispatch and go stale.
         if self._footer_hidden:
-            if key not in HIDE_HOLD_KEYS:
-                self._footer_hidden = False
+            self._footer_hidden = key in HIDE_HOLD_KEYS
         elif key == "h" and self._can_hide_footer():
             self._footer_hidden = True
             return
@@ -5287,14 +5161,15 @@ class HeadlessTidalPlayer:
             return
 
         if self._logout_pending:
-            if key == "y" or key == "Y":
+            if key in ("y", "Y"):
                 self._logout()
             self._logout_pending = False
             return
 
+        confirmed = key in ("y", "Y", KEY_ENTER, KEY_ENTER2)
         if self._disable_songs_pending:
             self._disable_songs_pending = False
-            if key in ("y", "Y", KEY_ENTER, KEY_ENTER2):
+            if confirmed:
                 self._set_setting(get_spec("cache_songs"), False)
                 self._clear_cached_songs()
             elif key in ("n", "N"):
@@ -5303,12 +5178,12 @@ class HeadlessTidalPlayer:
 
         if self._clear_cache_pending:
             self._clear_cache_pending = False
-            if key in ("y", "Y", KEY_ENTER, KEY_ENTER2):
+            if confirmed:
                 self._clear_cached_songs()
             return
 
         if self._downloads_delete is not None:
-            if key in ("y", "Y", KEY_ENTER, KEY_ENTER2):
+            if confirmed:
                 self._delete_download()
             else:
                 self._downloads_delete = None
@@ -5318,8 +5193,7 @@ class HeadlessTidalPlayer:
             self._refetch_pending = False
             plan = self._refetch_plan
             self._refetch_plan = None
-            if key in ("y", "Y", KEY_ENTER, KEY_ENTER2) and plan and (
-                    plan["downloads"] or plan["cache"]):
+            if confirmed and plan and (plan["downloads"] or plan["cache"]):
                 self._start_refetch_job()
             return
 
@@ -5339,24 +5213,17 @@ class HeadlessTidalPlayer:
             self._open_volume(from_focus=was_focused)
             return
 
-        if self._mode == self.MODE_SEARCH:
-            self._handle_search_key(key)
-        elif self._mode == self.MODE_BROWSE:
-            self._handle_browse_key(key)
-        elif self._mode == self.MODE_ARTIST:
-            self._handle_artist_key(key)
-        elif self._mode == self.MODE_QUEUE:
-            self._handle_queue_key(key)
-        elif self._mode == self.MODE_PLAYLISTS:
-            self._handle_playlists_key(key)
-        elif self._mode == self.MODE_ADD_TO_PLAYLIST:
-            self._handle_add_to_playlist_key(key)
-        elif self._mode == self.MODE_SETTINGS:
-            self._handle_settings_key(key)
-        elif self._mode == self.MODE_DOWNLOADS:
-            self._handle_downloads_key(key)
-        else:
-            self._handle_player_key(key)
+        handlers = {
+            self.MODE_SEARCH: self._handle_search_key,
+            self.MODE_BROWSE: self._handle_browse_key,
+            self.MODE_ARTIST: self._handle_artist_key,
+            self.MODE_QUEUE: self._handle_queue_key,
+            self.MODE_PLAYLISTS: self._handle_playlists_key,
+            self.MODE_ADD_TO_PLAYLIST: self._handle_add_to_playlist_key,
+            self.MODE_SETTINGS: self._handle_settings_key,
+            self.MODE_DOWNLOADS: self._handle_downloads_key,
+        }
+        handlers.get(self._mode, self._handle_player_key)(key)
 
     def _focus_player(self):
         if self._current_track is not None:
@@ -5386,29 +5253,23 @@ class HeadlessTidalPlayer:
         return key in (KEY_DOWN, KEY_ESC)
 
     def _can_open_volume(self) -> bool:
-        return (self._mode != self.MODE_SEARCH
-                and not self._download_open
-                and self._settings_edit is None
-                and self._picker_new_name is None)
+        return (self._mode != self.MODE_SEARCH and not self._download_open
+                and self._settings_edit is None and self._picker_new_name is None)
 
     def _can_hide_footer(self) -> bool:
-        return (self._mode == self.MODE_PLAYER
-                and not self._mini_player
-                and not self._volume_open
-                and not self._download_open)
+        return (self._mode == self.MODE_PLAYER and not self._mini_player
+                and not self._volume_open and not self._download_open)
 
     def _can_exit_menu_to_player(self) -> bool:
         if self._mode in (self.MODE_PLAYER, self.MODE_SEARCH):
             return False
-        if self._mini_player or self._volume_open or self._download_open:
-            return False
-        if self._settings_edit is not None or self._picker_new_name is not None:
-            return False
-        if (self._quit_pending or self._logout_pending
-                or self._disable_songs_pending or self._clear_cache_pending
-                or self._refetch_pending or self._downloads_delete is not None):
-            return False
-        return True
+        return not (
+            self._mini_player or self._volume_open or self._download_open
+            or self._settings_edit is not None
+            or self._picker_new_name is not None
+            or self._quit_pending or self._logout_pending
+            or self._disable_songs_pending or self._clear_cache_pending
+            or self._refetch_pending or self._downloads_delete is not None)
 
     def _open_volume(self, from_focus: bool = False):
         self._volume_from_focus = from_focus
@@ -5433,23 +5294,26 @@ class HeadlessTidalPlayer:
         elif key in (" ", "k"):
             self._toggle_play_key()
 
+    def _enter_mode(self, mode) -> None:
+        self._mini_player = False
+        self._mode = mode
+        self._nav_history.clear()
+
     def _handle_player_key(self, key: str):
         if key in (" ", "k"):
             self._toggle_play_key()
-        elif key == "n" or key == KEY_RIGHT:
+        elif key in ("n", KEY_RIGHT):
             self._next_track()
         elif key == KEY_LEFT:
             self._prev_track()
         elif key == KEY_UP:
             self._focus_player()
         elif key == "s":
-            self._mini_player = False
-            self._mode = self.MODE_SEARCH
+            self._enter_mode(self.MODE_SEARCH)
             self._search_query = ""
             self._search_history_cursor = None
             self._search_filter = "all"
             self._reset_search_results()
-            self._nav_history.clear()
         elif key == "t":
             self._mini_player = not self._mini_player
         elif key == "m":
@@ -5463,39 +5327,52 @@ class HeadlessTidalPlayer:
         elif key == "d":
             self._open_download()
         elif key == "q":
-            self._mini_player = False
-            self._mode = self.MODE_QUEUE
+            self._enter_mode(self.MODE_QUEUE)
             self._queue_cursor = self._queue_index if self._queue else 0
-            self._nav_history.clear()
         elif key == "p":
-            self._mini_player = False
-            self._mode = self.MODE_PLAYLISTS
-            self._nav_history.clear()
+            self._enter_mode(self.MODE_PLAYLISTS)
             if not self._playlists and not self._playlists_loading:
                 self._load_playlists()
         elif key == "c":
-            self._mini_player = False
-            self._mode = self.MODE_SETTINGS
+            self._enter_mode(self.MODE_SETTINGS)
             self._settings_cursor = 0
             self._settings_edit = None
             self._cache.invalidate_audio_count()
             self._forget_downloads()
-            self._nav_history.clear()
         elif key == KEY_ESC:
             self._quit_pending = True
 
+    def _handle_back_or_toggle(self, key: str, back=None) -> bool:
+        if key in (KEY_ESC, KEY_LEFT):
+            (back or self._go_back)()
+            return True
+        if key == " ":
+            self._toggle_play_key()
+            return True
+        return False
+
+    def _show_player(self) -> None:
+        self._mode = self.MODE_PLAYER
+
+    def _cursor_up(self, attr: str, count: int, floor: int = 0) -> None:
+        if count and getattr(self, attr) > floor:
+            setattr(self, attr, getattr(self, attr) - 1)
+        else:
+            self._focus_player()
+
+    def _cursor_down(self, attr: str, count: int) -> None:
+        if count:
+            setattr(self, attr, min(count - 1, getattr(self, attr) + 1))
+
     def _handle_search_key(self, key: str):
-        if key == KEY_ESC or key == KEY_LEFT:
+        if key in (KEY_ESC, KEY_LEFT):
             self._go_back()
             return
         if key == " " and self._search_results:
             self._toggle_play_key()
             return
-        if key == KEY_TAB:
-            self._cycle_search_filter(1)
-            return
-        if key == KEY_SHIFT_TAB:
-            self._cycle_search_filter(-1)
+        if key in (KEY_TAB, KEY_SHIFT_TAB):
+            self._cycle_search_filter(1 if key == KEY_TAB else -1)
             return
         history = self._history_rows()
         if key == KEY_UP:
@@ -5520,21 +5397,17 @@ class HeadlessTidalPlayer:
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
             if self._search_results:
                 self._select_search_result()
-            elif (history and self._search_history_cursor is not None
-                    and key != KEY_RIGHT):
-                self._search_query = history[self._search_history_cursor]
-                self._search_history_cursor = None
-                self._do_search()
             elif key != KEY_RIGHT:
+                if history and self._search_history_cursor is not None:
+                    self._search_query = history[self._search_history_cursor]
+                    self._search_history_cursor = None
                 self._do_search()
         elif key in (KEY_BACKSPACE, KEY_BACKSPACE2):
             if history and self._search_history_cursor is not None:
                 idx = self._search_history_cursor
-                self._search_history = (
-                    self._search_history[:idx] + self._search_history[idx + 1:])
+                self._search_history = self._search_history[:idx] + self._search_history[idx + 1:]
                 remaining = self._history_rows()
-                self._search_history_cursor = (
-                    min(idx, len(remaining) - 1) if remaining else None)
+                self._search_history_cursor = min(idx, len(remaining) - 1) if remaining else None
             else:
                 self._search_query = self._search_query[:-1]
                 self._search_history_cursor = None
@@ -5545,20 +5418,12 @@ class HeadlessTidalPlayer:
             self._reset_search_results()
 
     def _handle_browse_key(self, key: str):
-        if key == KEY_ESC or key == KEY_LEFT:
-            self._go_back()
-            return
-        if key == " ":
-            self._toggle_play_key()
+        if self._handle_back_or_toggle(key):
             return
         if key == KEY_UP:
-            if self._browse_tracks and self._browse_cursor > -1:
-                self._browse_cursor -= 1
-            else:
-                self._focus_player()
+            self._cursor_up("_browse_cursor", len(self._browse_tracks), floor=-1)
         elif key == KEY_DOWN:
-            if self._browse_tracks:
-                self._browse_cursor = min(len(self._browse_tracks) - 1, self._browse_cursor + 1)
+            self._cursor_down("_browse_cursor", len(self._browse_tracks))
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
             if self._browse_cursor == -1:
                 self._play_all_browse()
@@ -5566,37 +5431,26 @@ class HeadlessTidalPlayer:
                 self._play_browse_track()
         elif key == "a":
             self._play_all_browse()
+        elif key == "x":
+            self._remove_from_browse_playlist()
         elif key == "y":
             self._open_playlist_picker()
         elif key == "d":
             self._open_download()
         elif key == "D":
             self._open_download(whole=True)
-        elif key == "x":
-            self._remove_from_browse_playlist()
 
     def _handle_artist_key(self, key: str):
-        if key == KEY_ESC or key == KEY_LEFT:
-            self._go_back()
+        if self._handle_back_or_toggle(key):
             return
-        if key == " ":
-            self._toggle_play_key()
+        if key in (KEY_TAB, KEY_SHIFT_TAB):
+            self._cycle_artist_section(1 if key == KEY_TAB else -1)
             return
-        if key == KEY_TAB:
-            self._cycle_artist_section(1)
-            return
-        if key == KEY_SHIFT_TAB:
-            self._cycle_artist_section(-1)
-            return
-        rows = self._artist_rows()
+        row_count = len(self._artist_rows())
         if key == KEY_UP:
-            if rows and self._artist_cursor > 0:
-                self._artist_cursor -= 1
-            else:
-                self._focus_player()
+            self._cursor_up("_artist_cursor", row_count)
         elif key == KEY_DOWN:
-            if rows:
-                self._artist_cursor = min(len(rows) - 1, self._artist_cursor + 1)
+            self._cursor_down("_artist_cursor", row_count)
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
             self._select_artist_row()
         elif key == "a":
@@ -5609,20 +5463,12 @@ class HeadlessTidalPlayer:
             self._open_download(whole=True)
 
     def _handle_queue_key(self, key: str):
-        if key == KEY_ESC or key == KEY_LEFT:
-            self._mode = self.MODE_PLAYER
-            return
-        if key == " ":
-            self._toggle_play_key()
+        if self._handle_back_or_toggle(key, back=self._show_player):
             return
         if key == KEY_UP:
-            if self._queue and self._queue_cursor > 0:
-                self._queue_cursor -= 1
-            else:
-                self._focus_player()
+            self._cursor_up("_queue_cursor", len(self._queue))
         elif key == KEY_DOWN:
-            if self._queue:
-                self._queue_cursor = min(len(self._queue) - 1, self._queue_cursor + 1)
+            self._cursor_down("_queue_cursor", len(self._queue))
         elif key in (KEY_ENTER, KEY_ENTER2):
             if self._queue:
                 self._play_queue_index(self._queue_cursor)
@@ -5636,23 +5482,14 @@ class HeadlessTidalPlayer:
             self._open_download(whole=True)
 
     def _handle_playlists_key(self, key: str):
-        if key == KEY_ESC or key == KEY_LEFT:
-            self._mode = self.MODE_PLAYER
-            return
-        if key == " ":
-            self._toggle_play_key()
+        if self._handle_back_or_toggle(key, back=self._show_player):
             return
         if key == KEY_UP:
-            if self._playlists and self._playlists_cursor > 0:
-                self._playlists_cursor -= 1
-            else:
-                self._focus_player()
+            self._cursor_up("_playlists_cursor", len(self._playlists))
         elif key == KEY_DOWN:
-            if self._playlists:
-                self._playlists_cursor = min(len(self._playlists) - 1, self._playlists_cursor + 1)
-        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
-            if self._playlists:
-                self._open_playlist(self._playlists[self._playlists_cursor])
+            self._cursor_down("_playlists_cursor", len(self._playlists))
+        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT) and self._playlists:
+            self._open_playlist(self._playlists[self._playlists_cursor])
 
     def _handle_add_to_playlist_key(self, key: str):
         if self._picker_new_name is not None:
@@ -5662,15 +5499,10 @@ class HeadlessTidalPlayer:
                 self._picker_new_name = self._picker_new_name[:-1]
             elif key in (KEY_ENTER, KEY_ENTER2):
                 self._picker_create_and_add(self._picker_new_name)
-            elif len(key) == 1 and key.isprintable():
-                if len(self._picker_new_name) < PLAYLIST_NAME_MAX:
-                    self._picker_new_name = self._picker_new_name + key
+            elif len(key) == 1 and key.isprintable() and len(self._picker_new_name) < PLAYLIST_NAME_MAX:
+                self._picker_new_name += key
             return
-        if key == KEY_ESC or key == KEY_LEFT:
-            self._go_back()
-            return
-        if key == " ":
-            self._toggle_play_key()
+        if self._handle_back_or_toggle(key):
             return
         playlists = self._picker_playlists()
         if key == KEY_UP:
@@ -5680,24 +5512,20 @@ class HeadlessTidalPlayer:
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
             if self._picker_cursor < 0:
                 self._picker_new_name = ""
-            elif playlists and self._picker_cursor < len(playlists):
+            elif self._picker_cursor < len(playlists):
                 self._picker_add_to(playlists[self._picker_cursor])
 
     def _handle_download_key(self, key: str):
         if key in (KEY_ESC, KEY_LEFT):
             self._download_open = False
-            return
-        if key == " ":
+        elif key == " ":
             self._toggle_play_key()
-            return
-        if key in ("x", "X"):
+        elif key in ("x", "X"):
             self._cancel_download()
-            return
-        if key == KEY_UP:
+        elif key == KEY_UP:
             self._download_cursor = max(0, self._download_cursor - 1)
         elif key == KEY_DOWN:
-            self._download_cursor = min(len(QUALITY_CHOICES) - 1,
-                                        self._download_cursor + 1)
+            self._download_cursor = min(len(QUALITY_CHOICES) - 1, self._download_cursor + 1)
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT, "d", "D"):
             if self._download_bulk():
                 self._start_bulk_download_job(self._download_tier())
@@ -5710,50 +5538,42 @@ class HeadlessTidalPlayer:
         if self._settings_edit is not None:
             if key.isdigit():
                 if len(self._settings_edit) < 4:
-                    self._settings_edit = self._settings_edit + key
+                    self._settings_edit += key
                 return
             if key in (KEY_BACKSPACE, KEY_BACKSPACE2):
                 self._settings_edit = self._settings_edit[:-1]
                 return
             self._commit_setting_edit()
-            if key == KEY_ESC or key in (KEY_ENTER, KEY_ENTER2, KEY_LEFT, KEY_RIGHT):
+            if key in (KEY_ESC, KEY_ENTER, KEY_ENTER2, KEY_LEFT, KEY_RIGHT):
                 return
         elif key.isdigit() and self._begin_setting_edit(key):
             return
 
-        if key == KEY_ESC or key == "c":
+        if key in (KEY_ESC, "c"):
             if (self._refetch_job or {}).get("state") == "running":
                 self._cancel_refetch()
-                return
-            self._mode = self.MODE_PLAYER
-            return
-        if key == " ":
+            else:
+                self._show_player()
+        elif key == " ":
             self._toggle_play_key()
-            return
-        if key in ("o", "O"):
+        elif key in ("o", "O"):
             self._logout_pending = True
-            return
-        if key in ("x", "X"):
+        elif key in ("x", "X"):
             if (self._download_job or {}).get("state") == "running":
                 self._cancel_download()
-                return
-            self._clear_cache_pending = True
-            return
+            else:
+                self._clear_cache_pending = True
         # Not "p": that already opens playlists on the player screen.
-        if key in ("u", "U"):
+        elif key in ("u", "U"):
             self._upgrade_to_pkce()
-            return
-        if key in ("d", "D"):
+        elif key in ("d", "D"):
             self._open_downloads()
-            return
         # Asks first: this deliberately makes hundreds of requests.
-        if key in ("r", "R"):
-            if (self._refetch_job or {}).get("state") == "running":
-                return
-            self._refetch_plan = self._refetch_candidates()
-            self._refetch_pending = True
-            return
-        if key == KEY_UP:
+        elif key in ("r", "R"):
+            if (self._refetch_job or {}).get("state") != "running":
+                self._refetch_plan = self._refetch_candidates()
+                self._refetch_pending = True
+        elif key == KEY_UP:
             self._settings_cursor = max(0, self._settings_cursor - 1)
         elif key == KEY_DOWN:
             self._settings_cursor = min(len(SETTINGS_ROWS) - 1, self._settings_cursor + 1)
@@ -5769,11 +5589,7 @@ class HeadlessTidalPlayer:
         self._forget_downloads()
 
     def _handle_downloads_key(self, key: str):
-        if key == KEY_ESC or key == KEY_LEFT:
-            self._go_back()
-            return
-        if key == " ":
-            self._toggle_play_key()
+        if self._handle_back_or_toggle(key):
             return
         rows = self._download_rows()
         if key == KEY_UP:
@@ -5781,13 +5597,10 @@ class HeadlessTidalPlayer:
                 self._focus_player()
             else:
                 self._downloads_cursor -= 1
-            return
-        if key == KEY_DOWN:
+        elif key == KEY_DOWN:
             self._downloads_cursor = min(len(rows) - 1, self._downloads_cursor + 1)
-            return
-        if key in ("x", "X") and rows:
-            self._downloads_delete = rows[min(self._downloads_cursor,
-                                              len(rows) - 1)]
+        elif key in ("x", "X") and rows:
+            self._downloads_delete = rows[min(self._downloads_cursor, len(rows) - 1)]
 
     def _read_keys(self, select_mod, timeout=IDLE_POLL_SECONDS):
         watch = [sys.stdin]
@@ -5827,13 +5640,8 @@ class HeadlessTidalPlayer:
 
     def _make_live(self) -> "Live":
         # screen=True (alternate screen) is load-bearing: Rich's cursor-up repaint strands frames on resize.
-        return Live(
-            self._build_display(),
-            console=self.console,
-            # Repaints are driven by _repaint, not auto_refresh.
-            auto_refresh=False,
-            screen=True,
-        )
+        # Repaints are driven by _repaint, not auto_refresh.
+        return Live(self._build_display(), console=self.console, auto_refresh=False, screen=True)
 
     def run(self):
         # One ticli at a time, decided before anything touches config, cache tracker or audio backend; two instances overwrite the same saved position.
@@ -5937,3 +5745,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

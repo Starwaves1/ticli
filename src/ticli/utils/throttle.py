@@ -1,33 +1,21 @@
 """Cross-process request throttle for the agent surface.
 
-Exists because the working rules' rate limits lived in a Markdown file and an
-agent proved that documentation is not enforcement: it fired ~30 requests in
-seconds while building a playlist, unaware the rule existed (2026-08-25). The
-agent before it got the owner's IP blocked the same way. This module moves the
-brake from agent discipline into code, where it cannot be skipped by not
-having read it.
+An agent once fired ~30 requests in seconds while building a playlist, unaware
+of the rate-limit rules in a Markdown file (2026-08-25); the one before it got
+the owner's IP blocked. This moves the brake into code.
 
-Two mechanisms, one file:
+- **Spacing.** Each request reserves a slot: under an `flock` on the state
+  file, read `next_free_at`, claim `max(now, next_free_at)`, write back claim +
+  interval, release, then sleep until the claimed time. Reservation-then-sleep,
+  so the lock is never held across a wait and N processes serialize into N
+  spaced slots instead of stampeding.
+- **The trip.** A 429, or a 401 with TIDAL's subStatus 4006 ("Session does not
+  have streaming privileges", the bot-detection escalation), writes a tripped
+  record and every agent request then fails fast: the rule is stop and report,
+  since retries extend blocks. Only a human's `ticli agent unblock` clears it.
 
-- **Spacing.** Every request an agent makes reserves a slot: under an `flock`
-  on the state file, read `next_free_at`, claim `max(now, next_free_at)` as
-  this request's start, write the claim + interval back, release, and sleep
-  until the claimed time. Reservation-then-sleep rather than sleep-under-lock,
-  so the lock is never held across a wait or a network call, and N concurrent
-  processes serialize into N spaced slots instead of stampeding when the
-  first one finishes.
-
-- **The trip.** A 429, or a 401 carrying TIDAL's subStatus 4006 ("Session
-  does not have streaming privileges" — the bot-detection escalation), writes
-  a tripped record. From then on every agent request fails fast with a
-  structured error, because the working rule is *stop entirely and report* —
-  retries extend these blocks. Nothing clears it automatically: a human runs
-  `ticli agent unblock` after deciding it is safe, since the cost of a wrong
-  guess is the owner's music stopping, not a failed request.
-
-The state file lives in the same directory as the instance lock and the
-player state. Like `DOWNLOAD_ROOT` and `player.STATE_DIR`, the directory is
-read at call time so the test suite's rail can redirect it.
+The state file sits next to the instance lock and player state; the directory
+is read at call time so the test suite can redirect it.
 """
 
 import fcntl
@@ -36,28 +24,22 @@ import os
 import time
 from pathlib import Path
 
-# Same directory player.py calls STATE_DIR. Not imported from there — player's
-# import chain is the whole TUI, and `ticli agent --help` must stay instant.
-# Kept in step by a test rather than an import, the same way cli.py's
-# QUALITY_NAMES are.
+# Same as player.STATE_DIR, kept in step by a test rather than an import:
+# player's import chain is the whole TUI and `ticli agent --help` must stay instant.
 STATE_DIR = Path.home() / ".config" / "ticli"
 
-# The TUI floors interactive fetches at 1.0s with a human on the keys
-# (SEARCH_FETCH_MIN_INTERVAL). Agents are unattended and usually looping, so
-# the floor is doubled. This is spacing for a handful of calls, not a budget
-# for bulk work — an agent that needs hundreds of requests should be told no
-# by design, not throttled into taking ten minutes.
+# Double the TUI's 1.0s interactive floor (SEARCH_FETCH_MIN_INTERVAL): agents are
+# unattended and looping. Spacing for a handful of calls, not a bulk budget.
 MIN_INTERVAL_SECONDS = 2.0
 
 
 def _throttle_path() -> Path:
-    """Derived at call time rather than bound at import, so redirecting
-    STATE_DIR redirects this with it — same reason as _instance_lock_path."""
+    """Derived at call time so redirecting STATE_DIR redirects this too."""
     return STATE_DIR / "agent-throttle.json"
 
 
 class Tripped(Exception):
-    """The stop is in force. Carries the record so callers can report it."""
+    """The stop is in force; carries the record."""
 
     def __init__(self, record: dict):
         self.record = record
@@ -82,10 +64,8 @@ def _write_state(fd, state: dict) -> None:
 
 
 def _locked_state():
-    """Open the state file and take its flock. Caller must close the fd —
-    closing is what releases the lock. The whole read-modify-write cycle
-    happens under one hold, per the multi-writer-JSON rule: the stale read is
-    what loses the other writer's update."""
+    """Open the state file and take its flock. Caller must close the fd, which
+    releases the lock. Do the whole read-modify-write under one hold."""
     STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(_throttle_path(), os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX)
@@ -94,10 +74,7 @@ def _locked_state():
 
 def acquire(now=time.time, sleep=time.sleep) -> None:
     """Block until this process may make one request, or raise Tripped.
-
-    `now` and `sleep` are injectable for tests — the suite asserts the
-    reservation arithmetic without waiting out real intervals.
-    """
+    `now` and `sleep` are injectable for tests."""
     fd = _locked_state()
     try:
         state = _read_state(fd)
@@ -115,13 +92,12 @@ def acquire(now=time.time, sleep=time.sleep) -> None:
 
 
 def trip(reason: str, detail: str = "", now=time.time) -> dict:
-    """Record the stop. Returns the record written, for the caller's report."""
+    """Record the stop. Returns the record in force."""
     record = {"reason": reason, "detail": detail, "at": now()}
     fd = _locked_state()
     try:
         state = _read_state(fd)
-        # First trip wins: a second failure racing in must not overwrite the
-        # original evidence with a later, blurrier symptom.
+        # First trip wins: keep the original evidence.
         if not state.get("tripped"):
             state["tripped"] = record
             _write_state(fd, state)
@@ -133,7 +109,7 @@ def trip(reason: str, detail: str = "", now=time.time) -> dict:
 
 
 def tripped() -> dict | None:
-    """The trip record if the stop is in force, else None. Read-only."""
+    """The trip record if the stop is in force, else None."""
     if not _throttle_path().exists():
         return None
     fd = _locked_state()
@@ -144,8 +120,7 @@ def tripped() -> dict | None:
 
 
 def unblock() -> bool:
-    """Clear the trip. Returns whether one was in force. A human's command —
-    nothing in this module calls it."""
+    """Clear the trip. Returns whether one was in force. Human-only."""
     if not _throttle_path().exists():
         return False
     fd = _locked_state()

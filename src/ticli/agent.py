@@ -89,12 +89,11 @@ def _trip_from(exc) -> None:
         record = throttle.trip("http_429", detail=str(exc))
         raise _tripped_exit(record)
     if status == 401:
-        sub = None
         try:
-            sub = response.json().get("subStatus")
+            sub_status = response.json().get("subStatus")
         except Exception:
-            pass
-        if sub == 4006:
+            sub_status = None
+        if sub_status == 4006:
             record = throttle.trip("substatus_4006", detail=str(exc))
             raise _tripped_exit(record)
         raise fail(
@@ -279,8 +278,8 @@ def _player_running() -> bool:
     return False
 
 
-_SEARCH_TYPES = {"track": "tracks", "album": "albums",
-                 "artist": "artists", "playlist": "playlists"}
+_SEARCH_RENDERERS = {"tracks": _track_json, "albums": _album_json,
+                     "artists": _artist_json, "playlists": _playlist_json}
 
 
 def search(query: str, types: tuple, limit: int) -> None:
@@ -294,13 +293,12 @@ def search(query: str, types: tuple, limit: int) -> None:
     session = _session()
     results = _api_call(
         session.search, query,
-        models=[models[t] for t in wanted], limit=limit,
+        models=[models[kind] for kind in wanted], limit=limit,
     )
     payload = {"ok": True, "query": query}
-    render = {"track": _track_json, "album": _album_json,
-              "artist": _artist_json, "playlist": _playlist_json}
-    for t in wanted:
-        payload[_SEARCH_TYPES[t]] = [render[t](x) for x in (results.get(_SEARCH_TYPES[t]) or [])]
+    for kind in wanted:
+        key = f"{kind}s"
+        payload[key] = [_SEARCH_RENDERERS[key](item) for item in results.get(key) or []]
     emit(payload)
 
 
@@ -392,8 +390,7 @@ def playlist_show(playlist_id: str) -> None:
     session = _session()
     pl = _api_call(session.playlist, playlist_id)
     tracks = _api_call(pl.tracks)
-    payload = _playlist_json(pl)
-    emit({"ok": True, "playlist": payload,
+    emit({"ok": True, "playlist": _playlist_json(pl),
           "tracks": [_track_json(t) for t in tracks]})
 
 

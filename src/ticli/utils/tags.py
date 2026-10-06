@@ -191,12 +191,12 @@ def _shift_chunk_offsets(moov: bytearray, delta: int) -> None:
             elif kind in (b"stco", b"co64"):
                 wide = kind == b"co64"
                 width = 8 if wide else 4
+                fmt = ">Q" if wide else ">I"
                 count = struct.unpack_from(">I", moov, body + 4)[0]
                 if body + 8 + count * width > box_end:
                     raise TagError("chunk offset table overruns its box")
                 for i in range(count):
                     at = body + 8 + i * width
-                    fmt = ">Q" if wide else ">I"
                     value = struct.unpack_from(fmt, moov, at)[0] + delta
                     if value < 0 or (not wide and value > 0xFFFFFFFF):
                         raise TagError("chunk offset would not fit after tagging")
@@ -313,25 +313,24 @@ def _vorbis_comment(meta: dict) -> bytes:
                       ("ISRC", "isrc")):
         value = meta.get(key)
         if value:
-            fields.append(f"{name}={value}".encode("utf-8"))
+            fields.append(f"{name}={value}")
     if meta.get("track_num"):
-        fields.append(f"TRACKNUMBER={int(meta['track_num'])}".encode("utf-8"))
+        fields.append(f"TRACKNUMBER={int(meta['track_num'])}")
         if meta.get("track_total"):
-            fields.append(f"TRACKTOTAL={int(meta['track_total'])}".encode("utf-8"))
+            fields.append(f"TRACKTOTAL={int(meta['track_total'])}")
     if meta.get("disc_num"):
-        fields.append(f"DISCNUMBER={int(meta['disc_num'])}".encode("utf-8"))
+        fields.append(f"DISCNUMBER={int(meta['disc_num'])}")
     out = struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", len(fields))
     for field in fields:
-        out += struct.pack("<I", len(field)) + field
+        encoded = field.encode("utf-8")
+        out += struct.pack("<I", len(encoded)) + encoded
     return out
 
 
-def _tag_flac(data: bytes, meta: dict, cover: bytes = None) -> bytes:
+def _tag_flac(data: bytes, meta: dict) -> bytes:
     if data[:4] != b"fLaC":
         raise TagError("not a FLAC stream")
     comment = _vorbis_comment(meta)
-    if not comment:
-        raise TagError("nothing to write")
 
     pos = 4
     blocks = []  # (type, payload)
@@ -352,13 +351,12 @@ def _tag_flac(data: bytes, meta: dict, cover: bytes = None) -> bytes:
 
     kept = [(k, p) for k, p in blocks if k != 4]
     # STREAMINFO must stay first; the comment goes straight after it
-    rebuilt = [kept[0], (4, comment)] + kept[1:] if kept else [(4, comment)]
+    rebuilt = kept[:1] + [(4, comment)] + kept[1:]
 
     out = b"fLaC"
     for index, (kind, payload) in enumerate(rebuilt):
         flag = 0x80 if index == len(rebuilt) - 1 else 0
-        out += bytes([flag | kind]) + len(payload).to_bytes(3, "big")
-        out += payload
+        out += bytes([flag | kind]) + len(payload).to_bytes(3, "big") + payload
     return out + data[pos:]
 
 
@@ -390,23 +388,21 @@ def write_tags(path, meta: dict, cover: bytes = None) -> str:
     """
     path = Path(path)
     suffix = path.suffix.lower()
+    tmp = path.with_name(path.name + ".tagging")
     try:
         data = path.read_bytes()
         if suffix in (".m4a", ".mp4", ".aac"):
             out = _tag_mp4(data, meta, cover)
         elif suffix == ".flac":
-            out = _tag_flac(data, meta, cover)
+            out = _tag_flac(data, meta)
         else:
             return ""
-        tmp = path.with_name(path.name + ".tagging")
         tmp.write_bytes(out)
         os.replace(tmp, path)
     except (TagError, OSError, struct.error, ValueError) as e:
         logger.debug("Left %s untagged: %s", path, e)
         try:
-            tmp = path.with_name(path.name + ".tagging")
-            if tmp.exists():
-                tmp.unlink()
+            tmp.unlink(missing_ok=True)
         except OSError:
             pass
         return ""

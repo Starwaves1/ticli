@@ -54,73 +54,48 @@ SOURCE_SIZE = 320
 ART_SIZES = ((32, 16), (28, 14), (24, 12), (20, 10), (16, 8), (12, 6))
 
 # The most of the terminal's width a *stacked* cover may take. Height alone
-# used to choose the size, so a tall, narrow window put a 20-column cover
-# above a track line with eight columns of room left — the picture looked
-# fine and everything around it looked cramped.
-#
-# Three fifths, raised from two: stacked, nothing shares the cover's rows, so
-# the share is a question of balance rather than of competition, and two
-# fifths was answering it as though something did. A narrow window is exactly
-# where a big cover is worth having, and it is now the only place a stacked
-# cover is drawn at all — past MIN_BESIDE_WIDTH the picture moves beside the
-# text and the budget below takes over. The absolute ceiling is unchanged:
-# ART_SIZES still stops at 32 columns, so nothing gets bigger in a wide
-# window, only in a narrow one.
+# used to choose the size, so a tall, narrow window put a 20-column cover above
+# a track line with eight columns of room left. Raised from 0.4: nothing shares
+# a stacked cover's rows, so the share is about balance, not competition. The
+# absolute ceiling is unchanged (ART_SIZES stops at 32 columns).
 ART_WIDTH_SHARE = 0.6
 
 # Rows the rest of the player pane needs, below which artwork is not worth
-# its vertical cost, and the narrowest terminal art is offered in at all.
-# Sixteen, not fourteen: the pane is not one height. Borders, padding, the
-# four track rows, the next-track line and the controls come to fourteen,
-# but `[m]` adds a second controls row and a toast adds another, and at
-# fourteen a 24-row terminal showing both overflowed by a row — which Rich
-# answers by replacing the bottom line with a red ellipsis, i.e. eating the
-# controls. Two rows of headroom means every state of the pane fits.
+# its vertical cost. Sixteen, not fourteen: borders, padding, the four track
+# rows, the next-track line and the controls come to fourteen, but `[m]` adds a
+# second controls row and a toast adds another, and at fourteen a 24-row
+# terminal showing both overflowed by a row — which Rich answers by replacing
+# the bottom line with a red ellipsis, i.e. eating the controls.
 MIN_ROWS_AROUND_ART = 16
-# The same count for a cover drawn *beside* the text rather than above it,
-# where the track rows cost nothing extra because they are inside the
-# picture's own rows. What is left is the borders and padding (4), the blank
-# row above the footer (1), the footer (up to 4 with `[m]` open) and a toast
-# (1) — ten, plus a row of headroom. The smallest cover offered is six rows
-# and the text block is at most six, so the text always has somewhere to go.
+# The same count for a cover drawn *beside* the text, where the track rows are
+# inside the picture's own rows: borders and padding (4), the blank row above
+# the footer (1), the footer (up to 4 with `[m]` open) and a toast (1), plus a
+# row of headroom.
 MIN_ROWS_BESIDE_ART = 11
-# Columns a picture costs beyond its own width: the panel's border and
-# padding (6) plus the indent that lines it up with the track title (3). A
-# picture that doesn't clear this would wrap, which looks like corruption.
+# Columns a picture costs beyond its own width: the panel's border and padding
+# (6) plus the indent that lines it up with the track title (3). A picture that
+# doesn't clear this would wrap, which looks like corruption.
 ART_MARGIN = 9
 MIN_ART_WIDTH = min(cols for cols, _ in ART_SIZES) + ART_MARGIN
 
-# Columns between a cover and the text beside it, and the least the text may
-# be left with. Forty holds the three-space indent, both times, a full-width
-# progress bar and the scrub marker with room over for a title — under that
-# the text column is a column of ellipses and the picture has won an argument
-# it should not have been in.
+# Columns between a cover and the text beside it, and the least the text may be
+# left with: forty holds the indent, a full-width progress bar and the scrub
+# marker with room over for a title.
 ART_GUTTER = 2
 MIN_TEXT_WIDTH = 40
 # Where the cover stops sitting above the text and starts sitting beside it:
-# the width at which the *largest* cover there is can sit beside a full text
-# column. Derived, not chosen — the margin (9), the biggest entry in
-# ART_SIZES (32), the gutter (2) and MIN_TEXT_WIDTH (40) — and the derivation
-# is what makes widening the window safe. Below it the cover is capped by a
-# share of the width and above it by this budget, and because the budget can
-# hold 32 from the very first column past the threshold while beside also
-# answers to the *smaller* MIN_ROWS_BESIDE_ART, the cover crossing the
-# threshold can only grow. Picking a threshold that merely felt wide enough
-# (71 was tried) shrank a 28-column cover to 20 the moment the window got one
-# column wider, which is the one thing a responsive layout must not do.
-#
-# Vertical is the scarce axis in a wide window, and that is the point of the
-# move: stacked spends art_rows + 2 + 5 rows, side by side spends
-# max(art_rows, 5) — eleven rows back at 100x30, where the cover also goes
-# from 28x14 to 32x16.
+# the width at which the *largest* cover can sit beside a full text column.
+# Derived, not chosen, and the derivation is what makes widening the window
+# safe: the cover crossing the threshold can only grow. A threshold that merely
+# felt wide enough (71 was tried) shrank a 28-column cover to 20 the moment the
+# window got one column wider.
 MIN_BESIDE_WIDTH = (ART_MARGIN + max(cols for cols, _ in ART_SIZES)
                     + ART_GUTTER + MIN_TEXT_WIDTH)  # 83
 
 ART_VERSION = 1
 ART_SUFFIX = ".art"
-# Kilobytes each, and never more than this many. Deliberately its own small
-# ceiling rather than a share of the cache budget: the budget is about audio,
-# and a few hundred files of a few hundred bytes must not perturb it.
+# Deliberately its own small ceiling rather than a share of the cache budget:
+# the budget is about audio, and a few hundred small files must not perturb it.
 MAX_ART_FILES = 256
 
 # What a cover id may contain before it is allowed to name a file
@@ -150,23 +125,20 @@ SOF_PROGRESSIVE = 0xC2
 SOF_UNSUPPORTED = (0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
 
 
-class _Huffman:
-    """A canonical JPEG Huffman table, as a (bit length, code) -> symbol map."""
-
-    __slots__ = ("lookup",)
-
-    def __init__(self, counts, symbols):
-        self.lookup = {}
-        code = 0
-        k = 0
-        for length in range(1, 17):
-            for _ in range(counts[length - 1]):
-                if k >= len(symbols):
-                    raise ArtworkError("truncated huffman table")
-                self.lookup[(length, code)] = symbols[k]
-                code += 1
-                k += 1
-            code <<= 1
+def _build_huffman(counts, symbols) -> dict:
+    """A canonical JPEG Huffman table as a (bit length, code) -> symbol map."""
+    lookup = {}
+    code = 0
+    k = 0
+    for length in range(1, 17):
+        for _ in range(counts[length - 1]):
+            if k >= len(symbols):
+                raise ArtworkError("truncated huffman table")
+            lookup[(length, code)] = symbols[k]
+            code += 1
+            k += 1
+        code <<= 1
+    return lookup
 
 
 class _BitReader:
@@ -209,7 +181,7 @@ class _BitReader:
         code = 0
         for length in range(1, 17):
             code = (code << 1) | self.read_bit()
-            symbol = table.lookup.get((length, code))
+            symbol = table.get((length, code))
             if symbol is not None:
                 return symbol
         raise ArtworkError("bad huffman code")
@@ -277,17 +249,13 @@ def decode_jpeg_dc(data: bytes) -> list:
                 raise ArtworkError("scan before frame")
             scan, spectral_start, approx_high, approx_low = _read_scan_header(
                 segment, frame)
-            if frame["progressive"]:
-                # A progressive file's first scan must be the DC scan; if it
-                # isn't, this file is shaped in a way we don't read
-                if spectral_start != 0 or approx_high != 0:
-                    raise ArtworkError("first scan is not the DC scan")
+            progressive = frame["progressive"]
+            # A progressive file's first scan must be the DC scan
+            if progressive and (spectral_start != 0 or approx_high != 0):
+                raise ArtworkError("first scan is not the DC scan")
             planes = _decode_dc_scan(
                 data, pos + length, frame, scan, quant, dc_tables, ac_tables,
-                restart_interval,
-                shift=approx_low if frame["progressive"] else 0,
-                skip_ac=frame["progressive"],
-            )
+                restart_interval, shift=approx_low if progressive else 0)
             return _to_rgb(frame, planes)
         pos += length
     raise ArtworkError("no scan found")
@@ -322,8 +290,8 @@ def _read_huffman_tables(segment, dc_tables, ac_tables) -> None:
             raise ArtworkError("truncated huffman header")
         total = sum(counts)
         symbols = list(segment[i + 17:i + 17 + total])
-        table = _Huffman(counts, symbols)
-        (ac_tables if table_class else dc_tables)[target] = table
+        (ac_tables if table_class else dc_tables)[target] = _build_huffman(
+            counts, symbols)
         i += 17 + total
 
 
@@ -374,13 +342,14 @@ def _read_scan_header(segment, frame) -> tuple:
 
 
 def _decode_dc_scan(data, pos, frame, scan, quant, dc_tables, ac_tables,
-                    restart_interval, shift, skip_ac) -> list:
+                    restart_interval, shift) -> list:
     """Walk the scan, keeping one value per block and discarding the rest."""
     comps = frame["comps"]
     hmax = max(c["h"] for c in comps)
     vmax = max(c["v"] for c in comps)
     mcus_x = (frame["w"] + 8 * hmax - 1) // (8 * hmax)
     mcus_y = (frame["h"] + 8 * vmax - 1) // (8 * vmax)
+    skip_ac = frame["progressive"]
     planes = []
     for comp in comps:
         comp["bx"] = mcus_x * comp["h"]
@@ -419,9 +388,8 @@ def _decode_dc_scan(data, pos, frame, scan, quant, dc_tables, ac_tables,
                     row = mcu_row * comp["v"] + by
                     col = mcu_col * comp["h"] + bx
                     plane[row * comp["bx"] + col] = value
-                    if skip_ac:
-                        continue
-                    _skip_ac(bits, ac_table)
+                    if not skip_ac:
+                        _skip_ac(bits, ac_table)
     return planes
 
 
@@ -501,8 +469,8 @@ def decode_with_ffmpeg(data: bytes, width: int, height: int):
     if result.returncode != 0 or len(raw) < width * height * 3:
         return None
     return [
-        [tuple(raw[(y * width + x) * 3 + c] for c in range(3))
-         for x in range(width)]
+        [tuple(raw[offset:offset + 3])
+         for offset in range((y * width) * 3, (y * width + width) * 3, 3)]
         for y in range(height)
     ]
 
@@ -514,7 +482,7 @@ def resample(pixels: list, width: int, height: int) -> list:
     """Box-average an image down to width x height."""
     source_h = len(pixels)
     source_w = len(pixels[0]) if source_h else 0
-    if not source_w or not source_h:
+    if not source_w:
         raise ArtworkError("empty image")
     out = []
     for ty in range(height):
@@ -524,16 +492,9 @@ def resample(pixels: list, width: int, height: int) -> list:
         for tx in range(width):
             x0 = tx * source_w // width
             x1 = max(x0 + 1, (tx + 1) * source_w // width)
-            r = g = b = count = 0
-            for y in range(y0, y1):
-                line = pixels[y]
-                for x in range(x0, x1):
-                    pixel = line[x]
-                    r += pixel[0]
-                    g += pixel[1]
-                    b += pixel[2]
-                    count += 1
-            row.append((r // count, g // count, b // count))
+            block = [pixel for line in pixels[y0:y1] for pixel in line[x0:x1]]
+            count = len(block)
+            row.append(tuple(sum(channel) // count for channel in zip(*block)))
         out.append(row)
     return out
 
@@ -548,10 +509,8 @@ def decode(data: bytes, cols: int, rows: int):
         return None
     try:
         return resample(decode_jpeg_dc(data), cols, rows * 2)
-    except ArtworkError as e:
-        logger.debug("Built-in JPEG decode failed (%s), trying ffmpeg", e)
     except Exception as e:  # a malformed file must not escape as a traceback
-        logger.debug("Built-in JPEG decode error (%s), trying ffmpeg", e)
+        logger.debug("Built-in JPEG decode failed (%s), trying ffmpeg", e)
     return decode_with_ffmpeg(data, cols, rows * 2)
 
 
@@ -787,6 +746,5 @@ def cover_id_of(track):
     Cached rows carry only an album name, and a track can have no album at
     all, so this is allowed to come back empty.
     """
-    album = getattr(track, "album", None)
-    cover = getattr(album, "cover", None) if album is not None else None
+    cover = getattr(getattr(track, "album", None), "cover", None)
     return cover if isinstance(cover, str) and cover else None
