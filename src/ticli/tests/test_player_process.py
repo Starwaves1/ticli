@@ -4,6 +4,7 @@ socket with the player core in a thread. No TIDAL, no audio backend."""
 import io
 import os
 import select
+import sys
 import threading
 import time
 import types
@@ -501,3 +502,45 @@ class TestRepaintCadence:
     def test_the_wake_lands_just_past_the_second_boundary(self, monkeypatch):
         ui, clock = self._ui(monkeypatch, playing=True)
         assert ui._wait_timeout() == pytest.approx(0.7 + player_mod.SECOND_EDGE)
+
+
+class TestTheRealLoop:
+    def test_sigterm_ends_a_paused_tui_and_leaves_the_player(self):
+        """Paused, the loop waits with no timeout, and Python retries an interrupted
+        select: without the self-pipe wake a closed terminal would leave it hanging."""
+        import pty
+        import signal
+
+        pid, fd = pty.fork()
+        if pid == 0:
+            code = 1
+            try:
+                # pytest's capture objects stand in for these; the child needs the pty itself.
+                sys.stdin = os.fdopen(0, "r")
+                sys.stdout = os.fdopen(1, "w")
+                run = _Running(_core(playing=False))
+                ui = HeadlessTidalPlayer(remote=ipc.connect())
+                ui.console = Console(file=sys.stdout, force_terminal=True, width=80, height=24)
+                ui._show_artwork = False
+                threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM)).start()
+                ui.run()
+                code = 0 if run.thread.is_alive() and run.core.audio.stopped == 0 else 2
+            finally:
+                os._exit(code)
+        deadline = time.monotonic() + 5
+        status = None
+        while time.monotonic() < deadline:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            try:
+                if select.select([fd], [], [], 0.1)[0]:
+                    os.read(fd, 65536)
+            except OSError:
+                pass
+        else:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail("SIGTERM did not end a paused TUI")
+        os.close(fd)
+        assert os.waitstatus_to_exitcode(status) == 0, "the player must outlive its TUI"

@@ -6037,9 +6037,11 @@ class HeadlessTidalPlayer:
                                f"[dim]Its log: {player_log_path()}[/dim]")
             return
 
-        # SIGHUP/SIGTERM leave the player playing: only quitting stops it.
+        # SIGHUP/SIGTERM leave the player playing: only quitting stops it. The wake matters:
+        # Python retries an interrupted select, which while paused has no timeout.
         def _on_signal(signum, frame):
             self.running = False
+            self._wake()
         for _sig in (signal.SIGTERM, signal.SIGHUP):
             try:
                 signal.signal(_sig, _on_signal)
@@ -6057,8 +6059,11 @@ class HeadlessTidalPlayer:
         try:
             self._wake_r, self._wake_w = os.pipe()
             os.set_blocking(self._wake_r, False)
-        except OSError:
-            self._wake_r = self._wake_w = None
+            os.set_blocking(self._wake_w, False)
+            # A signal can land on another thread, which never interrupts this select.
+            signal.set_wakeup_fd(self._wake_w)
+        except (OSError, ValueError):
+            pass
 
         old_settings = termios.tcgetattr(sys.stdin)
         # Kept so a PKCE sign-in can hand the terminal back for a paste.
@@ -6087,6 +6092,10 @@ class HeadlessTidalPlayer:
                 remote.request("stop", timeout=STOP_TIMEOUT)
             lost = remote.closed and not self._quitting and not self._logged_out
             remote.close()
+            try:
+                signal.set_wakeup_fd(-1)
+            except ValueError:
+                pass
             for fd in (self._wake_r, self._wake_w):
                 try:
                     if fd is not None:

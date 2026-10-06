@@ -397,6 +397,9 @@ def main(argv=None) -> int:
         server.wake()
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, _on_signal)
+    os.set_blocking(server.wake_w, False)
+    # A signal can land on a worker thread, which never interrupts the loop's select.
+    signal.set_wakeup_fd(server.wake_w)
 
     ready("ready")
     try:
