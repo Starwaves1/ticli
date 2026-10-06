@@ -434,6 +434,50 @@ class TestSaveLoadRoundTrip:
         save_config(dict(DEFAULTS))  # must not raise
 
 
+class TestUpdateConfig:
+    def test_two_writers_neither_tear_the_file_nor_lose_a_change(self, config_file):
+        import threading
+
+        torn = []
+
+        def write(key, values):
+            for value in values:
+                config_mod.update_config({key: value})
+                if load_config().get(config_mod.UNREADABLE):
+                    torn.append(key)
+
+        writers = [threading.Thread(target=write, args=("page_size", [*range(5, 40)] * 2 + [33])),
+                   threading.Thread(target=write, args=("progress_bar_max", [*range(20, 90)] + [78]))]
+        for writer in writers:
+            writer.start()
+        for writer in writers:
+            writer.join()
+        assert torn == []
+        cfg = load_config()
+        assert (cfg["page_size"], cfg["progress_bar_max"]) == (33, 78)
+        assert [f.name for f in config_file.parent.iterdir() if f.name.endswith(".tmp")] == []
+
+    def test_only_the_changed_key_is_written(self, config_file):
+        save_config({**DEFAULTS, "allow_ai_control": False, "page_size": 20})
+        config_mod.update_config({"quality": "MAX"})
+        cfg = load_config()
+        assert (cfg["allow_ai_control"], cfg["page_size"], cfg["quality"]) == (False, 20, "MAX")
+
+    def test_an_unreadable_file_is_never_replaced(self, config_file):
+        config_file.write_text("{torn")
+        with pytest.raises(config_mod.ConfigUnreadable):
+            config_mod.update_config({"page_size": 20})
+        assert config_file.read_text() == "{torn"
+
+    def test_an_unreadable_file_loads_with_the_switches_closed(self, config_file):
+        config_file.write_text('{"allow_ai_control": true, "ai_control')
+        cfg = load_config()
+        assert cfg[config_mod.UNREADABLE] is True
+        assert cfg["allow_ai_control"] is False and cfg["allow_dangerous_commands"] is False
+        save_config(cfg)
+        assert config_mod.UNREADABLE not in json.loads(config_file.read_text())
+
+
 class TestCoerce:
     def test_int_clamped_to_bounds(self):
         spec = get_spec("page_size")

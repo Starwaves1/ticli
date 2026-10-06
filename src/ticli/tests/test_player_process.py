@@ -359,6 +359,16 @@ class TestAgentGateOverTheSocket:
         response = ipc.connect().request("next", caller="agent", timeout=3)
         assert response["code"] == "ai_control_off"
 
+    def test_a_switch_written_before_another_clients_setting_change_is_kept(self, running):
+        core = _core()
+        running(core)
+        # The TUI writes the switch; another client's change lands before reload_switches does.
+        config_mod.update_config({"allow_ai_control": False})
+        assert ipc.connect().request("settings.set", {"key": "page_size", "value": 20},
+                                     caller="tui", timeout=2)["ok"]
+        cfg = config_mod.load_config()
+        assert cfg["allow_ai_control"] is False and cfg["page_size"] == 20
+
     def test_the_key_hash_never_crosses_the_socket(self, running):
         core = _core()
         core.config["ai_control_key"] = config_mod.hash_ai_key("secret")

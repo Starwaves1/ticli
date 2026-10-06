@@ -17,8 +17,8 @@ from typing import Callable, Optional
 from ticli.utils import downloads, throttle
 from ticli.utils.cache import CachedTrack, MetadataCache
 from ticli.utils.config import (
-    PROTECTED_KEYS, SETTINGS_SPEC, ai_key_matches, coerce, get_spec, load_config,
-    save_config,
+    PROTECTED_KEYS, SETTINGS_SPEC, UNREADABLE, UNREADABLE_MESSAGE, ConfigUnreadable,
+    ai_key_matches, coerce, get_spec, load_config, update_config,
 )
 
 HUMAN = "human"
@@ -62,6 +62,9 @@ def gate(name: str, caller: str, key, cfg: dict, *, read: bool = False,
     """A refusal for an agent call the human's switches don't allow, else None."""
     if caller == HUMAN or name == "status":
         return None
+    if cfg.get(UNREADABLE):
+        return _error("config_unreadable", UNREADABLE_MESSAGE,
+                      "Ask your human to fix or delete ticli's config.json. " + _NEVER_EDIT)
     stored = coerce(get_spec("ai_control_key"), cfg.get("ai_control_key"))
     if stored and not key:
         return _error("key_required", "This ticli needs the AI control key.",
@@ -225,7 +228,8 @@ def _status(p, args) -> dict:
 def switches(cfg) -> dict:
     return {"allow_ai_control": bool(cfg.get("allow_ai_control", True)),
             "allow_dangerous_commands": bool(cfg.get("allow_dangerous_commands", False)),
-            "key_required": bool(coerce(get_spec("ai_control_key"), cfg.get("ai_control_key")))}
+            "key_required": bool(cfg.get(UNREADABLE)
+                                 or coerce(get_spec("ai_control_key"), cfg.get("ai_control_key")))}
 
 
 def _toggle(p, args):
@@ -541,9 +545,13 @@ def _settings_set(p, args) -> dict:
     key = spec["key"]
     if value == p.config.get(key, spec["default"]):
         return {"key": key, "value": value, "changed": False}
+    try:
+        update_config({key: value})
+    except ConfigUnreadable:
+        raise CommandError("config_unreadable", UNREADABLE_MESSAGE,
+                           "Fix or delete ticli's config.json, then try again.")
     p.config[key] = value
     p._apply_setting(key, value)
-    save_config(p.config)
     return {"key": key, "value": value, "changed": True}
 
 

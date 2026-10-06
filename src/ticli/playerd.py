@@ -24,7 +24,7 @@ from typing import Optional
 
 from ticli import ipc
 from ticli.commands import AGENT, COMMANDS, HUMAN
-from ticli.utils.config import PROTECTED_KEYS, load_config
+from ticli.utils.config import PROTECTED_KEYS, UNREADABLE, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +244,7 @@ class PlayerServer:
             return
         if cmd == "reload_switches":
             fresh = load_config()
-            for key in PROTECTED_KEYS:
+            for key in (*PROTECTED_KEYS, UNREADABLE):
                 self.core.config[key] = fresh.get(key)
             self.broadcast()
             self._reply(client, rid, {"ok": True, "result": {}})

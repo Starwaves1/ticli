@@ -253,8 +253,11 @@ from ticli.utils.config import (
     display_value,
     get_spec,
     hash_ai_key,
+    UNREADABLE,
+    UNREADABLE_MESSAGE,
+    ConfigUnreadable,
     load_config,
-    save_config,
+    update_config,
 )
 from ticli.utils.cache import (
     PLAY_COUNTS_AFTER,
@@ -1474,6 +1477,8 @@ class HeadlessTidalPlayer:
         self._refetch_pending = False
         self._toast = ""
         self._toast_until = 0.0
+        if self.config.get(UNREADABLE):
+            self._set_toast(UNREADABLE_MESSAGE, seconds=PLAYER_ERROR_SECONDS)
         self._quit_pending = False
         self._logout_pending = False
         self._disable_songs_pending = False
@@ -5352,7 +5357,10 @@ class HeadlessTidalPlayer:
         allowed = min(wanted, ceiling)
         if allowed != self.config.get("volume"):
             self.config["volume"] = allowed
-            save_config(self.config)
+            try:
+                update_config({"volume": allowed})
+            except ConfigUnreadable as e:
+                logger.warning("Volume not saved: %s", e)
         if self.audio:
             self.audio.set_volume(allowed)
 
@@ -5366,15 +5374,15 @@ class HeadlessTidalPlayer:
         # The only writer of the protected rows, reached from settings keypresses alone (ADR-0007).
         if value == self.config.get(spec["key"], spec["default"]):
             return
+        try:
+            # Only this key, over the file as it is now: the hash never crosses the socket.
+            update_config({spec["key"]: value})
+        except ConfigUnreadable as e:
+            self._set_toast(str(e), seconds=PLAYER_ERROR_SECONDS)
+            return
         self.config[spec["key"]] = value
-        if self.remote is None:
-            save_config(self.config)
-        else:
-            # The mirrored config never carries the key hash: write the file's own copy, then
-            # have the player re-read the switches. Not a command: none may write these.
-            on_disk = load_config()
-            on_disk[spec["key"]] = value
-            save_config(on_disk)
+        if self.remote is not None:
+            # Not a command: none may write these.
             self.remote.send("reload_switches")
         self._set_toast(f"{spec['label']}: {display_value(spec, value)}")
 

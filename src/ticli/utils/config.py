@@ -9,11 +9,13 @@ coerced, clamped and saved like the rest but is not in SETTINGS_ROWS (the page
 list); volume lives on the [v] overlay.
 """
 
+import fcntl
 import hashlib
 import hmac
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,11 @@ CONFIG_VERSION = 5
 
 CONFIG_DIR = Path.home() / ".config" / "ticli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+LOCK_NAME = "config.lock"
+
+# Set on a config loaded from a file that would not parse; never written back.
+UNREADABLE = "_unreadable"
+UNREADABLE_MESSAGE = "config.json is unreadable; fix or delete it. Agents are refused until then."
 
 # Ascending, named like TIDAL's own player (MEDIUM is the 320k AAC rung under
 # Low's dropdown). These are ticli's names, not tidalapi's wire values:
@@ -165,6 +172,13 @@ SETTINGS_ROWS = [spec for spec in SETTINGS_SPEC if not spec.get("hidden")]
 
 PROTECTED_KEYS = frozenset(spec["key"] for spec in SETTINGS_SPEC if spec.get("protected"))
 
+# A file that won't parse must not read as "AI control on, no key" (ADR-0007).
+FAIL_CLOSED = {"allow_ai_control": False, "allow_dangerous_commands": False}
+
+
+class ConfigUnreadable(OSError):
+    pass
+
 _SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}
 
 
@@ -289,27 +303,34 @@ def _migrate(cfg: dict) -> dict:
     return cfg
 
 
-def load_config() -> dict:
-    """Load settings. Missing or corrupt file → defaults, never raises."""
-    data = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text())
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
-            logger.debug("Failed to read config, using defaults: %s", e)
-    if not isinstance(data, dict):
-        data = {}
+def _read_file():
+    """(data, readable). A missing file is readable and empty."""
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+    except FileNotFoundError:
+        return {}, True
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        logger.warning("Failed to read %s: %s", CONFIG_FILE, e)
+        return {}, False
+    return (data, True) if isinstance(data, dict) else ({}, False)
 
+
+def load_config() -> dict:
+    """Load settings. Missing file → defaults; unreadable → defaults with the
+    protected switches closed and UNREADABLE set. Never raises."""
+    data, readable = _read_file()
     # Unknown keys ride along so save_config can write them back
     cfg = _migrate(dict(data))
     for spec in SETTINGS_SPEC:
         cfg[spec["key"]] = coerce(spec, cfg.get(spec["key"], spec["default"]))
+    if not readable:
+        cfg.update(FAIL_CLOSED, **{UNREADABLE: True})
     return cfg
 
 
 def save_config(cfg: dict) -> None:
     """Persist settings. Best effort — a failed write must never kill the TUI."""
-    data = {k: v for k, v in cfg.items() if k not in DEFAULTS}
+    data = {k: v for k, v in cfg.items() if k not in DEFAULTS and k != UNREADABLE}
     data["version"] = CONFIG_VERSION
     for spec in SETTINGS_SPEC:
         data[spec["key"]] = coerce(spec, cfg.get(spec["key"], spec["default"]))
@@ -319,10 +340,35 @@ def save_config(cfg: dict) -> None:
         logger.warning("Failed to save config: %s", e)
 
 
-def _write_config_file(data: dict) -> None:
-    """Temp + rename, never torn."""
+def update_config(changes: dict) -> dict:
+    """Write only `changes` over what is on disk now, under a lock, so concurrent
+    writers (the player, each TUI) never undo each other. Raises ConfigUnreadable
+    rather than replace a file that won't parse."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = CONFIG_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CONFIG_FILE)
+    fd = os.open(CONFIG_DIR / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        cfg = load_config()
+        if cfg.get(UNREADABLE):
+            raise ConfigUnreadable(UNREADABLE_MESSAGE)
+        cfg.update(changes)
+        save_config(cfg)
+        return cfg
+    finally:
+        os.close(fd)
+
+
+def _write_config_file(data: dict) -> None:
+    """A private temp file + rename: never torn, even with several writers."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".config.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data, indent=2, sort_keys=True))
+        os.replace(tmp, CONFIG_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise

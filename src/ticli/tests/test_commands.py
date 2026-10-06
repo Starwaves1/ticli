@@ -305,6 +305,35 @@ class TestAIControlSwitch:
         assert p.slept == []
 
 
+class TestUnreadableConfig:
+    @pytest.fixture(autouse=True)
+    def corrupt(self, config_file):
+        config_file.write_text('{"allow_ai_control": true, "allow_dangerous')
+
+    def test_agents_are_refused_everything_but_status(self):
+        p = _player()
+        for name in ("next", "queue.list", "search", "cache.clear"):
+            _assert_refusal(_agent(p, name, query="x"), "config_unreadable")
+        assert p._plays == [] and p.session.asked == []
+        switches = _agent(p, "status")["result"]["switches"]
+        assert switches == {"allow_ai_control": False, "allow_dangerous_commands": False,
+                            "key_required": True}
+
+    def test_the_agent_cli_gate_fails_closed_too(self):
+        refused = commands.gate("search", AGENT, None, load_config(), read=True)
+        assert refused["code"] == "config_unreadable"
+
+    def test_the_human_still_plays_but_cannot_overwrite_the_file(self, config_file):
+        p = _player()
+        assert _human(p, "next")["ok"]
+        result = p.commands.execute("settings.set", {"key": "page_size", "value": 20}, caller=HUMAN)
+        assert result["code"] == "config_unreadable"
+        assert config_file.read_text().startswith('{"allow_ai_control": true, "allow_dangerous')
+
+    def test_the_tui_says_so(self):
+        assert "unreadable" in HeadlessTidalPlayer()._toast
+
+
 class TestDangerousSwitch:
     def test_off_by_default_refuses_dangerous_agent_calls(self):
         p = _player()
