@@ -125,6 +125,18 @@ class TestActions:
         _human(p, "queue.remove", index=0)
         assert p._current_track is None and p.audio.stopped == 1
 
+    @pytest.mark.parametrize("name", ["queue.play", "queue.remove"])
+    def test_a_stale_queue_index_is_refused_with_the_queue_as_it_is(self, name):
+        p = _player()
+        result = _human(p, name, index=2, track_id=2)
+        assert result["ok"] is False and result["code"] == "stale"
+        assert result["queue"] == {"index": 1, "length": 3, "track_ids": [1, 2, 3]}
+        assert len(p._queue) == 3 and p._plays == []
+
+    def test_a_matching_track_id_goes_through(self):
+        p = _player()
+        assert _human(p, "queue.play", index=2, track_id=3)["ok"] and p._plays == [3]
+
     def test_play_album_from_the_open_list_costs_nothing(self):
         p = _player()
         p._browse_source = ("album", "77")

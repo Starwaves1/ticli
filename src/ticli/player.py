@@ -4614,7 +4614,8 @@ class HeadlessTidalPlayer:
     def _remove_from_queue(self):
         if not self._queue or self._queue_cursor >= len(self._queue):
             return
-        self._run("queue.remove", index=self._queue_cursor)
+        self._run("queue.remove", index=self._queue_cursor,
+                  track_id=getattr(self._queue[self._queue_cursor], "id", None))
         if self._queue:
             self._queue_cursor = min(self._queue_cursor, len(self._queue) - 1)
 
@@ -5775,7 +5776,8 @@ class HeadlessTidalPlayer:
             self._cursor_down("_queue_cursor", len(self._queue))
         elif key in (KEY_ENTER, KEY_ENTER2):
             if self._queue:
-                self._run("queue.play", index=self._queue_cursor)
+                self._run("queue.play", index=self._queue_cursor,
+                          track_id=getattr(self._queue[self._queue_cursor], "id", None))
         elif key == "x":
             self._remove_from_queue()
         elif key == "y":

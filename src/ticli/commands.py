@@ -33,13 +33,13 @@ _NEVER_EDIT = ("Only your human can change this, in ticli's TUI settings ([c]). 
 
 
 class CommandError(Exception):
-    def __init__(self, code: str, reason: str, fix: str = ""):
+    def __init__(self, code: str, reason: str, fix: str = "", **extra):
         super().__init__(reason)
-        self.code, self.reason, self.fix = code, reason, fix
+        self.code, self.reason, self.fix, self.extra = code, reason, fix, extra
 
 
-def _error(code: str, reason: str, fix: str = "") -> dict:
-    payload = {"ok": False, "code": code, "reason": reason}
+def _error(code: str, reason: str, fix: str = "", **extra) -> dict:
+    payload = {"ok": False, "code": code, "reason": reason, **extra}
     if fix:
         payload["fix"] = fix
     return payload
@@ -116,7 +116,7 @@ class Commands:
                     return offline_read(name, args, p.config)
             result = cmd.handler(p, args)
         except CommandError as e:
-            return _error(e.code, e.reason, e.fix)
+            return _error(e.code, e.reason, e.fix, **e.extra)
         except Exception as e:
             if caller == HUMAN:
                 raise
@@ -267,14 +267,26 @@ def _queue_list(p, args) -> dict:
     return {"index": p._queue_index, "tracks": [_track_json(t) for t in p._queue]}
 
 
-def _queue_play(p, args):
-    p._play_queue_index(_index(args))
-
-
-def _queue_remove(p, args) -> dict:
+def _queue_entry(p, args) -> int:
+    """The index asked for, checked against `track_id` when given: with several
+    clients the queue may have moved under a stale index."""
     index = _index(args)
     if not 0 <= index < len(p._queue):
         raise CommandError("bad_args", "No queue entry at that index.")
+    if "track_id" in args and str(args["track_id"]) != _sid(p._queue[index]):
+        raise CommandError("stale", "The queue changed; that index is another track now.",
+                           "Check the queue below and retry with the current index.",
+                           queue={"index": p._queue_index, "length": len(p._queue),
+                                  "track_ids": [getattr(t, "id", None) for t in p._queue]})
+    return index
+
+
+def _queue_play(p, args):
+    p._play_queue_index(_queue_entry(p, args))
+
+
+def _queue_remove(p, args) -> dict:
+    index = _queue_entry(p, args)
     removing_current = index == p._queue_index
     p._queue.pop(index)
     if index < p._queue_index:

@@ -327,6 +327,19 @@ class TestSlowTidal:
         assert core._current_track.id == 999 and core._playing is False
 
 
+class TestQueueByIndex:
+    def test_a_tui_removing_by_a_stale_index_hits_nothing(self, running):
+        core = _core()
+        running(core)
+        ui = _tui()
+        ui._queue_cursor = 2
+        q = core._queue
+        core._queue = [q[0], q[2], q[1]]  # another client moved an entry meanwhile
+        ui._remove_from_queue()
+        assert _pump(ui, lambda: "queue changed" in ui._toast.lower())
+        assert [t.id for t in core._queue] == [1, 3, 2]
+
+
 class TestAgentGateOverTheSocket:
     def test_ai_control_off_refuses_agent_actions(self, running):
         core = _core()
