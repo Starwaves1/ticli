@@ -18,6 +18,9 @@ from ticli import player as player_mod
 from ticli.player import HeadlessTidalPlayer
 from ticli.tests.test_bulk_downloads import _bulk, _bulk_library, _counting
 from ticli.utils import net
+from ticli.utils.cache import CachedTrack
+from urllib3.exceptions import (ConnectTimeoutError, MaxRetryError,
+                                NewConnectionError, ReadTimeoutError)
 
 OFFLINE_TEXT = (
     "HTTPSConnectionPool(host='api.tidal.com', port=443): Max retries exceeded "
@@ -82,6 +85,38 @@ class TestClassification:
                 raise RuntimeError("stream failed") from inner
         except RuntimeError as outer:
             assert net.is_transport_failure(outer)
+
+
+def _raised(make):
+    try:
+        make()
+    except Exception as e:
+        return e
+    raise AssertionError("nothing raised")
+
+
+class _StallingRaw:
+    def stream(self, chunk_size, decode_content=True):
+        raise ReadTimeoutError(None, "https://sp-ad-fa.audio.tidal.com/x", "Read timed out.")
+        yield b""
+
+
+class TestAStalledReadIsNotAnOutage:
+    def test_a_read_timeout_inside_iter_content_is_not_offline(self):
+        response = requests.Response()
+        response.raw = _StallingRaw()
+        e = _raised(lambda: list(response.iter_content(1024)))
+        assert isinstance(e, requests.exceptions.ConnectionError)
+        assert not net.is_transport_failure(e)
+
+    def test_connect_timeouts_and_refused_connections_still_are(self):
+        url = "https://api.tidal.com/v1/tracks/1"
+        connect = requests.exceptions.ConnectTimeout(
+            MaxRetryError(None, url, ConnectTimeoutError(None, "timed out")))
+        refused = requests.exceptions.ConnectionError(
+            MaxRetryError(None, url, NewConnectionError(None, "Connection refused")))
+        assert net.is_transport_failure(connect)
+        assert net.is_transport_failure(refused)
 
 
 class _RecordingAdapter(requests.adapters.BaseAdapter):
@@ -155,6 +190,47 @@ class TestAPacedRunStopsOnAnOutage:
             assert "rate-limiting" not in p._toast
         finally:
             server.close()
+
+    def test_a_bulk_download_of_cached_rows_with_no_network_asks_once(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.02)
+        p, _tracks, server, _payloads = _bulk_library(10)
+        try:
+            rows = [CachedTrack({"id": tid, "name": f"Row {tid}", "duration": 100})
+                    for tid in range(1, 11)]
+            p._download_tracks = rows
+            p._download_track = rows[0]
+            calls = []
+
+            def _track(tid):
+                calls.append(tid)
+                raise _offline(tid)
+
+            p.session.track = _track
+            job = _bulk(p)
+            assert calls == [1], calls
+            assert job["state"] == "failed"
+            assert player_mod.OFFLINE_MESSAGE in p._toast
+        finally:
+            server.close()
+
+    def test_a_refetch_with_no_network_asks_once_and_says_it_stopped(self, monkeypatch):
+        monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.0)
+        p = HeadlessTidalPlayer()
+        calls = []
+
+        def _track(tid):
+            calls.append(tid)
+            raise _offline(tid)
+
+        p.session = types.SimpleNamespace(audio_quality=None, is_pkce=False, track=_track)
+        p._refetch_candidates = lambda: {"downloads": [1, 2, 3], "cache": []}
+        p._start_refetch_job()
+        assert _wait_for(lambda: (p._refetch_job or {}).get("state") != "running")
+        assert calls == [1]
+        assert p._refetch_job["state"] == "failed"
+        line = p._build_refetch_line().plain
+        assert f"Stopped — {player_mod.OFFLINE_MESSAGE}" in line
+        assert "upgrade all" not in line
 
     def test_a_cdn_outage_mid_fetch_stops_the_run(self, monkeypatch):
         monkeypatch.setattr(player_mod, "REFETCH_MIN_INTERVAL", 0.0)

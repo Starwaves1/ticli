@@ -1,4 +1,5 @@
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 API_TIMEOUT = (5, 30)
 
@@ -20,12 +21,18 @@ def tidal_session():
     return session
 
 
+def _stalled_read(exc) -> bool:
+    return any(isinstance(e, ReadTimeoutError) for e in (*exc.args, exc.__context__, exc.__cause__))
+
+
 def is_transport_failure(exc) -> bool:
     # ReadTimeout is deliberately not here: TIDAL answering slowly is not TIDAL being unreachable.
+    # requests re-raises a read timeout during iter_content as a plain ConnectionError, so a stalled CDN
+    # segment has to be told apart from a dead network by what it wraps.
     seen = set()
     while exc is not None and id(exc) not in seen:
         if isinstance(exc, requests.exceptions.ConnectionError):
-            return True
+            return not _stalled_read(exc)
         seen.add(id(exc))
         exc = exc.__cause__ or exc.__context__
     return False

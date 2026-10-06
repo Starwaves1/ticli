@@ -2967,11 +2967,11 @@ class HeadlessTidalPlayer:
         # refuses while the other runs.
         refetch = self._build_refetch_line()
         action = (refetch
-                  if (self._refetch_job or {}).get("state") in ("running",
-                                                                "blocked")
+                  if (self._refetch_job or {}).get("state") in ("running", "blocked",
+                                                                "failed")
                   else self._build_download_line() or refetch)
         content.append("\n   ", style="")
-        busy = ((self._refetch_job or {}).get("state") in ("running", "blocked")
+        busy = ((self._refetch_job or {}).get("state") in ("running", "blocked", "failed")
                 or (self._download_job or {}).get("state")
                 in ("running", "blocked", "failed"))
         if busy or len(folder) + len(action.plain) + 3 > max(self._fit.inner - 3, 20):
@@ -3172,6 +3172,11 @@ class HeadlessTidalPlayer:
             content.append(
                 f"Stopped — TIDAL is rate-limiting. {job.get('done', 0)}"
                 " done, nothing retried.", style="red")
+            return content
+        if state == "failed":
+            content.append(f"Stopped — {job.get('error')}. {job.get('done', 0)} done.", style="red")
+            content.append("   [R]", style="bold")
+            content.append(" try again", style="dim")
             return content
         content.append("[R]", style="bold")
         content.append(f" upgrade all to {self._quality_name}", style="dim")
@@ -4750,7 +4755,7 @@ class HeadlessTidalPlayer:
 
     def _download_plan(self, track, tier: str) -> dict:
         track_id = getattr(track, "id", None)
-        real = self._resolve_track(track)
+        real = self.session.track(track.id) if getattr(track, "cached", False) else track
         if real is None:
             raise RuntimeError("track could not be resolved")
         # Extension unknown until the CDN answers: write under a provisional per-track name, rename after.
@@ -4932,7 +4937,7 @@ class HeadlessTidalPlayer:
                     "Nothing will be retried.",
                     seconds=PLAYER_ERROR_SECONDS)
             elif run.offline:
-                _update(state="done")
+                _update(state="failed", error=OFFLINE_MESSAGE)
                 self._set_toast(f"Re-fetch stopped after {done} — {OFFLINE_MESSAGE}",
                                 seconds=PLAYER_ERROR_SECONDS)
             else:
