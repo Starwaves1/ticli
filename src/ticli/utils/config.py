@@ -9,6 +9,8 @@ coerced, clamped and saved like the rest but is not in SETTINGS_ROWS (the page
 list); volume lives on the [v] overlay.
 """
 
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -130,11 +132,60 @@ SETTINGS_SPEC: list[dict] = [
         "unit": "GB",
         "desc": "Disk the cache may use, in GB. Over budget, the least recently used files go first.",
     },
+    # Protected rows (ADR-0007): changed only by TUI keypresses, never by a command.
+    {
+        "key": "allow_ai_control",
+        "label": "Allow AI control",
+        "kind": "bool",
+        "protected": True,
+        "default": True,
+        "desc": "Let AI agents control ticli. Off, they can only read what is on disk.",
+    },
+    {
+        "key": "allow_dangerous_commands",
+        "label": "Allow dangerous commands",
+        "kind": "bool",
+        "protected": True,
+        "default": False,
+        "desc": "Let agents delete playlists, remove tracks, delete downloads, clear the cache or log out.",
+    },
+    {
+        "key": "ai_control_key",
+        "label": "AI control key",
+        "kind": "secret",
+        "protected": True,
+        "default": None,
+        "desc": "A key agents must pass to control ticli. Enter to type one; an empty key clears it.",
+    },
 ]
 
 DEFAULTS = {spec["key"]: spec["default"] for spec in SETTINGS_SPEC}
 
 SETTINGS_ROWS = [spec for spec in SETTINGS_SPEC if not spec.get("hidden")]
+
+PROTECTED_KEYS = frozenset(spec["key"] for spec in SETTINGS_SPEC if spec.get("protected"))
+
+_SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}
+
+
+def hash_ai_key(key: str):
+    """The stored form of an AI control key; an empty key means none."""
+    if not key:
+        return None
+    salt = os.urandom(16)
+    digest = hashlib.scrypt(key.encode(), salt=salt, **_SCRYPT)
+    return {"salt": salt.hex(), "hash": digest.hex()}
+
+
+def ai_key_matches(stored, key) -> bool:
+    if not stored or not isinstance(key, str) or not key:
+        return False
+    try:
+        salt = bytes.fromhex(stored["salt"])
+        want = bytes.fromhex(stored["hash"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(hashlib.scrypt(key.encode(), salt=salt, **_SCRYPT), want)
 
 
 def get_spec(key: str) -> dict:
@@ -169,6 +220,10 @@ def coerce(spec: dict, value):
         except (TypeError, ValueError):
             return spec["default"]
         return max(spec["min"], min(spec["max"], number))
+    if spec["kind"] == "secret":
+        ok = (isinstance(value, dict)
+              and all(isinstance(value.get(f), str) and value.get(f) for f in ("salt", "hash")))
+        return {"salt": value["salt"], "hash": value["hash"]} if ok else None
     return value
 
 
@@ -189,6 +244,8 @@ def display_value(spec: dict, value) -> str:
     """How a value reads on the settings page."""
     if spec["kind"] == "bool":
         return "On" if coerce(spec, value) else "Off"
+    if spec["kind"] == "secret":
+        return "Set" if coerce(spec, value) else "Not set"
     unit = spec.get("unit", "")
     return f"{value}{'' if unit == '%' else ' '}{unit}" if unit else str(value)
 
