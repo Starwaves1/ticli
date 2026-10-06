@@ -152,7 +152,7 @@ def playlist_add(playlist_id, track_ids):
 @agent.command()
 def unblock():
     """Clear a tripped rate-limit stop. For humans, after investigating —
-    an agent must never run this."""
+    works only from a terminal; an agent must never run this."""
     from ticli import agent as impl
     impl.unblock()
 

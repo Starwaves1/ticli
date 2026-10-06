@@ -449,7 +449,14 @@ def playlist_add(playlist_id: str, track_ids: tuple) -> None:
 
 
 def unblock() -> None:
-    """The human's lever, not the agent's: clear a tripped stop."""
+    """The human's lever, not the agent's: clear a tripped stop (ADR-0001)."""
+    from ticli import commands
+
+    if commands.cli_caller() != commands.HUMAN:
+        raise fail(
+            "human_only", "Only a human at a terminal can clear the trip.",
+            hint=("Stop and ask your human to run `ticli agent unblock` in a "
+                  "terminal after checking why TIDAL blocked us."))
     was = throttle.unblock()
     emit({"ok": True, "was_tripped": was})
     if not was:

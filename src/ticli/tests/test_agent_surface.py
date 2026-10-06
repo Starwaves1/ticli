@@ -343,7 +343,17 @@ class TestCliContract:
         assert out == {"ok": True, "playlist_id": "pl-1", "requested": 2, "added": 2}
         assert added == ["11", "22"]  # ids reach the API as strings
 
-    def test_unblock_via_cli_clears_a_real_trip(self, stored_tokens):
+    def test_unblock_without_a_terminal_is_refused_and_keeps_the_trip(self, stored_tokens):
+        throttle.trip("http_429")
+        result = CliRunner().invoke(cli, ["agent", "unblock"])  # CliRunner's stdin is no TTY
+        payload = json.loads(result.output)
+        assert result.exit_code == 1 and payload["error"] == "human_only"
+        assert "ask your human to run `ticli agent unblock` in a terminal" in payload["hint"]
+        assert json.loads(throttle._throttle_path().read_text())["tripped"] is not None
+
+    def test_unblock_via_cli_clears_a_real_trip(self, monkeypatch, stored_tokens):
+        from ticli import commands
+        monkeypatch.setattr(commands, "cli_caller", lambda stdin=None: commands.HUMAN)
         throttle.trip("http_429")
         runner = CliRunner()
         result = runner.invoke(cli, ["agent", "unblock"])

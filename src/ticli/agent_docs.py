@@ -157,7 +157,8 @@ go looking for another way.
 
 ### `ticli agent unblock` — 0 requests
 Clears a trip. **Human-only** — see The trip above. Present it to the user
-as the command *they* run; do not run it for them.
+as the command *they* run; do not run it for them. Without a terminal on
+stdin it refuses with `human_only`.
 
 ## Workflows
 
