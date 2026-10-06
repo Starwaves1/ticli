@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ticli.utils import downloads, throttle
-from ticli.utils.cache import MetadataCache
+from ticli.utils.cache import CachedTrack, MetadataCache
 from ticli.utils.config import (
     PROTECTED_KEYS, SETTINGS_SPEC, ai_key_matches, coerce, get_spec, load_config,
     save_config,
@@ -143,10 +143,16 @@ def _tracks(p, ids, *first) -> list:
             if track is not None:
                 known.setdefault(_sid(track), track)
     tracks = []
+    indexed = None
     for tid in ids:
         track = known.get(str(tid)) or p._known.get(("track", str(tid)))
         if track is None:
-            track = p.session.track(tid)
+            # A row the TUI found in the metadata index: playback resolves it only if no local copy exists.
+            if indexed is None:
+                wanted = {str(t) for t in ids}
+                indexed = {str(r.get("id")): CachedTrack(r) for _pid, r in p._cache.iter_tracks()
+                           if str(r.get("id")) in wanted}
+            track = indexed.get(str(tid)) or p.session.track(tid)
         tracks.append(track)
     return tracks
 

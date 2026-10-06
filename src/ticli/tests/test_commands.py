@@ -161,6 +161,69 @@ class TestActions:
         assert json.loads(config_file.read_text())["page_size"] == 20
 
 
+class TestReadsOwnTheirLists:
+    """Browsing reads run in the player and leave what they fetched there, so the
+    next command by id costs nothing whichever client sent it."""
+
+    def test_album_tracks_then_play_album_is_one_request(self):
+        p = _player()
+        asked = []
+        album = types.SimpleNamespace(id=9, name="A", tracks=lambda: asked.append(1) or [_track(4), _track(5)])
+        p._remember("album", [album])
+        result = _human(p, "album.tracks", id=9)
+        assert [t.id for t in result["result"]["tracks"]] == [4, 5]
+        assert _human(p, "play.album", id=9, index=1)["ok"]
+        assert p._plays == [5] and asked == [1]
+
+    def test_artist_section_then_play_artist_costs_nothing_more(self):
+        p = _player()
+        artist = types.SimpleNamespace(id=3, name="X", get_top_tracks=lambda limit: [_track(6), _track(7)])
+        p._remember("artist", [artist])
+        rows = _human(p, "artist.section", id=3, section="tracks")["result"]["items"]
+        assert [r["obj"].id for r in rows] == [6, 7]
+        p._artist_sections = {}
+        assert _human(p, "play.artist", id=3, section="tracks", index=1)["ok"]
+        assert p._plays == [7]
+
+    def test_play_track_by_an_id_from_the_metadata_index_asks_tidal_nothing(self):
+        p = _player()
+        p._cache.put_playlist_tracks("p", [_track(42)])
+        assert _human(p, "play.track", track_ids=[42])["ok"]
+        assert p._plays == [42]
+
+    def test_playlist_remove_needs_the_rows_loaded(self):
+        p = _player()
+        result = _human(p, "playlist.remove", id="nope", index=0)
+        assert result["code"] == "not_loaded"
+
+    def test_playlist_remove_refuses_a_stale_row(self):
+        p = _player()
+        playlist = types.SimpleNamespace(id="p", name="P", remove_by_index=lambda i: True)
+        p._remember("playlist", [playlist])
+        p._lists[("playlist", "p")] = [_track(1), _track(2)]
+        assert _human(p, "playlist.remove", id="p", index=0, track_id=2)["code"] == "stale"
+
+    def test_library_playlists_refreshes_the_editable_list(self):
+        p = _player()
+        mine = player_mod.tidalapi.UserPlaylist.__new__(player_mod.tidalapi.UserPlaylist)
+        mine.id, mine.name, mine.num_tracks = "m", "Mine", 1
+        theirs = types.SimpleNamespace(id="t", name="Theirs", num_tracks=2, creator=None)
+        p.session = types.SimpleNamespace(user=types.SimpleNamespace(playlists=lambda: [mine, theirs]))
+        result = _human(p, "library.playlists")
+        assert [pl.id for pl in result["result"]["playlists"]] == ["m", "t"]
+        assert p._editable_playlists == [mine]
+
+    def test_stop_stops_and_keeps_the_position(self):
+        p = _player()
+        p.audio.get_time_pos = lambda: None
+        p._playing = True
+        p._play_offset = 50.0
+        p._play_start_time = None
+        assert _human(p, "stop")["ok"]
+        assert p._playing is False and p.audio.stopped == 1
+        assert p._current_track is not None
+
+
 class TestHardening:
     def test_search_uses_the_query_argument_not_the_input_box(self):
         p = _player()
