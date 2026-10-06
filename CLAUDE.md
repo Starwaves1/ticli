@@ -26,7 +26,8 @@ Package in `src/ticli`; entry point `ticli = ticli.cli:main`.
 - `utils/cache.py`: metadata index, cached audio, budget and eviction.
 - `utils/downloads.py` + `utils/tags.py`: user-owned downloads and stdlib tagging.
 - `utils/artwork.py`: stdlib JPEG decode to half-block pixel art.
-- `tests/`: `conftest.py` (suite-wide path redirects), `fakes.py` (network stand-ins), `vt.py` (terminal model for display tests).
+- `utils/testhooks.py`: env hooks (only with `TICLI_TEST_HOOKS=1`) that run a real `ticli.playerd` on a fake TIDAL session, tokens off the keyring.
+- `tests/`: `conftest.py` (suite-wide path redirects), `fakes.py` (network stand-ins), `fake_tidal.py` (the session for `test_real_player.py`, marked `real_player`), `vt.py` (terminal model for display tests).
 
 ## Damage gates
 

@@ -50,3 +50,4 @@ include = ["ticli", "ticli.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["ticli/tests"]
+markers = ["real_player: starts the real ticli.playerd with mpv --ao=null and a fake TIDAL (needs mpv)"]

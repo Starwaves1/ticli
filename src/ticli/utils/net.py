@@ -12,6 +12,11 @@ class TimeoutSession(requests.Session):
 
 
 def tidal_session():
+    from ticli.utils.testhooks import session_factory
+
+    factory = session_factory()
+    if factory is not None:
+        return factory()
     import tidalapi
 
     session = tidalapi.Session()
