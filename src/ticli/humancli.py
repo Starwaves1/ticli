@@ -391,6 +391,16 @@ def resolve_song(link: Link, token) -> list:
 # ── running a verb ──
 
 
+def _queue_guard(link: Link, args: dict) -> dict:
+    """Pin the entry by its track so a queue another client moved is `stale`, not another track."""
+    reply = link.ask("queue.list")
+    tracks = ((reply.get("result") or {}).get("tracks") or []) if reply.get("ok") else []
+    index = args.get("index")
+    if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(tracks):
+        return {"track_id": tracks[index].get("id")}
+    return {}
+
+
 def prepare(link: Link, cmd: str, args: dict) -> tuple:
     """(command, args) with names and songs turned into ids."""
     from ticli.commands import COMMANDS
@@ -399,8 +409,12 @@ def prepare(link: Link, cmd: str, args: dict) -> tuple:
     kind = NAMED.get(cmd)
     if kind and "id" in args:
         args["id"], _label = resolve_name(link, kind, args["id"], example)
+    if cmd in ("queue.play", "queue.remove") and "track_id" not in args:
+        args = {**args, **_queue_guard(link, args)}
     params = COMMANDS[cmd].params
     for field in ("track_id", "track_ids"):
+        if cmd.startswith("queue."):
+            break
         if field not in params and field + "*" not in params:
             continue
         given = args.pop(field, None)

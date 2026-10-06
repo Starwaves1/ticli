@@ -366,3 +366,24 @@ class TestShape:
             assert name.replace(".", " ") in out, name
         for hand in ("pause", "resume", "next", "prev", "status", "start", "search"):
             assert hand in out
+
+
+class TestQueueOps:
+    def test_queue_remove_pins_the_track_it_was_shown(self, player, tty):
+        h = player()
+        seen = []
+        real = h.core.commands.execute
+
+        def spy(name, args=None, *a, **kw):
+            if name == "queue.remove":
+                seen.append(dict(args or {}))
+            return real(name, args, *a, **kw)
+        h.core.commands.execute = spy
+        assert ticli("queue", "remove", "2").exit_code == 0
+        assert seen == [{"index": 2, "track_id": 3}]
+        assert [t.id for t in h.core._queue] == [1, 2]
+
+    def test_a_queue_that_moved_is_stale_not_another_track(self, player):
+        h = player()
+        reply = h.agent("queue.remove", {"index": 2, "track_id": 1})
+        assert reply["code"] == "stale" and len(h.core._queue) == 3
