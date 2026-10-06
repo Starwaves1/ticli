@@ -18,7 +18,7 @@ ticli is a terminal music player for TIDAL; the TUI is the human's surface.
 `ticli agent` is yours: headless verbs that speak JSON, rate-limited in code.
 Everything you can do with ticli programmatically is on this page. If you are
 here to work on ticli's *source*, this is the wrong document — read
-`ai/README.md` in the repo first.
+`CLAUDE.md` in the repo first.
 
 ## The contract
 
@@ -155,8 +155,8 @@ settings page (PKCE sign-in).
 **Anything that touches playback** — play, pause, skip, queue, volume,
 what's playing, downloads, favorites, radio: **not in this surface yet.**
 Say it is not yet supported and point at the TUI; the running player is the
-human's. (A control socket for the live player is specced in the repo's
-`ai/DECISIONS.md` — deferred, not forgotten.) The one thing you *can* see
+human's. (A control socket for the live player is deferred, not
+forgotten.) The one thing you *can* see
 is `status`'s `player_running` boolean.
 
 Also not here yet: **browsing** (an album's track list, an artist's page —

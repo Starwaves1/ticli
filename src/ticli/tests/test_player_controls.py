@@ -387,7 +387,7 @@ class TestTruncatedStream:
     as end-of-track — correctly, by its own contract — so the monitor used to
     advance, and the user heard twelve seconds of a three-minute song with
     nothing said. Reachable by pausing longer than the ~1 h signed-URL life,
-    or by any network blip. ai/INCIDENTS #3 by another door.
+    or by any network blip. A failure must never look like a track ending.
     """
 
     def _audio(self):

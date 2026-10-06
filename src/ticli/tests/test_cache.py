@@ -1679,7 +1679,7 @@ class TestACachedTrackCostsNoRequest:
     `play_url` only discovered the cached file *after* it had been handed a
     URL — and then ignored it. Replaying a 20-track cached playlist cost 20
     requests it threw away, plus up to 20 more from the prefetch, against the
-    exact endpoint whose burst rate got the owner's IP blocked (INCIDENTS #1).
+    exact endpoint whose burst rate got the owner's IP blocked (docs/adr/0001).
     """
 
     def _player_with(self, quality="HIGH"):

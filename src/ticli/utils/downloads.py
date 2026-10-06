@@ -39,7 +39,7 @@ too (see utils/tags.py); the path is what survives when they cannot be.
 **Size estimates cost nothing.** Duration is already in the metadata index, so
 `duration x nominal bitrate` gives every tier at once with no request at all.
 The alternative — one `playbackinfo` per track for a real `Content-Length` —
-is exactly the pattern that got the owner's IP blocked (see ai/INCIDENTS #1),
+is exactly the pattern that got the owner's IP blocked (see docs/adr/0001-tidal-rate-limits.md),
 and it takes the user's playback down with it. Everything estimated is
 prefixed `~`; a size shown without one is a byte count already on this disk,
 from the index below or from the cache tracker, and never a guess. The four
@@ -65,6 +65,10 @@ from ticli.utils import cache as cache_mod
 
 logger = logging.getLogger(__name__)
 
+# `load_index` silently reads a file whose version doesn't match as empty, so
+# bumping this forgets the user's whole download library. Never bump it for a
+# rename or a display change — translate old values at read time instead (the
+# precedent is QUALITY_V4_RENAMES); a real schema change needs a migration.
 INDEX_VERSION = 1
 
 # Set to a Path to override where downloads go. Tests point it at tmp_path;
@@ -77,7 +81,7 @@ DOWNLOAD_ROOT = None
 #
 #   LOW / MEDIUM — AAC, effectively constant bitrate. Estimating from the
 #     nominal rate under-reads the real file by 0.3-2.1% (four real TIDAL
-#     tracks, ai/reference/download-research-2026-07-25.md §1.4) and by 0.67%
+#     tracks) and by 0.67%
 #     at 320k / 3.4% at 96k when re-measured locally against ffmpeg's encoder.
 #     One-signed and small: the estimate is never high.
 #

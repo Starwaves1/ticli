@@ -1,18 +1,19 @@
 """The agent surface: JSON contract, throttle enforcement, resolve ranking.
 
 Two of these are regression tests for failures that actually happened on
-2026-08-25, the session that motivated the feature (see HISTORY):
+2026-08-25, the session that motivated the feature:
 
 - an agent fired ~30 requests in seconds because the rate rules lived in
   Markdown (TestThrottle asserts the brake is now in the request path);
 - a resolver whose remix penalty outweighed its artist bonus served
   "The Journey" by H.E.R. for Folamour's (TestResolve replays it).
 
-Everything runs against fakes — zero live requests, per WORKING-RULES. The
+Everything runs against fakes — zero live requests (docs/adr/0001-tidal-rate-limits.md).
+The
 throttle tests inject `now`/`sleep` and then assert the *file on disk*,
 because the reservation arithmetic and the trip record are the observable
-reality here; a test that only checked return values would be the shape of
-INCIDENTS #2.
+reality here; a test that only checked return values could stay green over
+a brake that never engaged.
 """
 
 import json

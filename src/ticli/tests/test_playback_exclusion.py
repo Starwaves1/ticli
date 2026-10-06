@@ -10,8 +10,8 @@ and survives the app exiting. That is two songs at once out of one client.
 The invariant these tests hold down is therefore about *processes*, not about
 bookkeeping: every process ever spawned, except the one `_process` currently
 names, must have been terminated or killed. Asserting that `_process` points at
-the newest spawn passes with the bug fully present and proves nothing — which
-is the ai/INCIDENTS #2 shape, and is exactly what the pre-existing fakes in
+the newest spawn passes with the bug fully present and proves nothing — and
+is exactly what the pre-existing fakes in
 test_player_controls.py and test_cache.py cannot see (neither defines
 `terminate`, and one makes `poll()` return None forever).
 
@@ -19,9 +19,10 @@ The mechanism guarded here: `play_url` used to call `stop()` — which takes
 `_lock`, reaps, and *releases* — and only then re-acquire `_lock` to spawn.
 Two starts arriving inside one reap each spawned a backend, because the loser's
 `stop()` ran after the winner had already set `_process = None` and so reaped
-nothing. See ai/INCIDENTS.md and ai/BUGS-2026-07-24-resume-trace.md item 4,
-which predicted this exact failure ("tighter interleaving double-spawns mpv →
-orphaned process, double audio") and whose third prescribed fix never shipped.
+nothing. This exact failure ("tighter interleaving double-spawns mpv →
+orphaned process, double audio") was predicted two weeks before it was heard;
+of the three fixes prescribed, the re-entrancy guard on the window itself was
+the one that never shipped.
 
 No TIDAL session and no real player process.
 """
@@ -84,7 +85,7 @@ class FakeProc:
 
     def wait(self, timeout=None):
         self.waited += 1
-        # Reaping a real mpv takes 37-75ms (ai/INCIDENTS.md). That duration is
+        # Reaping a real mpv takes 37-75ms. That duration is
         # not the bug, but it is what parks a second starter on the lock.
         if self._reap_delay:
             time.sleep(self._reap_delay)
@@ -214,7 +215,7 @@ class TestOneCriticalSection:
         """resume() used to `release()` by hand to call play_url and re-acquire.
 
         Same seam, reached by pressing space on ffplay before the cache copy
-        is ready. WORKING-RULES forbids the shape outright: a plain Lock is not
+        is ready. The shape is forbidden outright: a plain Lock is not
         reentrant, so the answer is an unlocked `_locked` half, never a manual
         unlock-and-hope.
         """
@@ -243,8 +244,7 @@ def widen_the_seam(audio, monkeypatch, gap=0.05):
     the parked waiter is even woken. Measured under 1% of contended track
     changes, which is a bug you hit once a month and can never reproduce on
     purpose. A test that merely starts two threads and hopes passes with the
-    bug fully present; that is the ai/INCIDENTS #2 shape and it is how this
-    one survived.
+    bug fully present, and that is how this one survived.
 
     So this pins the interleaving instead of gambling on it. It does not create
     the window — it stops the releasing thread from immediately re-taking the
@@ -292,7 +292,7 @@ class TestConcurrentStartsLeaveOneProcess:
     def test_two_starts_inside_one_reap_leave_exactly_one_live_process(
             self, spawned, monkeypatch):
         # A reap slow enough to park the second starter on the lock, which is
-        # what a real mpv does anyway (37-75ms, ai/INCIDENTS.md).
+        # what a real mpv does anyway (37-75ms).
         first = FakeProc(reap_delay=0.03)
         audio = AudioPlayer("mpv")
         audio._process = first

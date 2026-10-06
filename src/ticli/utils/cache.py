@@ -10,8 +10,10 @@ Two things live here, because they share one budget and one directory:
   and evicts it.
 
 Deliberately not in `~/.config/ticli`: config is user-owned and precious,
-this is machine-owned and disposable. Deleting the whole cache directory at
-any moment is always safe — the app just gets slow again for one visit.
+this is machine-owned and disposable. Deleting what this module writes is
+always safe — the app just gets slow again for one visit. The directory as a
+whole is not: the download index (`downloads.json`, see utils/downloads.py)
+lives here too, and losing it forgets the user's whole download library.
 The location follows each OS's own convention (XDG on Linux, ~/Library/Caches
 on macOS, %LOCALAPPDATA% on Windows) rather than one hardcoded path.
 
@@ -39,6 +41,11 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 CACHE_VERSION = 1
+# `_load_tracker` silently reads a file whose version doesn't match as empty,
+# so bumping this forgets every play count and granted tier. Never bump it for
+# a rename or a display change — translate old values at read time instead
+# (the precedent is QUALITY_V4_RENAMES); a real schema change needs a
+# migration.
 TRACKER_VERSION = 1
 
 # What a play is worth waiting for before it counts. A skip is not a play, and
@@ -82,7 +89,7 @@ def is_owned_audio(name: str) -> bool:
     by `total_bytes` (a plain directory size, which does not consult this)
     while being invisible to `owned_audio_files`, so it could be neither
     evicted nor cleared. Once the leak exceeded the budget every sweep
-    deleted every real song and kept the leak. See ai/INCIDENTS #6.
+    deleted every real song and kept the leak.
     """
     if name.endswith(".part"):
         stem = name[:-len(".part")]

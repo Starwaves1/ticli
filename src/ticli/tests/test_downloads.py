@@ -1,7 +1,8 @@
 """Tests for the download tier.
 
-The rule these are written to (ai/WORKING-RULES.md, and INCIDENTS #2 behind
-it) is that a test asserts observable reality. A download is bytes in the
+The rule these are written to is that a test asserts observable reality,
+because tests that asserted bookkeeping once stayed green over a cache that
+had never written a byte. A download is bytes in the
 user's music folder, so that is what is asserted: the file exists, its bytes
 equal the bytes the server sent, its header is the container its extension
 claims, and the tags read back out of it. Two of the cases run over a real
@@ -236,7 +237,8 @@ class TestEstimatesCostNothing:
 
     def test_opening_the_box_and_walking_every_tier_costs_no_request(self, monkeypatch):
         """Four tiers hovered is four numbers shown and **zero** calls. One
-        `playbackinfo` per hover is what ai/INCIDENTS #1 was, so this is the
+        `playbackinfo` per hover is what got the IP blocked (docs/adr/0001),
+        so this is the
         assertion the estimates exist for."""
         patch_get(monkeypatch, player_mod,
                   lambda *a, **k: pytest.fail("no requests here"))
@@ -272,7 +274,7 @@ class TestTheSizeIsExactWhenItIsFree:
     """A `~` means an estimate and no `~` means a byte count. The only two
     places a real one can be had for nothing are the download index and the
     cache tracker — anywhere else it is a request, and a request per hover is
-    ai/INCIDENTS #1."""
+    docs/adr/0001-tidal-rate-limits.md."""
 
     def _opened(self, quality="HIGH"):
         p = _player(quality=quality)
@@ -542,7 +544,8 @@ class TestATierThatCannotBeServedStepsDown:
 
     def test_a_rate_limit_is_never_stepped_past(self):
         """Retrying is what turned a rate limit into an edge block
-        (ai/INCIDENTS #1). Three more requests at lower tiers is the worst
+        (docs/adr/0001-tidal-rate-limits.md). Three more requests at lower tiers is
+        the worst
         possible response to a limiter already saying no."""
         p = _player(quality="MAX")
         asked = []
@@ -1531,7 +1534,8 @@ class TestTheTwoTiersReadAsTwoTiers:
 class TestReFetchingEverything:
     """The one action in the app that deliberately makes hundreds of requests.
 
-    ai/INCIDENTS #1 is 53 `playbackinfo` calls in 2.8 s getting the owner's IP
+    docs/adr/0001-tidal-rate-limits.md: 53 `playbackinfo` calls in 2.8 s getting
+    the owner's IP
     blocked and his music stopping. So the tests here are about the brakes:
     that it asks first, that it is serial and paced, that it can be stopped,
     and that evidence of a block ends it rather than being retried.
@@ -2296,8 +2300,7 @@ class TestSeeingAndRemovingWhatYouHave:
     # ── what it costs ──
 
     def test_painting_two_hundred_marked_rows_costs_one_index_read(self, monkeypatch):
-        """Finding F6 of ai/reference/data-path-audit-2026-07-26.md, which is
-        what a `path_for` per row would be: 229 ms of UI-thread JSON at 500
+        """A `path_for` per row would be 229 ms of UI-thread JSON at 500
         entries, twice a second. Assert the reads, not the milliseconds."""
         for tid in range(200):
             self._download(tid, name=f"Song {tid}")
@@ -2341,7 +2344,8 @@ class TestSeeingAndRemovingWhatYouHave:
         assert len(reads) == 1
 
     def test_the_list_and_the_markers_make_no_request_at_all(self, monkeypatch):
-        """ai/INCIDENTS #1. Nothing on this screen needs the network: every
+        """docs/adr/0001-tidal-rate-limits.md. Nothing on this screen needs the
+        network: every
         field comes off the path the downloader wrote or the index row beside
         it, which is why there is no [Enter] to play a row."""
         def _refuse(*a, **k):

@@ -635,6 +635,8 @@ def art_size(width: int, height: int, beside: bool = False):
         room = int(width * ART_WIDTH_SHARE)
         spare = MIN_ROWS_AROUND_ART
     for cols, rows in ART_SIZES:
+        # `cols + ART_MARGIN <= width` is implied by `cols <= room` at today's
+        # constants, but kept: ART_WIDTH_SHARE has been retuned before (0.4→0.6).
         if (cols + ART_MARGIN <= width and cols <= room
                 and rows + spare <= height):
             return cols, rows

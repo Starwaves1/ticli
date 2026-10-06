@@ -4,8 +4,9 @@ There is one of these because there is one thing to get wrong: `fetch_to_file`
 opens a `requests.Session` per download (46 segments of a hi-res track are 46
 requests to the same host, and one connection instead of 46 is a measured
 2.3 s and 45 TLS handshakes). A test that only replaces `requests.get` is
-faking a function production no longer calls on that path, which is the shape
-of INCIDENTS #2 — so `patch_get` replaces both, together, and nothing has to
+faking a function production no longer calls on that path, and stays green
+over code it never exercises — so `patch_get` replaces both, together, and
+nothing has to
 remember.
 """
 

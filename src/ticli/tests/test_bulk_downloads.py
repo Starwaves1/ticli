@@ -6,7 +6,8 @@ why they are asserted separately and in terms of what can be observed:
 * **The API rate did not change.** Resolving is still serial and still paced,
   so a twelve-track run makes twelve stream requests and never has two in
   flight. The assertions are request *counts* and in-flight peaks, because
-  ai/INCIDENTS #1 is the worst thing that has happened to this project and a
+  the IP block (docs/adr/0001-tidal-rate-limits.md) is the worst thing that has
+  happened to this project and a
   flag can be set by a run that kept going.
 * **The fetch really is three-wide.** `fetch_to_file` is instrumented where
   the player actually calls it, and the peak has to be 3 — not 1, which would
@@ -193,7 +194,8 @@ class TestPlayAllDownloadsTheWholeThing:
 
 class TestTheBulkEstimateCostsNothing:
     """Summing durations is arithmetic. A real per-track size is one
-    `playbackinfo` each, which is ai/INCIDENTS #1 exactly."""
+    `playbackinfo` each, which is the burst in
+    docs/adr/0001-tidal-rate-limits.md."""
 
     def test_the_total_is_the_sum_and_no_request_is_made(self, monkeypatch):
         patch_get(monkeypatch, player_mod,
@@ -446,7 +448,7 @@ class TestThreeAtATime:
             server.close()
 
     def test_three_is_not_a_setting(self):
-        """"No parallelism to tune" is the property ai/WORKING-RULES protects,
+        """"No parallelism to tune" is the property the rate rules protect,
         and it stays true where it matters: the number is a constant and
         nothing in the config can move it."""
         from ticli.utils.config import SETTINGS_SPEC
@@ -661,7 +663,7 @@ class TestTheBarsOnScreen:
 
     def test_the_bar_steps_by_half_cells(self):
         """`╸` is the left half of `━`, which is what makes the bar move every
-        frame instead of once a character (ai/bar-styles-demo.py)."""
+        frame instead of once a character."""
         assert player_mod._bar_split(0.0, 10) == ("", "┈" * 10)
         assert player_mod._bar_split(0.05, 10) == ("╸", "┈" * 9)
         assert player_mod._bar_split(0.10, 10) == ("━", "┈" * 9)
@@ -800,7 +802,7 @@ class TestTheBarsOnScreen:
 
     def test_the_bars_read_no_disk_and_no_index(self, monkeypatch):
         """A repaint is twice a second; `load_index()` re-parses the whole
-        file (ai/reference F6). Every number on a bar is on the slot."""
+        file. Every number on a bar is on the slot."""
         p, slots = self._running()
         slots[0].update(title="Nightcall", state="running", done=10, total=20)
         monkeypatch.setattr(downloads, "load_index",
@@ -811,7 +813,7 @@ class TestTheBarsOnScreen:
             _box_text(p)
 
 
-# ── ai/INCIDENTS #5, with three writers instead of two ──
+# ── Concurrent eviction sweeps, with three writers instead of two ──
 
 
 class TestEvictionAtThreeWide:

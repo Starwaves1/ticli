@@ -177,16 +177,15 @@ def _boxed(rows: list, width: int, margin: int, style: str) -> list:
 # The download bar: a heavy rule into a dotted remainder. `╸` is the left half
 # of `━`, which buys a half-cell step for nothing — a bar that jumps a whole
 # character at a time reads as a progress *report*, one that moves every frame
-# reads as a thing happening. Owner's pick out of ten, ai/bar-styles-demo.py.
+# reads as a thing happening. Owner's pick out of ten.
 BAR_FULL, BAR_HALF, BAR_EMPTY = "━", "╸", "┈"
 
 
 def _bar_split(fraction: float, width: int) -> tuple:
     """`(filled, remainder)`, split so the two halves can be coloured apart.
 
-    Lifted from `_split` in ai/bar-styles-demo.py rather than re-derived: the
-    rounding is the whole of the half-cell step and getting it subtly wrong
-    is a bar that sticks at the ends.
+    The rounding is the whole of the half-cell step, and getting it subtly
+    wrong is a bar that sticks at the ends.
     """
     fraction = max(0.0, min(1.0, fraction))
     steps = int(round(fraction * width * 2))
@@ -557,7 +556,8 @@ REFETCH_MIN_INTERVAL = 2.0
 # `get_stream()` — stays serial and paced (see _PacedRun), so the peak API
 # request rate of a three-wide run is identical to a one-wide run's. "There is
 # no parallelism to tune and no way to ask for more" is the property that keeps
-# ai/INCIDENTS #1 from happening again, and it is still true where it matters.
+# the IP block (docs/adr/0001-tidal-rate-limits.md) from happening again, and
+# it is still true where it matters.
 DOWNLOAD_WORKERS = 3
 # How often the resolver looks for a free worker slot while all of them are
 # busy. Not a new polling loop: it is inside a job that is already running and
@@ -569,7 +569,8 @@ WORKER_POLL_SECONDS = 0.05
 RATE_SAMPLES = 3
 
 # What TIDAL saying "stop" looks like in an exception. On any of these the
-# rule (ai/WORKING-RULES.md) is to stop making requests entirely and report —
+# rule (docs/adr/0001-tidal-rate-limits.md) is to stop making requests
+# entirely and report —
 # never to retry, which is what turned a rate limit into an edge block.
 RATE_LIMIT_SIGNS = ("429", "too many requests", "4006",
                     "does not have streaming privileges")
@@ -854,9 +855,10 @@ class _PacedRun:
     The split is not an optimisation, it is where the limiter is. Resolving a
     track is API traffic — `session.track()` then `get_stream()` — and 53 of
     those in 2.8 s got the owner's IP blocked and his music stopped
-    (ai/INCIDENTS #1). So resolving stays exactly as the serial re-fetch left
-    it: one at a time, on this thread, never closer together than
-    `REFETCH_MIN_INTERVAL` between *starts*, so a run of instant failures
+    (docs/adr/0001-tidal-rate-limits.md). So resolving stays exactly as the
+    serial re-fetch left it: one at a time, on this thread, never closer
+    together than `REFETCH_MIN_INTERVAL` between *starts*, so a run of instant
+    failures
     cannot become a burst either. Fetching is a plain GET to a CDN that the
     API limiter never sees, so up to `workers` of those run at once and the
     **peak API request rate is identical to a one-wide run's**. The re-fetch
@@ -1221,11 +1223,11 @@ def _take_instance_lock():
     the descriptor holding the lock; it stays open for the life of the
     process, because closing it is what drops the lock.
 
-    An advisory `flock`, deliberately not the pid file BUGS-2026-07-24 item 8
-    proposed. The kernel releases a flock when the holder dies — SIGKILL, a
-    closed terminal, a power cut — so there is no stale lock to detect and no
-    recycled pid to misjudge, which is the entire failure mode of pid files
-    and the reason this needs no cleanup path at all.
+    An advisory `flock`, deliberately not a pid file. The kernel releases a
+    flock when the holder dies — SIGKILL, a closed terminal, a power cut — so
+    there is no stale lock to detect and no recycled pid to misjudge, which is
+    the entire failure mode of pid files and the reason this needs no cleanup
+    path at all.
 
     When locking cannot be *evaluated* — no `fcntl`, or a filesystem that
     refuses to take one, which is the NFS home directory case — this returns
@@ -1601,7 +1603,9 @@ class AudioPlayer:
 
         `local` is a deliberately downloaded copy (see utils/downloads.py) and
         outranks both: it is the same bytes, it is the user's file rather than
-        ours, and it means a downloaded library plays offline. Like the cache,
+        ours, and it costs no stream request. (Not offline playback: ticli
+        needs the network to start, and a restored queue row is resolved
+        through the session before local files are looked for.) Like the cache,
         it is verified at the moment of use rather than trusted — a file the
         user deleted by hand falls straight through to the network, which is
         the whole of "handled durably" on this path.
@@ -1631,10 +1635,9 @@ class AudioPlayer:
         bar, and outlived the app.
 
         `self._lock` is a plain, non-reentrant Lock, so a caller holding it
-        cannot call `stop()` at all; the unlocked `_locked` half is the shape
-        ai/WORKING-RULES.md prescribes for exactly this, and the one `seek_to`
-        has always had. Returns (have_kept, gen) so the caller can start the
-        download after releasing.
+        cannot call `stop()` at all; the unlocked `_locked` half is the only
+        shape available, and the one `seek_to` has always had. Returns
+        (have_kept, gen) so the caller can start the download after releasing.
         """
         self._stop_locked()
         self._paused = False
@@ -2288,8 +2291,8 @@ class HeadlessTidalPlayer:
         # `(track id, tier → exact bytes already on this disk, downloaded
         # path)`, read once per opening of the box. Two index reads answer it
         # for all four tiers at once, and the box must not pay them again on
-        # every repaint — see _download_usage and ai/reference F6 for the
-        # same bargain and the milliseconds that made it necessary.
+        # every repaint — see _download_usage for the same bargain and the
+        # milliseconds that made it necessary.
         self._download_known: Optional[tuple] = None
         # Settings page state. _settings_edit is the digits typed into a number
         # row so far, or None when the arrows are just navigating; it is only
@@ -2707,6 +2710,8 @@ class HeadlessTidalPlayer:
         lock keeps a concurrent *writer* from erasing this one's changes.
         """
         STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # One fixed temp path for every instance: safe only because
+        # _take_instance_lock keeps a second ticli from ever getting here.
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state))
         os.chmod(tmp, 0o600)
@@ -2863,9 +2868,10 @@ class HeadlessTidalPlayer:
         `_play_track`'s existing `_resolve_track` swap fetches the real track
         lazily, one request, when a track is actually played. Restoring a
         whole saved playlist used to spend one `session.track()` per id at
-        every launch, serially and unpaced — the burst shape of ai/INCIDENTS
-        #1, in production. The record path is synchronous on purpose: run()
-        calls this before the UI loop starts, the attach cannot fail, so full
+        every launch, serially and unpaced — the burst shape that got the
+        owner's IP blocked (docs/adr/0001-tidal-rate-limits.md), in
+        production. The record path is synchronous on purpose: run() calls
+        this before the UI loop starts, the attach cannot fail, so full
         saves stay enabled and no `_restore_pending` latch is needed.
 
         A file with only "track_ids" — every pre-upgrade file — still fetches
@@ -2979,7 +2985,7 @@ class HeadlessTidalPlayer:
                     if t is not None:
                         tracks.append(t)
                 if blocked:
-                    # Stop entirely and report — never retry (WORKING-RULES:
+                    # Stop entirely and report — never retry (docs/adr/0001:
                     # retries are what turned a rate limit into an edge
                     # block). No attach either: the latch stays set, full
                     # saves stay suppressed, and the file keeps the whole
@@ -3624,7 +3630,12 @@ class HeadlessTidalPlayer:
                     # empty stderr, which is indistinguishable from the end of
                     # a song — except by the clock. Stop and say so rather
                     # than advancing: a track that died must not look like a
-                    # track that finished (ai/INCIDENTS #3, by another door).
+                    # track that finished, or one bad stream silently skips
+                    # through the queue with no error ever shown. Restarting
+                    # automatically (with a one-retry latch) was considered
+                    # and rejected: a silent retry against a dead URL is the
+                    # same silence with more requests, and [space] refetches
+                    # a fresh URL.
                     position = self._get_position()
                     duration = getattr(self._current_track, "duration", 0) or 0
                     self._set_toast(
@@ -4427,9 +4438,8 @@ class HeadlessTidalPlayer:
 
         Answered out of the one memoised measurement, so a 200-row page costs
         the same single index read a 1-row page does — the alternative is a
-        `path_for` per row per repaint, which is finding F6 of
-        ai/reference/data-path-audit-2026-07-26.md: 229 ms of UI-thread JSON,
-        twice a second.
+        `path_for` per row per repaint, which measured 229 ms of UI-thread
+        JSON at 500 downloads, twice a second.
         """
         if track_id is None:
             return False
@@ -4843,11 +4853,11 @@ class HeadlessTidalPlayer:
 
         The same three-states idiom `_build_refetch_line` uses, and the third
         one is the point: **a failure used to be silent** the moment the box
-        was closed, which is ai/INCIDENTS #3 in miniature. A run that was
-        rate-limited, or a track that could not be fetched, says so here in
-        red until the next download replaces it. A clean finish says nothing
-        — the toast already did, and a permanent "Saved 12 ✓" on a settings
-        page is furniture.
+        was closed, and a failure nobody sees is one nobody can diagnose. A
+        run that was rate-limited, or a track that could not be fetched, says
+        so here in red until the next download replaces it. A clean finish
+        says nothing — the toast already did, and a permanent "Saved 12 ✓" on
+        a settings page is furniture.
         """
         job = self._download_job or {}
         state = job.get("state")
@@ -5441,7 +5451,7 @@ class HeadlessTidalPlayer:
             row.append(" close", style="dim")
         elif state == "failed":
             # In the backend's own words: a download that stopped without
-            # saying why is INCIDENTS #3 in miniature
+            # saying why is a failure nobody can diagnose
             row.append(f"Failed — {job.get('error')}", style="red")
             row.append("   [Enter]", style="bold")
             row.append(" retry", style="dim")
@@ -6775,7 +6785,8 @@ class HeadlessTidalPlayer:
         Duration is already on the track (and already in the metadata index),
         so all four tiers can be shown at once for free. Asking TIDAL instead
         would be one `playbackinfo` request per track per tier against a
-        limiter that revokes streaming at about fifty — see ai/INCIDENTS #1.
+        limiter that revokes streaming at about fifty — see
+        docs/adr/0001-tidal-rate-limits.md.
         """
         return downloads.estimate_bytes(
             getattr(self._download_track, "duration", 0), tier)
@@ -6788,7 +6799,8 @@ class HeadlessTidalPlayer:
         """What a whole playlist is likely to cost at `tier`. **No network,
         and it must stay that way.** Every duration is already on the tracks,
         so this is arithmetic; a real per-track size is one `playbackinfo`
-        each, and 53 of those in 2.8 s is ai/INCIDENTS #1 exactly."""
+        each, and 53 of those in 2.8 s got the owner's IP blocked
+        (docs/adr/0001-tidal-rate-limits.md)."""
         return sum(downloads.estimate_bytes(getattr(t, "duration", 0), tier)
                    for t in self._download_tracks)
 
@@ -6806,7 +6818,7 @@ class HeadlessTidalPlayer:
         Measured once per opening of the box and kept, because the box
         repaints twice a second and `load_index()` re-reads and re-parses the
         whole index every call: 229 ms per repaint at 500 downloads, on the
-        UI thread (ai/reference/data-path-audit-2026-07-26.md F6). Dropped
+        UI thread. Dropped
         when a download lands, which is the only thing that changes it.
         """
         track_id = getattr(self._download_track, "id", None)
@@ -6840,8 +6852,8 @@ class HeadlessTidalPlayer:
 
         A `~` on everything is the honest default: a real size is one
         `playbackinfo` per tier, which is the request pattern that took the
-        owner's session down (ai/INCIDENTS #1). The `~` comes off only when
-        the bytes are already here to be counted.
+        owner's session down (docs/adr/0001-tidal-rate-limits.md). The `~`
+        comes off only when the bytes are already here to be counted.
         """
         sizes, _ = self._download_facts()
         if tier in sizes:
@@ -7432,9 +7444,9 @@ class HeadlessTidalPlayer:
     # This is the single most rate-limit-dangerous thing in the app, and the
     # incident it could repeat is the worst one in this project's history: 53
     # `playbackinfo` calls in 2.8 seconds got the owner's IP blocked and his
-    # music stopped mid-session (ai/INCIDENTS #1). So the design question is
-    # not "how fast can this go" — it is "how do we make it impossible for a
-    # user to do that to themselves".
+    # music stopped mid-session (docs/adr/0001-tidal-rate-limits.md). So the
+    # design question is not "how fast can this go" — it is "how do we make it
+    # impossible for a user to do that to themselves".
     #
     # Four answers, all of them structural rather than advisory:
     #
@@ -7467,7 +7479,7 @@ class HeadlessTidalPlayer:
         free from a granted downgrade). Asking for hi-res on a device-flow
         session does not make hi-res available, and re-fetching a whole
         library to be handed back the same AAC is a great many requests for
-        nothing — against the limiter that caused ai/INCIDENTS #1.
+        nothing — against the limiter in docs/adr/0001-tidal-rate-limits.md.
         """
         wanted = self.QUALITY_MAP.get(self._quality_name)
         if wanted not in QUALITY_RANK:
@@ -7748,7 +7760,8 @@ class HeadlessTidalPlayer:
         **A rate limit is never stepped past.** A 429, or a 401 with subStatus
         4006, means stop — retrying at another tier is three more requests
         into a limiter that is already saying no, and retrying is what turned
-        a rate limit into an edge block (ai/INCIDENTS #1). That one re-raises
+        a rate limit into an edge block (docs/adr/0001-tidal-rate-limits.md).
+        That one re-raises
         immediately; everything else moves down a rung.
 
         In the common case this is exactly one request, the same as before.
@@ -8882,10 +8895,10 @@ class HeadlessTidalPlayer:
         # One ticli at a time, decided before anything else touches the
         # config directory, the cache tracker or the audio backend. Two
         # instances is the other way the owner's "a primary song playing and
-        # another song playing at that same time" happens (INCIDENTS #7 is
-        # the in-process route), and they also take turns overwriting the
-        # same saved position — BUGS-2026-07-24 item 8, the half that the
-        # atomic write did not cover.
+        # another song playing at that same time" happens (the in-process
+        # route is the reap/respawn race _play_url_locked closes), and they
+        # also take turns overwriting the same saved position, which the
+        # atomic write alone does not prevent.
         self._instance_lock_fd, other = _take_instance_lock()
         if other is not None:
             named = f" (pid {other})" if other else ""

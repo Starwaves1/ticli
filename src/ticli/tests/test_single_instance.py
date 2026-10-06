@@ -1,10 +1,10 @@
 """Tests for the one-ticli-at-a-time guard.
 
-Two ticli processes is the second route to the symptom that INCIDENTS #7 was
-about: a primary song playing and another song playing at the same time. The
-in-process race is fixed; this is the other door. Two instances also take
-turns overwriting `player_state.json` — BUGS-2026-07-24 item 8, whose atomic
-write fixed *torn* files but not *clobbered* ones, and whose shared `.tmp`
+Two ticli processes is the second route to a primary song playing and another
+song playing at the same time. The in-process race (two track-starts inside one
+reap) is fixed; this is the other door. Two instances also take turns
+overwriting `player_state.json`, where the atomic write fixed *torn* files
+but not *clobbered* ones, and whose shared `.tmp`
 path means the loser's save can fail outright and be swallowed at debug level.
 
 What is asserted here is the behaviour that matters rather than the
@@ -102,7 +102,7 @@ class TestTheLockItself:
 class TestAHolderThatDies:
     """The property a pid file cannot have.
 
-    BUGS-2026-07-24 item 8 proposed a pid lockfile. A pid file has to decide
+    The obvious fix is a pid lockfile. A pid file has to decide
     whether the pid in it is still alive, and it is wrong in both directions:
     it strands the app after a crash, and it can match a recycled pid. An
     advisory flock is released by the kernel when the holder's last descriptor
