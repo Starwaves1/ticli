@@ -2488,3 +2488,55 @@ class TestARestoredRowWithALocalCopyPlaysOffline:
                            "artists": ["A"], "album": "Album"})
         assert row.album.name == "Album"
         assert getattr(row.album, "cover", None) is None
+
+
+class TestAPrefetchedRowIsResolvedOnce:
+    class _CountingSession(_FakeSession):
+        def __init__(self, gate=None):
+            super().__init__(latency=0)
+            self.track_calls = []
+            self.gate = gate
+
+        def track(self, tid):
+            self.track_calls.append(tid)
+            if self.gate is not None:
+                self.gate.wait(5)
+            return _streaming_track(tid, [])
+
+    def _player_near_the_end(self, session):
+        p = HeadlessTidalPlayer(quality="HIGH")
+        p.session = session
+        p._cache = MetadataCache(songs=True)
+        p.audio = _RecordingAudio()
+        head = _track(1)
+        p._queue = [head, CachedTrack({"id": 12, "name": "Track 12", "duration": 200})]
+        p._queue_index = 0
+        p._current_track = head
+        p._playing = True
+        p._play_start_time = None
+        p._play_offset = head.duration - 1
+        return p
+
+    def test_a_prefetched_row_costs_one_track_request(self):
+        p = self._player_near_the_end(self._CountingSession())
+        p._maybe_prefetch_next()
+        assert _wait_for(lambda: p._prefetch is not None)
+        _settle()
+        p._play_queue_index(1)
+        assert _wait_for(lambda: p.audio.plays)
+        _settle()
+        assert p.session.track_calls == [12]
+        assert not getattr(p._queue[1], "cached", False)
+
+    def test_a_queue_replaced_during_the_prefetch_is_left_alone(self):
+        gate = threading.Event()
+        p = self._player_near_the_end(self._CountingSession(gate))
+        p._maybe_prefetch_next()
+        assert _wait_for(lambda: p.session.track_calls)
+        replacement = [_track(5), _track(6)]
+        p._queue = replacement
+        gate.set()
+        assert _wait_for(lambda: p._prefetch is not None)
+        _settle()
+        assert p._queue is replacement
+        assert [t.id for t in p._queue] == [5, 6]

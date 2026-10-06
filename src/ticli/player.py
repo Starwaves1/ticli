@@ -1956,10 +1956,14 @@ class HeadlessTidalPlayer:
         self._prefetch_id = track_id
         if self._local_source(nxt)[0] is not None:
             return
+        queue, gen = self._queue, self._play_gen
 
         def _run():
             try:
                 real = self._resolve_track(nxt)
+                if real is not None and real is not nxt and self._play_gen == gen \
+                        and self._queue is queue:
+                    self._queue = [real if t is nxt else t for t in queue]
                 if real is not None:
                     url, granted = self._stream_description(real)
                     self._prefetch = (real.id, url, granted, time.time())
