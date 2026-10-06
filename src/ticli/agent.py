@@ -112,7 +112,7 @@ def _session():
     refreshed the token on the way in, the refreshed copy is saved back so
     the next invocation doesn't repeat the round trip.
     """
-    import tidalapi  # deferred: keep `ticli agent --help` instant
+    from ticli.utils.net import tidal_session  # deferred: keep `ticli agent --help` instant
 
     data = load_tokens()
     if not data:
@@ -121,7 +121,7 @@ def _session():
             "No stored TIDAL session.",
             hint="Run `ticli` interactively to log in (PKCE for FLAC).",
         )
-    session = tidalapi.Session()
+    session = tidal_session()
     try:
         session.load_oauth_session(
             data["token_type"],
