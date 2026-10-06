@@ -324,7 +324,7 @@ def compact_state(status: dict, pending: int = 0) -> dict:
     state = {"track": None if not track else {
                  "id": track.get("id"), "title": track.get("title"),
                  "artist": ", ".join(track.get("artists") or []),
-                 "pos": round(status.get("position") or 0), "dur": track.get("duration")},
+                 "pos": round(status.get("position") or 0), "dur": track.get("duration_seconds")},
              "playing": bool(status.get("playing")),
              "queue": {"len": queue.get("length", 0), "index": queue.get("index", -1)},
              "switches": {"ai": switches.get("allow_ai_control", True),

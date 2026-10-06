@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 from ticli import agentq, ipc
+from ticli import commands as command_layer
 from ticli.commands import AGENT, COMMANDS, HUMAN, tripped_error
 from ticli.utils import throttle
 from ticli.utils.config import PROTECTED_KEYS, load_config
@@ -88,6 +89,7 @@ class PlayerServer:
         sock.listen(16)
         sock.setblocking(False)
         self.listener = sock
+        command_layer.idle_hook = self.wake
         self.sel.register(sock, selectors.EVENT_READ, "accept")
         self.sel.register(self.wake_r, selectors.EVENT_READ, "wake")
 
@@ -118,7 +120,7 @@ class PlayerServer:
         busy = ((core._download_job or {}).get("state") == "running"
                 or core._download_run is not None
                 or (core._refetch_job or {}).get("state") == "running")
-        busy = busy or self.agent_queue.busy()
+        busy = busy or self.agent_queue.busy() or command_layer.in_flight() > 0
         return self.had_client and not self.clients and not core._playing and not busy
 
     def wake(self) -> None:
@@ -132,6 +134,8 @@ class PlayerServer:
             self.wake()
 
     def close(self) -> None:
+        if command_layer.idle_hook == self.wake:
+            command_layer.idle_hook = None
         for client in list(self.clients.values()):
             self._drop(client)
         if self.listener is not None:

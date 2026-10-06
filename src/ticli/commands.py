@@ -174,11 +174,36 @@ def classify(e) -> dict:
 _inline = threading.local()
 
 
+_in_flight = 0
+_in_flight_lock = threading.Lock()
+idle_hook: Optional[Callable] = None
+
+
+def in_flight() -> int:
+    return _in_flight
+
+
 def _background(fn) -> None:
+    """The player must not leave while one of these still runs (a human CLI verb
+    disconnects as soon as it is accepted); `idle_hook` wakes it when the last ends."""
     if getattr(_inline, "on", False):
         fn()
-    else:
-        threading.Thread(target=fn, daemon=True).start()
+        return
+
+    def run():
+        global _in_flight
+        try:
+            fn()
+        finally:
+            with _in_flight_lock:
+                _in_flight -= 1
+            if idle_hook is not None:
+                idle_hook()
+
+    global _in_flight
+    with _in_flight_lock:
+        _in_flight += 1
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _reraise_inline() -> None:
@@ -258,7 +283,7 @@ def _track_json(track) -> Optional[dict]:
     return {"id": getattr(track, "id", None), "title": getattr(track, "name", None),
             "artists": [a.name for a in (getattr(track, "artists", None) or [])],
             "album": getattr(album, "name", None) if album else None,
-            "duration": getattr(track, "duration", None)}
+            "duration_seconds": getattr(track, "duration", None)}
 
 
 def _play_list(p, tracks, index) -> dict:
@@ -881,7 +906,7 @@ def _record_json(record) -> dict:
     record = record if isinstance(record, dict) else {}
     return {"id": record.get("id"), "title": record.get("name"),
             "artists": record.get("artists") or [], "album": record.get("album"),
-            "duration": record.get("duration")}
+            "duration_seconds": record.get("duration")}
 
 
 def _disk_queue(state) -> tuple:
