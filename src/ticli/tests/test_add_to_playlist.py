@@ -147,6 +147,7 @@ class TestPicker:
     def test_remove_from_own_playlist(self):
         p = _make_player()
         p._mode = p.MODE_BROWSE
+        p._browse_source = ("playlist", "")
         removed = []
         p._browse_playlist = types.SimpleNamespace(
             name="Mix A", remove_by_index=lambda i: (removed.append(i), True)[-1])
@@ -162,6 +163,7 @@ class TestPicker:
     def test_remove_last_track_clamps_cursor(self):
         p = _make_player()
         p._mode = p.MODE_BROWSE
+        p._browse_source = ("playlist", "")
         p._browse_playlist = types.SimpleNamespace(
             name="Mix A", remove_by_index=lambda i: True)
         p._browse_tracks = [_fake_track(1)]
@@ -186,6 +188,7 @@ class TestPicker:
     def test_remove_failure_keeps_tracks_and_toasts(self):
         p = _make_player()
         p._mode = p.MODE_BROWSE
+        p._browse_source = ("playlist", "")
         p._browse_playlist = types.SimpleNamespace(
             name="Mix A", remove_by_index=lambda i: False)
         p._browse_tracks = [_fake_track(1), _fake_track(2)]

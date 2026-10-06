@@ -164,11 +164,12 @@ class TestActions:
 class TestHardening:
     def test_search_uses_the_query_argument_not_the_input_box(self):
         p = _player()
-        p._search_query = ""
-        seen = []
-        p._apply_search_scope = lambda: seen.append(p._search_query)
+        p._search_query = "typed"
+        asked = []
+        p.session = types.SimpleNamespace(search=lambda q, **kw: asked.append(q) or {"tracks": [_track(7)]})
         result = p.commands.execute("search", {"query": "x"}, caller=HUMAN)
-        assert result["ok"] and seen == ["x"] and p._search_query == "x"
+        assert result["ok"] and asked == ["x"]
+        assert [t.id for t in result["result"]["tracks"]] == [7]
 
     def test_a_raising_danger_predicate_is_a_structured_error(self, monkeypatch):
         p = _player()

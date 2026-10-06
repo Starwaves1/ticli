@@ -54,8 +54,8 @@ def cli(ctx, quality, login_flow):
     # player's import chain still stays out of `--help`.
     if ctx.invoked_subcommand is not None:
         return
-    from ticli.player import HeadlessTidalPlayer
-    HeadlessTidalPlayer(quality=quality, login_flow=login_flow).run()
+    from ticli.player import run_tui
+    run_tui(quality=quality, login_flow=login_flow)
 
 
 @cli.group()

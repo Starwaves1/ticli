@@ -396,6 +396,10 @@ def _restore_sleep(seconds: float) -> None:
 QUALITY_RANK = {"LOW": 0, "HIGH": 1, "LOSSLESS": 2, "HI_RES_LOSSLESS": 3}
 
 IDLE_POLL_SECONDS = 0.5
+# Wake just past a second boundary so the displayed second has already turned.
+SECOND_EDGE = 0.005
+SUBSCRIBE_TIMEOUT = 10.0
+STOP_TIMEOUT = 5.0
 KEY_REPEAT_WINDOW = 0.15
 # tidalapi documents no more than 300 items behind any one query.
 SEARCH_MAX_OFFSET = 300
@@ -497,6 +501,16 @@ def _write_hls_playlist(track_id, playlist: str) -> str:
     except OSError:
         pass
     return str(path)
+
+
+def _wire_job(job) -> Optional[dict]:
+    """A download job as plain data: slots unfrozen, the monitor's private rate marks dropped."""
+    if not job:
+        return None
+    plain = dict(job)
+    if "slots" in plain:
+        plain["slots"] = [{k: v for k, v in slot.items() if k != "mark"} for slot in plain["slots"]]
+    return plain
 
 
 class _DownloadSuperseded(Exception):
@@ -1284,6 +1298,7 @@ class AudioPlayer:
             return self.player_cmd != "mpv" or self._process_alive
 
 class HeadlessTidalPlayer:
+    remote = None
     MODE_PLAYER = "player"
     MODE_SEARCH = "search"
     MODE_BROWSE = "browse"
@@ -1347,8 +1362,19 @@ class HeadlessTidalPlayer:
         "MAX": "24/192 FLAC",
     }
 
-    def __init__(self, quality: Optional[str] = None, login_flow: Optional[str] = None):
+    def __init__(self, quality: Optional[str] = None, login_flow: Optional[str] = None,
+                 remote=None):
         self.console = Console()
+        # Set when this instance is a TUI attached to the background player (ADR-0008).
+        self.remote = remote
+        self._mirror: dict = {}
+        self._pending: dict = {}
+        self._known: dict = {}
+        self._lists: dict = {}
+        self._tick_hook = None
+        self._quitting = False
+        self._logged_out = False
+        self.start_failure = None
         self.session = tidal_session()
         flow = (login_flow or LOGIN_FLOWS[0]).lower()
         self._login_flow = flow if flow in LOGIN_FLOWS else LOGIN_FLOWS[0]
@@ -1491,7 +1517,7 @@ class HeadlessTidalPlayer:
             return f"{first} {last}" if last else first
         return getattr(u, "username", None) or getattr(u, "email", None) or f"User {u.id}"
 
-    def _login(self) -> bool:
+    def _login(self, interactive: bool = True) -> bool:
         data = load_tokens()
         if data:
             try:
@@ -1510,6 +1536,9 @@ class HeadlessTidalPlayer:
                     return True
             except Exception as e:
                 logger.debug("Failed to load saved session: %s", e)
+
+        if not interactive:
+            return False
 
         if self._login_flow == "pkce":
             if self._login_pkce():
@@ -1609,6 +1638,17 @@ class HeadlessTidalPlayer:
         return False
 
     def _upgrade_to_pkce(self) -> None:
+        if self.remote is not None:
+            # The paste needs this terminal; the player then loads the tokens it saved.
+            if self._is_pkce():
+                return
+            with self._suspended_tui():
+                upgraded = self._login_pkce() and self._finish_login()
+            if upgraded:
+                self._run("login.reload")
+            else:
+                self._set_toast("Sign-in cancelled — still signed in as before")
+            return
         if self.session.is_pkce:
             return
         with self._suspended_tui():
@@ -1670,10 +1710,218 @@ class HeadlessTidalPlayer:
             pass
 
     def _run(self, command: str, /, **args) -> dict:
-        return self.commands.execute(command, args, caller=HUMAN)
+        if self.remote is None:
+            return self.commands.execute(command, args, caller=HUMAN)
+        self._pending[self.remote.send(command, args)] = self._remote_refusal
+        return {"ok": True, "result": {"accepted": True}}
+
+    def _remote_refusal(self, response: dict) -> None:
+        if not response.get("ok"):
+            self._set_toast(response.get("reason") or "The player refused that",
+                            seconds=PLAYER_ERROR_SECONDS)
+        self._forget_disk_views()
+
+    def _fetch(self, command: str, args: dict, done, known=()) -> None:
+        """Run a read that may hit TIDAL off the input path; `done(response)` gets
+        `{"ok", "result"}` or `{"ok": False, "reason"}`. TIDAL calls live in commands.py."""
+        for kind, obj in known:
+            self._remember(kind, [obj])
+        if self.remote is not None:
+            self._pending[self.remote.send(command, args)] = done
+            return
+
+        def _work():
+            try:
+                response = self.commands.execute(command, args, caller=HUMAN)
+            except Exception as e:
+                response = {"ok": False, "code": "failed", "reason": str(e)}
+            try:
+                done(response)
+            finally:
+                self._wake()
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    KNOWN_MAX = 20000
+
+    def _remember(self, kind: str, objs) -> None:
+        known = self._known
+        for obj in objs or ():
+            if obj is not None:
+                known[(kind, self._obj_id(obj))] = obj
+        while len(known) > self.KNOWN_MAX:
+            known.pop(next(iter(known)))
+
+    def _list_changed(self, source: tuple, tracks: list) -> None:
+        if source in self._lists:
+            self._lists[source] = list(tracks)
+        if self._browse_source == source:
+            self._browse_tracks = list(tracks)
+            self._browse_cursor = min(self._browse_cursor, len(tracks) - 1)
+        if self._list_hook is not None:
+            self._list_hook(source, tracks)
+
+    _list_hook = None
+
+    def _is_editable(self, playlist) -> bool:
+        if isinstance(playlist, tidalapi.UserPlaylist):
+            return True
+        return self.remote is not None and bool(getattr(playlist, "editable", False))
+
+    @staticmethod
+    def _editable_type():
+        return tidalapi.UserPlaylist
+
+    def _stop_playback(self) -> None:
+        self._shutdown()
+        self._playing = False
+        self._play_start_time = None
+
+    def _reload_login(self) -> None:
+        data = load_tokens()
+        if not data:
+            raise RuntimeError("No saved login to load")
+        self.session.load_oauth_session(
+            data["token_type"], data["access_token"], data.get("refresh_token"),
+            data.get("expiry_time"), is_pkce=data.get("is_pkce", False))
+        self._quality_ceiling = None
+        self._set_toast(
+            "Signed in for higher quality — songs already cached still play "
+            "as before; [x] clears them", seconds=6)
+
+    def _is_pkce(self) -> bool:
+        if self.remote is not None:
+            return bool(self._mirror.get("pkce"))
+        return bool(self.session.is_pkce)
+
+    def _backend_name(self) -> Optional[str]:
+        if self.remote is not None:
+            return self._mirror.get("backend")
+        return self.audio.player_cmd if self.audio else None
+
+    # ── the player's state as the TUI sees it (ADR-0008) ──
+
+    def snapshot(self) -> dict:
+        job = self._download_job
+        run = self._download_run
+        spec = get_spec("volume")
+        return {
+            "track": self._current_track,
+            "queue": list(self._queue),
+            "queue_index": self._queue_index,
+            "clock": [bool(self._playing), self._play_offset, self._play_start_time],
+            "liked": sorted(self._liked_ids, key=str),
+            "toast": [self._toast, self._toast_until],
+            "quality": self._quality_name,
+            "ceiling": self._quality_ceiling,
+            "badge": self._playing_badge,
+            "user": self._user_display_name,
+            "pkce": bool(getattr(self.session, "is_pkce", False)),
+            "config": {k: v for k, v in self.config.items() if k not in PROTECTED_KEYS},
+            "switches": {k: bool(coerce(get_spec(k), self.config.get(k))) for k in PROTECTED_KEYS},
+            "backend": self._backend_name(),
+            "volume_ceiling": self._setting_ceiling(spec),
+            "download_job": _wire_job(job),
+            "download_run": run is not None,
+            "download_queued": sorted(self._download_queued_ids(), key=str),
+            "refetch_job": _wire_job(self._refetch_job),
+            "editable_playlists": list(self._editable_playlists),
+            "last_playlist_id": self._last_playlist_id,
+            "picker_busy": bool(self._picker_busy),
+            "remove_busy": bool(self._browse_remove_busy),
+            "history": list(self._search_history),
+        }
+
+    def _apply_state(self, state: dict) -> None:
+        mirror = self._mirror
+        for key, value in state.items():
+            mirror[key] = value
+            if key == "track":
+                self._current_track = value
+            elif key == "queue":
+                self._queue = list(value)
+                self._queue_cursor = max(0, min(self._queue_cursor, len(self._queue) - 1))
+            elif key == "queue_index":
+                self._queue_index = value
+            elif key == "clock":
+                self._playing, self._play_offset, self._play_start_time = value
+            elif key == "liked":
+                self._liked_ids = set(value)
+            elif key == "toast":
+                self._toast, self._toast_until = value
+            elif key == "quality":
+                self._quality_name = value
+            elif key == "ceiling":
+                self._quality_ceiling = value
+            elif key == "badge":
+                self._playing_badge = value
+            elif key == "user":
+                self._user_display_name = value
+            elif key == "config":
+                for name, setting in value.items():
+                    if self.config.get(name) != setting:
+                        self.config[name] = setting
+                        self._apply_ui_setting(name, setting)
+            elif key == "switches":
+                for name, on in value.items():
+                    if name != "ai_control_key":
+                        self.config[name] = on
+                    elif bool(self.config.get(name)) != on:
+                        # A stand-in: the hash stays on disk, never on the socket.
+                        self.config[name] = {"salt": "-", "hash": "-"} if on else None
+            elif key in ("download_job", "refetch_job"):
+                setattr(self, "_" + key, value)
+                self._forget_disk_views()
+            elif key == "download_run":
+                self._download_run = True if value else None
+            elif key == "editable_playlists":
+                self._editable_playlists = list(value)
+                self._editable_playlists_time = time.time()
+            elif key == "last_playlist_id":
+                self._last_playlist_id = value
+            elif key == "picker_busy":
+                self._picker_busy = value
+            elif key == "remove_busy":
+                self._browse_remove_busy = value
+            elif key == "history":
+                self._search_history = list(value)
+                if self._search_history_cursor is not None:
+                    self._search_history_cursor = min(self._search_history_cursor,
+                                                      len(value) - 1) if value else None
+
+    def _apply_ui_setting(self, key: str, value) -> None:
+        if key == "quality":
+            self._quality_name = value
+        elif key == "page_size":
+            self._page_size = value
+        elif key == "progress_bar_max":
+            self._bar_max = value
+        elif key == "show_artwork":
+            self._show_artwork = value
+            if not value:
+                self._artwork = None
+                self._artwork_request = None
+
+    def _on_message(self, message: dict) -> None:
+        if message.get("event") == "state":
+            self._apply_state(message.get("state") or {})
+        elif message.get("event") == "list":
+            source = tuple(message.get("source") or ())
+            self._list_changed(source, message.get("tracks") or [])
+        elif "id" in message:
+            done = self._pending.pop(message["id"], None)
+            if done is not None:
+                done(message)
+
+    def _forget_disk_views(self) -> None:
+        self._forget_downloads()
+        self._cache.invalidate_audio_count()
 
     def _logout(self):
         self._run("logout")
+        if self.remote is not None:
+            self._logged_out = True
+            self.running = False
 
     def _note_agent_action(self, what: str) -> None:
         self._set_toast(f"agent: {what}")
@@ -2324,6 +2572,8 @@ class HeadlessTidalPlayer:
                 last_save = time.time()
             if self.audio:
                 self._handle_media_key(self.audio.poll_media_key())
+            if self._tick_hook is not None:
+                self._tick_hook()
             time.sleep(0.5)
 
     def _track_duration(self):
@@ -3116,7 +3366,7 @@ class HeadlessTidalPlayer:
 
     def _build_pkce_line(self) -> Text:
         line = Text()
-        if self.session.is_pkce:
+        if self._is_pkce():
             line.append("\n   PKCE login ")
             line.append("✓", style="green")
             line.append("   Max quality available", style="dim")
@@ -3411,8 +3661,9 @@ class HeadlessTidalPlayer:
         notes = []
         if value >= 105:
             notes.append("louder than the master — quality suffers")
-        if self.audio and ceiling < spec["max"]:
-            notes.append(f"{self.audio.player_cmd} caps at {ceiling}%")
+        backend = self._backend_name()
+        if backend and ceiling < spec["max"]:
+            notes.append(f"{backend} caps at {ceiling}%")
         if notes and fit.hint_rows > 1:
             rows.append(Text(" " * INDENT + "  ".join(notes), style="blue"))
 
@@ -3996,7 +4247,11 @@ class HeadlessTidalPlayer:
         if not query:
             return
         self._add_to_history(query)
-        self._run("search", query=query)
+        if self.remote is not None:
+            self._run("history.add", query=query)
+        self._reset_search_results()
+        self._search_key = query
+        self._apply_search_scope()
 
     def _apply_search_scope(self):
         query = self._search_query.strip()
@@ -4029,15 +4284,15 @@ class HeadlessTidalPlayer:
     def _fetch_search_page(self, query: str, gen: int):
         page = self._page_size
         offset = self._search_reservoir["offset"]
-        models = self._search_models()
         self._search_last_fetch = time.monotonic()
 
-        def _run():
+        def _done(response):
             try:
-                # TIDAL applies `limit` per type, so one request at the page size covers every category.
-                results = self.session.search(query, models=models, limit=page, offset=offset)
                 if gen != self._search_gen:
                     return
+                if not response.get("ok"):
+                    raise RuntimeError(response.get("reason") or "no answer")
+                results = response["result"]
                 reservoir = self._search_reservoir
                 found = {kind: list(results.get(kind) or []) for kind in ("tracks", "albums", "artists", "playlists")}
                 # There is never more than 300 items behind a query.
@@ -4058,9 +4313,9 @@ class HeadlessTidalPlayer:
                 # Only while this is still the query being searched: a superseded fetch must not open the gate.
                 if gen == self._search_gen:
                     self._search_fetching = False
-                self._wake()
 
-        threading.Thread(target=_run, daemon=True).start()
+        # TIDAL applies `limit` per type, so one request at the page size covers every category.
+        self._fetch("search", {"query": query, "limit": page, "offset": offset}, _done)
 
     def _search_more(self):
         scope = self._search_filter
@@ -4134,24 +4389,26 @@ class HeadlessTidalPlayer:
         self._push_nav()
         self._mode = self.MODE_BROWSE
         self._browse_playlist = None
-        self._browse_source = ("album", self._obj_id(album))
+        source = ("album", self._obj_id(album))
+        self._browse_source = source
         self._browse_title = album.name
         self._browse_tracks = []
         self._browse_cursor = -1
         self._browse_loading = True
         self._browse_message = ""
 
-        def _run():
-            try:
-                self._browse_tracks = list(album.tracks())
+        def _done(response):
+            if self._browse_source != source:
+                return
+            if response.get("ok"):
+                self._browse_tracks = list(response["result"]["tracks"])
                 if not self._browse_tracks:
                     self._browse_message = "No tracks found"
-            except Exception:
+            else:
                 self._browse_message = "Failed to load album"
-            finally:
-                self._browse_loading = False
+            self._browse_loading = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._fetch("album.tracks", {"id": source[1]}, _done, known=[("album", album)])
 
     def _open_artist(self, artist):
         self._push_nav()
@@ -4198,19 +4455,18 @@ class HeadlessTidalPlayer:
         limit = max(20, self._page_size)
         self._artist_sections = {**self._artist_sections, key: {"state": "loading", "items": [], "message": ""}}
 
-        def _run():
-            try:
-                items = self._fetch_artist_section(artist, section, limit)
-            except Exception:
-                record = {"state": "failed", "items": [], "message": self.ARTIST_SECTION_FAILED[section]}
-            else:
+        def _done(response):
+            if response.get("ok"):
+                items = list(response["result"]["items"])
                 record = {"state": "ready", "items": items,
                           "message": "" if items else self.ARTIST_SECTION_EMPTY[section]}
+            else:
+                record = {"state": "failed", "items": [], "message": self.ARTIST_SECTION_FAILED[section]}
             # Whole-dict assignment: the paint thread only reads complete records.
             self._artist_sections = {**self._artist_sections, key: record}
-            self._wake()
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._fetch("artist.section", {"id": key[0], "section": section, "limit": limit},
+                    _done, known=[("artist", artist)])
 
     def _fetch_artist_section(self, artist, section: str, limit: int) -> list:
         if section == "tracks":
@@ -4298,30 +4554,29 @@ class HeadlessTidalPlayer:
         self._playlists_cursor = 0
         self._playlists_message = ""
 
-        def _run():
+        def _done(response):
             try:
-                fresh = list(self.session.user.playlists() or [])
+                if not response.get("ok"):
+                    if not self._playlists:
+                        self._playlists_message = "Failed to load playlists"
+                    return
+                fresh = list(response["result"]["playlists"])
                 self._playlists = fresh
                 if self._playlists_cursor >= len(fresh):
                     self._playlists_cursor = max(0, len(fresh) - 1)
                 if not fresh:
                     self._playlists_message = "No playlists found"
-                self._cache.put_playlists(fresh, editable_type=tidalapi.UserPlaylist)
-            except Exception:
-                if not self._playlists:
-                    self._playlists_message = "Failed to load playlists"
             finally:
                 self._playlists_loading = False
-                self._wake()
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._fetch("library.playlists", {}, _done)
 
     def _open_playlist(self, playlist):
         self._push_nav()
         self._mode = self.MODE_BROWSE
         playlist_id = self._obj_id(playlist)
         self._browse_source = ("playlist", playlist_id)
-        self._browse_playlist = playlist if isinstance(playlist, tidalapi.UserPlaylist) else None
+        self._browse_playlist = playlist if self._is_editable(playlist) else None
         self._browse_title = playlist.name if hasattr(playlist, "name") else "Playlist"
         cached = self._cache.get_playlist_tracks(playlist_id) if playlist_id else None
         self._browse_tracks = cached or []
@@ -4331,30 +4586,25 @@ class HeadlessTidalPlayer:
 
         title = self._browse_title
 
-        def _run():
+        def _done(response):
             try:
-                live = playlist
-                if getattr(playlist, "cached", False):
-                    live = self.session.playlist(playlist_id)
-                    if isinstance(live, tidalapi.UserPlaylist):
-                        self._browse_playlist = live
-                tracks = list(live.tracks() or [])
-                if playlist_id:
-                    self._cache.put_playlist_tracks(playlist_id, tracks)
+                if not response.get("ok"):
+                    if not self._browse_tracks:
+                        self._browse_message = "Failed to load playlist"
+                    return
+                live, tracks = response["result"]["playlist"], list(response["result"]["tracks"])
+                if self._browse_source == ("playlist", playlist_id) and self._is_editable(live):
+                    self._browse_playlist = live
                 if self._browse_title != title:
                     return
                 self._browse_tracks = tracks
                 self._browse_cursor = min(self._browse_cursor, len(tracks) - 1)
                 if not tracks:
                     self._browse_message = "Playlist is empty"
-            except Exception:
-                if not self._browse_tracks:
-                    self._browse_message = "Failed to load playlist"
             finally:
                 self._browse_loading = False
-                self._wake()
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._fetch("playlist.tracks", {"id": playlist_id}, _done, known=[("playlist", playlist)])
 
     def _remove_from_queue(self):
         if not self._queue or self._queue_cursor >= len(self._queue):
@@ -4368,7 +4618,8 @@ class HeadlessTidalPlayer:
         if pl is None or not self._browse_tracks or self._browse_cursor < 0:
             return
         # A removal in flight is refused inside: indices would shift
-        self._run("playlist.remove", id=self._obj_id(pl), index=self._browse_cursor)
+        self._run("playlist.remove", id=self._obj_id(pl), index=self._browse_cursor,
+                  track_id=getattr(self._browse_tracks[self._browse_cursor], "id", None))
 
     def _set_toast(self, msg: str, seconds: float = 2.5):
         self._toast = msg
@@ -4435,7 +4686,7 @@ class HeadlessTidalPlayer:
         track_id = getattr(track, "id", None)
         if job and not running and job.get("track_id") != track_id:
             self._download_job = None
-        if not running:
+        if not running and self.remote is None:
             # Exact name only: the one deletion this feature ever performs under the music folder.
             self._discard_staging(track_id)
 
@@ -4551,6 +4802,8 @@ class HeadlessTidalPlayer:
                      for _ in range(DOWNLOAD_WORKERS))
 
     def _download_queued_ids(self) -> set:
+        if self.remote is not None:
+            return set(self._mirror.get("download_queued") or ())
         run = self._download_run
         if run is None:
             return set()
@@ -5051,21 +5304,12 @@ class HeadlessTidalPlayer:
         if not self._editable_playlists or time.time() - self._editable_playlists_time > 60:
             self._picker_loading = True
 
-            def _run():
-                try:
-                    playlists = self.session.user.playlists()
-                    self._editable_playlists = [
-                        p for p in (playlists or []) if isinstance(p, tidalapi.UserPlaylist)
-                    ]
-                    self._editable_playlists_time = time.time()
-                    if not self._editable_playlists:
-                        self._picker_cursor = -1
-                except Exception:
-                    pass
-                finally:
-                    self._picker_loading = False
+            def _done(response):
+                if response.get("ok") and not self._editable_playlists:
+                    self._picker_cursor = -1
+                self._picker_loading = False
 
-            threading.Thread(target=_run, daemon=True).start()
+            self._fetch("library.playlists", {}, _done)
 
     def _picker_add_to(self, playlist):
         if self._picker_busy:
@@ -5090,6 +5334,8 @@ class HeadlessTidalPlayer:
     def _setting_ceiling(self, spec: dict) -> int:
         if spec["key"] != "volume":
             return spec["max"]
+        if self.remote is not None:
+            return self._mirror.get("volume_ceiling") or min(spec["max"], SAFE_VOLUME_CEILING)
         if not self.audio:
             return min(spec["max"], SAFE_VOLUME_CEILING)
         try:
@@ -5121,7 +5367,15 @@ class HeadlessTidalPlayer:
         if value == self.config.get(spec["key"], spec["default"]):
             return
         self.config[spec["key"]] = value
-        save_config(self.config)
+        if self.remote is None:
+            save_config(self.config)
+        else:
+            # The mirrored config never carries the key hash: write the file's own copy, then
+            # have the player re-read the switches. Not a command: none may write these.
+            on_disk = load_config()
+            on_disk[spec["key"]] = value
+            save_config(on_disk)
+            self.remote.send("reload_switches")
         self._set_toast(f"{spec['label']}: {display_value(spec, value)}")
 
     def _change_setting(self, step: int):
@@ -5195,6 +5449,7 @@ class HeadlessTidalPlayer:
 
         if self._quit_pending:
             if key == KEY_ESC:
+                self._quitting = True
                 self.running = False
             else:
                 self._quit_pending = False
@@ -5374,7 +5629,7 @@ class HeadlessTidalPlayer:
         elif key == "p":
             self._enter_mode(self.MODE_PLAYLISTS)
             if not self._playlists and not self._playlists_loading:
-                self._run("library.playlists")
+                self._load_playlists()
         elif key == "c":
             self._enter_mode(self.MODE_SETTINGS)
             self._settings_cursor = 0
@@ -5447,6 +5702,8 @@ class HeadlessTidalPlayer:
         elif key in (KEY_BACKSPACE, KEY_BACKSPACE2):
             if history and self._search_history_cursor is not None:
                 idx = self._search_history_cursor
+                if self.remote is not None:
+                    self._run("history.forget", query=history[idx])
                 self._search_history = self._search_history[:idx] + self._search_history[idx + 1:]
                 remaining = self._history_rows()
                 self._search_history_cursor = min(idx, len(remaining) - 1) if remaining else None
@@ -5665,12 +5922,16 @@ class HeadlessTidalPlayer:
         watch = [sys.stdin]
         if self._wake_r is not None:
             watch.append(self._wake_r)
+        if self.remote is not None:
+            watch.append(self.remote)
         ready = select_mod.select(watch, [], [], timeout)[0]
         if self._wake_r is not None and self._wake_r in ready:
             try:
                 os.read(self._wake_r, 4096)
             except OSError:
                 pass
+        if self.remote is not None and self.remote in ready:
+            self._drain_remote()
         if sys.stdin not in ready:
             return []
         data = os.read(sys.stdin.fileno(), 1024)
@@ -5702,8 +5963,29 @@ class HeadlessTidalPlayer:
         # Repaints are driven by _repaint, not auto_refresh.
         return Live(self._build_display(), console=self.console, auto_refresh=False, screen=True)
 
-    def run(self):
-        # One ticli at a time, decided before anything touches config, cache tracker or audio backend; two instances overwrite the same saved position.
+    def _drain_remote(self) -> None:
+        for message in self.remote.read_messages():
+            self._on_message(message)
+        if self.remote.closed:
+            self.running = False
+
+    def _wait_timeout(self, now: Optional[float] = None) -> Optional[float]:
+        """How long the TUI may sleep: to the next displayed second while playing, to a
+        toast's end while one shows, else until input or an event (ADR-0003)."""
+        now = time.time() if now is None else now
+        waits = []
+        if self._playing and self._play_start_time and self._current_track is not None:
+            position = self._play_offset + (now - self._play_start_time)
+            waits.append(int(position) + 1 - position + SECOND_EDGE)
+        if self._toast and self._toast_until > now:
+            waits.append(self._toast_until - now + SECOND_EDGE)
+        return max(0.0, min(waits)) if waits else None
+
+    def start(self, interactive: bool = True) -> bool:
+        """Bring up the player core: lock, backend, login, saved state, monitor.
+        `start_failure` says why not: "running", "login", or an error line."""
+        self.start_failure = None
+        # One player at a time, decided before anything touches config, cache tracker or audio backend; two instances overwrite the same saved position.
         self._instance_lock_fd, other = _take_instance_lock()
         if other is not None:
             named = f" (pid {other})" if other else ""
@@ -5711,18 +5993,21 @@ class HeadlessTidalPlayer:
             stop = f", or stop it with: kill {other}" if other else "."
             self.console.print(f"[red]ticli is already running{named}.[/red]\n"
                                f"Switch to its terminal{stop}")
-            return
+            self.start_failure = "running"
+            return False
 
         player_cmd = _find_audio_player()
         if not player_cmd:
             self.console.print("[red]No audio player found. Install mpv or ffplay.[/red]")
-            return
+            self.start_failure = "error: no audio player found; install mpv or ffplay"
+            return False
         self.audio = AudioPlayer(player_cmd, volume=self.config["volume"], cache=self._cache)
         # Saved volume may predate the backend: 250% written next to mpv, read where only ffplay exists.
         self._clamp_volume_to_backend()
 
-        if not self._login():
-            return
+        if not self._login(interactive):
+            self.start_failure = "login" if not interactive else "error: login failed"
+            return False
 
         self._reconcile_cache()
 
@@ -5730,10 +6015,29 @@ class HeadlessTidalPlayer:
 
         self._restore_state()
 
-        monitor = threading.Thread(target=self._monitor_playback, daemon=True)
-        monitor.start()
+        threading.Thread(target=self._monitor_playback, daemon=True).start()
+        return True
 
-        # SIGHUP/SIGTERM must still exit the main loop so the finally block saves state and stops audio.
+    def run(self):
+        """The TUI, attached to the background player over `self.remote`."""
+        import tty
+        import termios
+        import select
+
+        if not sys.stdin.isatty():
+            self.console.print("[red]Player requires an interactive terminal.[/red]")
+            return
+        remote = self.remote
+        remote.wait_for(remote.send("subscribe"), timeout=SUBSCRIBE_TIMEOUT)
+        held, remote.held = remote.held, []
+        for message in held:
+            self._on_message(message)
+        if remote.closed or not self._mirror:
+            self.console.print("[red]The player did not answer.[/red] "
+                               f"[dim]Its log: {player_log_path()}[/dim]")
+            return
+
+        # SIGHUP/SIGTERM leave the player playing: only quitting stops it.
         def _on_signal(signum, frame):
             self.running = False
         for _sig in (signal.SIGTERM, signal.SIGHUP):
@@ -5749,14 +6053,6 @@ class HeadlessTidalPlayer:
             signal.signal(signal.SIGWINCH, _on_resize)
         except (AttributeError, ValueError, OSError):
             pass
-
-        import tty
-        import termios
-        import select
-
-        if not sys.stdin.isatty():
-            self.console.print("[red]Player requires an interactive terminal.[/red]")
-            return
 
         try:
             self._wake_r, self._wake_w = os.pipe()
@@ -5774,7 +6070,7 @@ class HeadlessTidalPlayer:
                 self._live = live
                 self._repaint(live, force=True)
                 while self.running:
-                    keys = self._read_keys(select)
+                    keys = self._read_keys(select, timeout=self._wait_timeout())
                     for key in keys:
                         self._handle_key(key)
                         if not self.running:
@@ -5786,7 +6082,11 @@ class HeadlessTidalPlayer:
             self._live = None
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
             self._tty_settings = None
-            self._shutdown()
+            if self._quitting and not remote.closed:
+                # Quit means quit: the player stops and saves, then leaves once nobody needs it.
+                remote.request("stop", timeout=STOP_TIMEOUT)
+            lost = remote.closed and not self._quitting and not self._logged_out
+            remote.close()
             for fd in (self._wake_r, self._wake_w):
                 try:
                     if fd is not None:
@@ -5795,7 +6095,40 @@ class HeadlessTidalPlayer:
                     pass
             self._wake_r = self._wake_w = None
 
-        self.console.print("[dim]Player closed.[/dim]")
+        if self._logged_out:
+            self.console.print("[yellow]Logged out. Tokens cleared.[/yellow]")
+        elif lost:
+            self.console.print("[red]The player stopped.[/red] "
+                               f"[dim]Its log: {player_log_path()}[/dim]")
+        elif self._quitting:
+            self.console.print("[dim]Player closed.[/dim]")
+        else:
+            self.console.print("[dim]Detached; the player keeps playing. Run ticli to return.[/dim]")
+
+
+def run_tui(quality: Optional[str] = None, login_flow: Optional[str] = None) -> None:
+    """`ticli`: attach to the background player, starting it first if needed."""
+    from ticli import ipc
+    console = Console()
+    if not sys.stdin.isatty():
+        console.print("[red]Player requires an interactive terminal.[/red]")
+        return
+    conn, status = ipc.connect_or_start(quality, login_flow)
+    if conn is None and status == "login":
+        # The player has no terminal, so a first sign-in happens here, then it starts again.
+        if not HeadlessTidalPlayer(quality=quality, login_flow=login_flow)._login():
+            return
+        conn, status = ipc.connect_or_start(quality, login_flow)
+    if conn is None:
+        console.print(f"[red]Could not start the player:[/red] {status}")
+        return
+    HeadlessTidalPlayer(quality=quality, login_flow=login_flow, remote=conn).run()
+
+
+def player_log_path():
+    from ticli import ipc
+    return ipc.log_path()
+
 
 def main():
     from ticli.cli import main as _main

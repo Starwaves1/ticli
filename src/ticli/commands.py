@@ -24,6 +24,8 @@ from ticli.utils.config import (
 HUMAN = "human"
 AGENT = "agent"
 
+ARTIST_SECTIONS = ("tracks", "albums", "playlists", "suggestions")
+
 WRONG_KEY_DELAY_SECONDS = 1.0
 
 _NEVER_EDIT = ("Only your human can change this, in ticli's TUI settings ([c]). "
@@ -142,11 +144,25 @@ def _tracks(p, ids, *first) -> list:
                 known.setdefault(_sid(track), track)
     tracks = []
     for tid in ids:
-        track = known.get(str(tid))
+        track = known.get(str(tid)) or p._known.get(("track", str(tid)))
         if track is None:
             track = p.session.track(tid)
         tracks.append(track)
     return tracks
+
+
+def _known(p, kind, obj_id):
+    return p._known.get((kind, str(obj_id)))
+
+
+def _list(p, source):
+    """The tracks of a list this player fetched or the TUI shows, else None."""
+    tracks = p._lists.get(source)
+    if tracks:
+        return list(tracks)
+    if p._browse_source == source and p._browse_tracks:
+        return list(p._browse_tracks)
+    return None
 
 
 def _ids(args, field="track_ids") -> list:
@@ -272,33 +288,44 @@ def _play_track_cmd(p, args) -> dict:
 
 def _play_album(p, args) -> dict:
     album_id = str(args.get("id", ""))
-    if p._browse_source == ("album", album_id) and p._browse_tracks:
-        tracks = list(p._browse_tracks)
-    else:
-        tracks = list(p.session.album(album_id).tracks())
+    tracks = _list(p, ("album", album_id))
+    if tracks is None:
+        album = _known(p, "album", album_id) or p.session.album(album_id)
+        tracks = list(album.tracks())
     return _play_list(p, tracks, _index(args))
 
 
 def _play_playlist(p, args) -> dict:
     playlist_id = str(args.get("id", ""))
-    if p._browse_source == ("playlist", playlist_id) and p._browse_tracks:
-        tracks = list(p._browse_tracks)
-    else:
+    tracks = _list(p, ("playlist", playlist_id))
+    if tracks is None:
         tracks = (p._cache.get_playlist_tracks(playlist_id)
                   or list(p.session.playlist(playlist_id).tracks()))
     return _play_list(p, tracks, _index(args))
 
 
+def _artist_section_arg(args) -> str:
+    section = args.get("section", "tracks")
+    if section not in ARTIST_SECTIONS:
+        raise CommandError("bad_args", "section must be one of " + ", ".join(ARTIST_SECTIONS) + ".")
+    return section
+
+
 def _play_artist(p, args) -> dict:
     artist_id = str(args.get("id", ""))
-    section = args.get("section", "tracks")
+    section = _artist_section_arg(args)
     if section not in ("tracks", "suggestions"):
         raise CommandError("bad_args", "section must be tracks or suggestions.")
+    tracks = p._lists.get(("artist:" + section, artist_id))
     record = p._artist_sections.get((artist_id, section))
-    if record and record["state"] == "ready":
+    if tracks:
+        tracks = list(tracks)
+    elif record and record["state"] == "ready":
         tracks = [row["obj"] for row in record["items"] if row["type"] == "track"]
     else:
-        tracks = p._fetch_artist_section(p.session.artist(artist_id), section, 50)
+        artist = _known(p, "artist", artist_id) or p.session.artist(artist_id)
+        tracks = [row["obj"] for row in p._fetch_artist_section(artist, section, 50)
+                  if row["type"] == "track"]
     return _play_list(p, tracks, _index(args))
 
 
@@ -341,7 +368,9 @@ def _playlist_add(p, args) -> dict:
         raise CommandError("busy", "A playlist change is still in flight.")
     playlist_id = args.get("id", "")
     ids = [str(t) for t in _ids(args)]
-    playlist = args.get("playlist") or _editable_playlist(p, playlist_id)
+    playlist = args.get("playlist")
+    if not hasattr(playlist, "add"):
+        playlist = _editable_playlist(p, playlist_id) or _known(p, "playlist", playlist_id)
     p._picker_busy = True
 
     def _run():
@@ -405,22 +434,27 @@ def _playlist_create(p, args) -> dict:
 def _playlist_remove(p, args) -> dict:
     playlist_id = str(args.get("id", ""))
     index = _index(args, None)
-    pl = p._browse_playlist
-    if pl is None or _sid(pl) != playlist_id:
-        raise CommandError("not_open", "Removing needs the playlist open in the TUI.")
-    if not 0 <= index < len(p._browse_tracks):
+    source = ("playlist", playlist_id)
+    pl = _known(p, "playlist", playlist_id)
+    if pl is None and p._browse_playlist is not None and _sid(p._browse_playlist) == playlist_id:
+        pl = p._browse_playlist
+    tracks = _list(p, source)
+    if pl is None or not hasattr(pl, "remove_by_index") or tracks is None:
+        raise CommandError("not_loaded", "Open that playlist first so its rows are known.",
+                           "Run playlist.tracks with its id, then remove by index.")
+    if not 0 <= index < len(tracks):
         raise CommandError("bad_args", "No track at that index.")
+    track = tracks[index]
+    if "track_id" in args and str(args["track_id"]) != _sid(track):
+        raise CommandError("stale", "That playlist changed; reopen it before removing.")
     if p._browse_remove_busy:
         raise CommandError("busy", "A removal is still in flight.")
-    track = p._browse_tracks[index]
     p._browse_remove_busy = True
 
     def _run():
         try:
             if pl.remove_by_index(index):
-                remaining = [t for i, t in enumerate(p._browse_tracks) if i != index]
-                p._browse_tracks = remaining
-                p._browse_cursor = min(p._browse_cursor, len(remaining) - 1)
+                p._list_changed(source, [t for i, t in enumerate(tracks) if i != index])
                 p._set_toast(f'Removed "{track.name}" from {pl.name}')
             else:
                 p._set_toast("Failed to remove from playlist")
@@ -428,6 +462,7 @@ def _playlist_remove(p, args) -> dict:
             p._set_toast("Failed to remove from playlist")
         finally:
             p._browse_remove_busy = False
+            p._wake()
 
     threading.Thread(target=_run, daemon=True).start()
     return {"accepted": True}
@@ -546,15 +581,73 @@ def _search(p, args) -> dict:
     query = str(args.get("query") or "").strip()
     if not query:
         raise CommandError("bad_args", "query must not be empty.")
-    p._search_query = query
-    p._reset_search_results()
-    p._apply_search_scope()
-    return {"accepted": True}
+    limit, offset = int(args.get("limit") or 50), int(args.get("offset") or 0)
+    # One GET whatever the scope: `types=` carries all four and `limit` is per type.
+    results = p.session.search(query, models=p._search_models(), limit=limit, offset=offset)
+    found = {kind: list(results.get(kind) or []) for kind in ("tracks", "albums", "artists", "playlists")}
+    for kind, objs in found.items():
+        p._remember(kind[:-1], objs)
+    return found
+
+
+def _album_tracks(p, args) -> dict:
+    album_id = str(args.get("id", ""))
+    album = _known(p, "album", album_id) or p.session.album(album_id)
+    tracks = list(album.tracks() or [])
+    p._remember("track", tracks)
+    p._lists[("album", album_id)] = tracks
+    return {"tracks": tracks}
+
+
+def _playlist_tracks(p, args) -> dict:
+    playlist_id = str(args.get("id", ""))
+    live = _known(p, "playlist", playlist_id)
+    if live is None or getattr(live, "cached", False):
+        live = p.session.playlist(playlist_id)
+        p._remember("playlist", [live])
+    tracks = list(live.tracks() or [])
+    p._remember("track", tracks)
+    p._lists[("playlist", playlist_id)] = tracks
+    p._cache.put_playlist_tracks(playlist_id, tracks)
+    return {"playlist": live, "tracks": tracks}
+
+
+def _artist_section(p, args) -> dict:
+    artist_id = str(args.get("id", ""))
+    section = _artist_section_arg(args)
+    limit = int(args.get("limit") or 20)
+    artist = _known(p, "artist", artist_id) or p.session.artist(artist_id)
+    rows = p._fetch_artist_section(artist, section, limit)
+    for row in rows:
+        p._remember(row["type"], [row["obj"]])
+    p._lists[("artist:" + section, artist_id)] = [r["obj"] for r in rows if r["type"] == "track"]
+    return {"items": rows}
 
 
 def _library_playlists(p, args) -> dict:
-    p._load_playlists()
-    return {"playlists": [{"id": _sid(pl), "name": pl.name} for pl in p._playlists]}
+    playlists = list(p.session.user.playlists() or [])
+    p._remember("playlist", playlists)
+    p._cache.put_playlists(playlists, editable_type=p._editable_type())
+    p._editable_playlists = [pl for pl in playlists if p._is_editable(pl)]
+    p._editable_playlists_time = time.time()
+    return {"playlists": playlists}
+
+
+def _stop(p, args):
+    p._stop_playback()
+
+
+def _login_reload(p, args):
+    p._reload_login()
+
+
+def _history_add(p, args):
+    p._add_to_history(str(args.get("query") or ""))
+
+
+def _history_forget(p, args):
+    query = str(args.get("query") or "")
+    p._search_history = [q for q in p._search_history if q != query]
 
 
 COMMANDS = {cmd.name: cmd for cmd in (
@@ -589,7 +682,14 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("cache.clear", _cache_clear, dangerous=True),
     Command("login.pkce", _login_pkce, tidal=True, dangerous=True),
     Command("logout", _logout, dangerous=True),
+    Command("stop", _stop),
+    Command("login.reload", _login_reload),
+    Command("history.add", _history_add),
+    Command("history.forget", _history_forget),
     Command("search", _search, read=True, tidal=True),
+    Command("album.tracks", _album_tracks, read=True, tidal=True),
+    Command("playlist.tracks", _playlist_tracks, read=True, tidal=True),
+    Command("artist.section", _artist_section, read=True, tidal=True),
     Command("library.playlists", _library_playlists, read=True, tidal=True),
 )}
 
@@ -605,6 +705,8 @@ AGENT_TOASTS = {
     "download.delete": "deleted a download", "refetch": "started a re-fetch",
     "refetch.cancel": "cancelled the re-fetch", "settings.set": "changed a setting",
     "cache.clear": "cleared the cache", "login.pkce": "switched login", "logout": "logged out",
+    "stop": "stopped playback", "login.reload": "reloaded the login",
+    "history.add": "added to search history", "history.forget": "edited search history",
 }
 
 

@@ -925,14 +925,14 @@ class TestVolumeCeilingIsDurable:
         assert p.audio.volumes == [250]
 
     def test_run_clamps_before_anything_plays(self, config_file, monkeypatch):
-        """The whole point of doing it in run(): the backend is only known
+        """The whole point of doing it in start(): the backend is only known
         there, and nothing must have been played at the stale volume yet."""
         save_config({**DEFAULTS, "volume": 250})
         monkeypatch.setattr(player_mod, "_find_audio_player", lambda: "ffplay")
         p = HeadlessTidalPlayer()
-        monkeypatch.setattr(p, "_login", lambda: False)  # stop run() right after
+        monkeypatch.setattr(p, "_login", lambda interactive=True: False)  # stop start() right after
 
-        p.run()
+        p.start()
 
         assert p.config["volume"] == 100
         assert p.audio.volume == 100, "never handed the out-of-range value"
@@ -1013,15 +1013,12 @@ class TestCLIQuality:
     def _patch_player(self, monkeypatch):
         seen = {}
 
-        class _FakePlayer:
-            def __init__(self, quality=None, login_flow=None):
-                seen["quality"] = quality
-                seen["login_flow"] = login_flow
+        def _fake_tui(quality=None, login_flow=None):
+            seen["quality"] = quality
+            seen["login_flow"] = login_flow
+            seen["ran"] = True
 
-            def run(self):
-                seen["ran"] = True
-
-        monkeypatch.setattr(player_mod, "HeadlessTidalPlayer", _FakePlayer)
+        monkeypatch.setattr(player_mod, "run_tui", _fake_tui)
         return seen
 
     def test_explicit_quality_is_passed_through(self, monkeypatch):

@@ -24,8 +24,13 @@ backends installed", which `describe` treats as nothing to add; tests about
 the probe itself use fake binaries or the reference kept in their module.
 """
 
+import shutil
+import tempfile
+from pathlib import Path
+
 import pytest
 
+from ticli import ipc as ipc_mod
 from ticli import player as player_mod
 from ticli.utils import backend_health as backend_health_mod
 from ticli.utils import config as config_mod
@@ -60,3 +65,12 @@ def never_the_real_config(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def never_probe_the_real_backends(monkeypatch):
     monkeypatch.setattr(backend_health_mod, "probe_backends", lambda *a, **k: [])
+
+
+@pytest.fixture(autouse=True)
+def never_the_real_player_socket(monkeypatch):
+    # The real one would reach a running player. Not under tmp_path: macOS caps a socket path at 104 bytes.
+    short = Path(tempfile.mkdtemp(prefix="ticli-", dir="/tmp"))
+    monkeypatch.setattr(ipc_mod, "socket_path", lambda: short / "player.sock")
+    yield short
+    shutil.rmtree(short, ignore_errors=True)

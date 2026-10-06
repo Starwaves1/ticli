@@ -195,7 +195,7 @@ class TestRunRefusesTheSecondInstance:
 
         monkeypatch.setattr(player_mod, "_find_audio_player", _boom)
         player = HeadlessTidalPlayer()
-        player.run()
+        player.start()
 
         assert player.audio is None, "no backend should have been built"
         assert not player_mod.STATE_FILE.exists(), (
@@ -205,7 +205,7 @@ class TestRunRefusesTheSecondInstance:
         fd, _ = player_mod._take_instance_lock()
         held.append(fd)
 
-        HeadlessTidalPlayer().run()
+        HeadlessTidalPlayer().start()
 
         said = capsys.readouterr().out
         assert "already running" in said
@@ -219,7 +219,7 @@ class TestRunRefusesTheSecondInstance:
         monkeypatch.setattr(player_mod, "_find_audio_player",
                             lambda: reached.append(True))
         player = HeadlessTidalPlayer()
-        player.run()
+        player.start()
         assert reached, "a lone ticli was refused its own lock"
         assert player._instance_lock_fd is not None
 
@@ -258,7 +258,7 @@ class TestDegradesRatherThanLocksTheOwnerOut:
         reached = []
         monkeypatch.setattr(player_mod, "_find_audio_player",
                             lambda: reached.append(True))
-        HeadlessTidalPlayer().run()
+        HeadlessTidalPlayer().start()
         assert reached, "an unanswerable lock question stopped ticli starting"
 
 
