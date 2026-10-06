@@ -1539,6 +1539,8 @@ class HeadlessTidalPlayer:
         self._restore_pending = False
         self._track_changing = False
         self._play_gen = 0
+        # Bumped by pause/seek/play: the monitor's position resync is dropped if it moved meanwhile
+        self._clock_epoch = 0
         self._playing_badge = None
         self._prefetch = None
         self._prefetch_id = None
@@ -1923,6 +1925,7 @@ class HeadlessTidalPlayer:
         return tidalapi.UserPlaylist
 
     def _stop_playback(self) -> None:
+        self._clock_epoch += 1
         self._shutdown()
         self._playing = False
         self._play_start_time = None
@@ -2314,6 +2317,7 @@ class HeadlessTidalPlayer:
         """`automatic` (auto-advance, a vanished source) never reconnects (ADR-0003)."""
         self._track_changing = True
         self._play_gen = gen = self._play_gen + 1
+        self._clock_epoch += 1
         self._seek_target = None
         self._prefetch_id = None
         self._current_track = track
@@ -2352,6 +2356,7 @@ class HeadlessTidalPlayer:
                                     local=local, quality=granted)
                 if self._play_gen != gen:
                     return
+                self._clock_epoch += 1
                 self._playing = True
                 self._play_start_time = time.time()
                 self._play_offset = seek
@@ -2564,6 +2569,7 @@ class HeadlessTidalPlayer:
                             "with no local copy", seconds=PLAYER_ERROR_SECONDS)
 
     def _restart_current_track(self):
+        self._clock_epoch += 1
         self._seek_target = None
         if self._playing and self.audio and self.audio.seek_to_start():
             self._play_offset = 0
@@ -2574,6 +2580,7 @@ class HeadlessTidalPlayer:
     def _seek_by(self, delta: float):
         if self._current_track is None:
             return
+        self._clock_epoch += 1
         duration = self._track_duration()
         target = max(0.0, self._get_position() + delta)
         if duration > 0:
@@ -2624,6 +2631,7 @@ class HeadlessTidalPlayer:
             self._run("toggle")
 
     def _toggle_play(self):
+        self._clock_epoch += 1
         if self._playing:
             self.audio.pause()
             self._playing = False
@@ -2775,8 +2783,9 @@ class HeadlessTidalPlayer:
             elif self._playing and self.audio:
                 # Resync with mpv's real position, but not while a scrub is still on its way
                 if not self._seek_pending():
+                    epoch = self._clock_epoch
                     pos = self.audio.get_time_pos()
-                    if pos is not None:
+                    if pos is not None and epoch == self._clock_epoch and self._playing:
                         self._play_offset = pos
                         self._play_start_time = time.time()
                 self._maybe_count_play()

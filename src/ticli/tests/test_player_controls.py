@@ -762,3 +762,48 @@ class TestTheVolumeOverlayAndTheDownloadBox:
         p._handle_key("d")
         assert p._mode == p.MODE_SEARCH
         assert p._search_query == "d"
+
+
+class TestPositionResync:
+    """The monitor reads the backend's position over IPC; a pause landing
+    while that read is in flight must win over the stale answer."""
+
+    def test_a_pause_during_the_resync_keeps_where_it_paused(self):
+        import threading
+        import time
+
+        asked, answer, polled = threading.Event(), threading.Event(), threading.Event()
+
+        class SlowAudio:
+            is_playing, is_paused = True, False
+
+            def get_time_pos(self):
+                asked.set()
+                answer.wait(2)
+                return 30.0
+
+            def pause(self):
+                self.is_playing, self.is_paused = False, True
+
+            def poll_media_key(self):
+                if answer.is_set():
+                    polled.set()
+
+        p = _make_player(position=100.0)
+        p.audio = SlowAudio()
+        p._play_start_time = time.time()
+        p.running = True
+        thread = threading.Thread(target=p._monitor_playback, daemon=True)
+        thread.start()
+        assert asked.wait(2)
+        p._toggle_play()
+        paused_at = p._play_offset
+        answer.set()
+        assert polled.wait(2)
+        p.running = False
+        thread.join(timeout=2)
+
+        assert paused_at == pytest.approx(100.0, abs=1.0)
+        assert p._playing is False
+        assert p._play_start_time is None
+        assert p._play_offset == paused_at
