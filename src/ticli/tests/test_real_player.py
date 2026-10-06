@@ -158,7 +158,7 @@ def test_a_stale_socket_is_replaced_and_sigterm_saves_and_leaves(home):
 
 
 def test_offline_start_reconnects_only_on_an_action(home, monkeypatch):
-    monkeypatch.setenv("TICLI_TEST_SESSION", "ticli.tests.fake_tidal:offline_session")
+    monkeypatch.setenv("TICLI_TEST_SESSION", "offline_session")
     log = home / "fake-tidal" / "requests.log"
 
     def attempts():
