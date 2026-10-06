@@ -212,6 +212,7 @@ class RecordingPlayer(player.HeadlessTidalPlayer):
     def __init__(self, playing):
         self._playing = playing
         self.calls = []
+        self.commands = player.Commands(self)
 
     def _next_track(self):
         self.calls.append("next")

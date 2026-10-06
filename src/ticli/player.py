@@ -241,8 +241,10 @@ HIDE_HOLD_KEYS = frozenset({KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, " "})
 
 HIDE_HINT_RANK = 9
 
+from ticli.commands import HUMAN, Commands
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
+    PROTECTED_KEYS,
     QUALITY_CHOICES,
     QUALITY_V4_RENAMES,
     SETTINGS_ROWS,
@@ -250,6 +252,7 @@ from ticli.utils.config import (
     cycle_value,
     display_value,
     get_spec,
+    hash_ai_key,
     load_config,
     save_config,
 )
@@ -1471,6 +1474,9 @@ class HeadlessTidalPlayer:
         self._prefetch = None
         self._prefetch_id = None
         self._nav_history = []
+        self._browse_source: Optional[tuple] = None
+        self._settings_secret: Optional[str] = None
+        self.commands = Commands(self)
         name = (quality or self.config["quality"]).upper()
         self._quality_name = name if name in self.QUALITY_MAP else self.config["quality"]
         self.session.audio_quality = self.QUALITY_MAP[self._quality_name]
@@ -1663,16 +1669,15 @@ class HeadlessTidalPlayer:
         except Exception:
             pass
 
+    def _run(self, command: str, /, **args) -> dict:
+        return self.commands.execute(command, args, caller=HUMAN)
+
     def _logout(self):
-        from ticli.utils.credential_store import delete_tokens
-        delete_tokens()
-        self.audio.stop()
-        self._playing = False
-        self._current_track = None
-        self._queue = []
-        self._queue_index = -1
-        self.running = False
-        self.console.print("[yellow]Logged out. Tokens cleared.[/yellow]")
+        self._run("logout")
+
+    def _note_agent_action(self, what: str) -> None:
+        self._set_toast(f"agent: {what}")
+        self._wake()
 
     def _load_favorites(self):
         def _run():
@@ -2155,7 +2160,7 @@ class HeadlessTidalPlayer:
         repeat = now - self._last_toggle_key < KEY_REPEAT_WINDOW
         self._last_toggle_key = now
         if not repeat:
-            self._toggle_play()
+            self._run("toggle")
 
     def _toggle_play(self):
         if self._playing:
@@ -2195,17 +2200,7 @@ class HeadlessTidalPlayer:
         if not self._current_track:
             return
         tid = self._current_track.id
-        def _run():
-            try:
-                if tid in self._liked_ids:
-                    self.session.user.favorites.remove_track(tid)
-                    self._liked_ids.discard(tid)
-                else:
-                    self.session.user.favorites.add_track(tid)
-                    self._liked_ids.add(tid)
-            except Exception:
-                pass
-        threading.Thread(target=_run, daemon=True).start()
+        self._run("unlike" if tid in self._liked_ids else "like", track_id=tid)
 
     def _start_track_radio(self):
         track = self._current_track
@@ -2256,16 +2251,10 @@ class HeadlessTidalPlayer:
         return True
 
     def _handle_media_key(self, action):
-        if action == "next":
-            self._next_track()
-        elif action == "prev":
-            self._prev_track()
-        elif action == "toggle":
-            self._toggle_play()
-        elif action == "play" and not self._playing:
-            self._toggle_play()
-        elif action == "pause" and self._playing:
-            self._toggle_play()
+        command = {"next": "next", "prev": "prev", "toggle": "toggle",
+                   "play": "resume", "pause": "pause"}.get(action)
+        if command:
+            self._run(command)
 
     def _monitor_playback(self):
         last_save = time.time()
@@ -2937,8 +2926,11 @@ class HeadlessTidalPlayer:
             content.append(label, style="bold white" if selected else "white")
             value = self.config.get(spec["key"], spec["default"])
             editing = selected and self._settings_edit is not None
+            secret = selected and self._settings_secret is not None
             if editing:
                 content.append(f"‹ {self._settings_edit}▏›", style="bold yellow")
+            elif secret:
+                content.append(f"‹ {'•' * len(self._settings_secret)}▏›", style="bold yellow")
             elif selected:
                 content.append(f"‹ {display_value(spec, value)} ›", style="bold cyan")
             else:
@@ -2956,6 +2948,11 @@ class HeadlessTidalPlayer:
         if self._settings_edit is not None:
             content.append(
                 "\n\n   Typing a number — Enter or Esc saves it, Backspace deletes",
+                style="dim",
+            )
+        if self._settings_secret is not None:
+            content.append(
+                "\n\n   Typing a key — Enter saves it (empty clears it), Esc cancels",
                 style="dim",
             )
         if prose:
@@ -3097,13 +3094,8 @@ class HeadlessTidalPlayer:
     def _delete_download(self) -> None:
         row = self._downloads_delete
         self._downloads_delete = None
-        if not row:
-            return
-        if downloads.remove(row["id"]):
-            self._forget_downloads()
-            self._set_toast(f"Deleted {row['title']}")
-        else:
-            self._set_toast("Could not delete that file")
+        if row:
+            self._run("download.delete", track_id=row["id"])
 
     def _build_quality_gate_note(self) -> Text:
         line = Text()
@@ -3729,7 +3721,8 @@ class HeadlessTidalPlayer:
         content.no_wrap = True
         return Panel(
             content,
-            title="[bold cyan]Ticli[/bold cyan]",
+            title=("[bold cyan]Ticli[/bold cyan] [dim]· AI control[/dim]"
+                   if self.config.get("allow_ai_control") else "[bold cyan]Ticli[/bold cyan]"),
             border_style="cyan",
             padding=(0, 1) if mini else (1, 2),
         )
@@ -4003,9 +3996,7 @@ class HeadlessTidalPlayer:
         if not query:
             return
         self._add_to_history(query)
-        self._reset_search_results()
-        self._search_key = query
-        self._apply_search_scope()
+        self._run("search", query=query)
 
     def _apply_search_scope(self):
         query = self._search_query.strip()
@@ -4135,9 +4126,7 @@ class HeadlessTidalPlayer:
         if opener:
             opener(obj)
         elif item["type"] == "track":
-            self._queue = [obj]
-            self._queue_index = 0
-            self._play_track(obj)
+            self._run("play.track", track_ids=[obj.id])
             self._mode = self.MODE_PLAYER
             self._nav_history.clear()
 
@@ -4145,6 +4134,7 @@ class HeadlessTidalPlayer:
         self._push_nav()
         self._mode = self.MODE_BROWSE
         self._browse_playlist = None
+        self._browse_source = ("album", self._obj_id(album))
         self._browse_title = album.name
         self._browse_tracks = []
         self._browse_cursor = -1
@@ -4287,30 +4277,19 @@ class HeadlessTidalPlayer:
         if opener:
             opener(obj)
         else:
-            self._queue = self._artist_section_tracks()
-            self._queue_index = sum(1 for r in rows[:self._artist_cursor] if r["type"] == "track")
-            self._play_track(obj)
+            self._play_artist_section(
+                sum(1 for r in rows[:self._artist_cursor] if r["type"] == "track"))
 
-    def _play_all_artist(self):
-        tracks = self._artist_section_tracks()
-        if not tracks:
-            return
-        self._queue = tracks
-        self._play_queue_index(0)
+    def _play_artist_section(self, index: int):
+        if self._artist_section_tracks():
+            self._run("play.artist", id=self._obj_id(self._artist),
+                      section=self._artist_section, index=index)
 
-    def _play_browse_track(self):
-        if not self._browse_tracks:
+    def _play_browse(self, index: int):
+        if not self._browse_tracks or self._browse_source is None:
             return
-        track = self._browse_tracks[self._browse_cursor]
-        self._queue = list(self._browse_tracks)
-        self._queue_index = self._browse_cursor
-        self._play_track(track)
-
-    def _play_all_browse(self):
-        if not self._browse_tracks:
-            return
-        self._queue = list(self._browse_tracks)
-        self._play_queue_index(0)
+        kind, source_id = self._browse_source
+        self._run(f"play.{kind}", id=source_id, index=index)
 
     def _load_playlists(self):
         cached = self._cache.get_playlists()
@@ -4341,6 +4320,7 @@ class HeadlessTidalPlayer:
         self._push_nav()
         self._mode = self.MODE_BROWSE
         playlist_id = self._obj_id(playlist)
+        self._browse_source = ("playlist", playlist_id)
         self._browse_playlist = playlist if isinstance(playlist, tidalapi.UserPlaylist) else None
         self._browse_title = playlist.name if hasattr(playlist, "name") else "Playlist"
         cached = self._cache.get_playlist_tracks(playlist_id) if playlist_id else None
@@ -4379,20 +4359,7 @@ class HeadlessTidalPlayer:
     def _remove_from_queue(self):
         if not self._queue or self._queue_cursor >= len(self._queue):
             return
-        removing_current = (self._queue_cursor == self._queue_index)
-        removing_before_current = (self._queue_cursor < self._queue_index)
-        self._queue.pop(self._queue_cursor)
-        if removing_before_current:
-            self._queue_index -= 1
-        elif removing_current:
-            if self._queue:
-                self._queue_index = min(self._queue_index, len(self._queue) - 1)
-                self._play_track(self._queue[self._queue_index])
-            else:
-                self._playing = False
-                self._current_track = None
-                if self.audio:
-                    self.audio.stop()
+        self._run("queue.remove", index=self._queue_cursor)
         if self._queue:
             self._queue_cursor = min(self._queue_cursor, len(self._queue) - 1)
 
@@ -4400,27 +4367,8 @@ class HeadlessTidalPlayer:
         pl = self._browse_playlist
         if pl is None or not self._browse_tracks or self._browse_cursor < 0:
             return
-        if self._browse_remove_busy:
-            return  # previous removal still in flight: indices would shift
-        index = self._browse_cursor
-        track = self._browse_tracks[index]
-        self._browse_remove_busy = True
-
-        def _run():
-            try:
-                if pl.remove_by_index(index):
-                    remaining = [t for i, t in enumerate(self._browse_tracks) if i != index]
-                    self._browse_tracks = remaining
-                    self._browse_cursor = min(self._browse_cursor, len(remaining) - 1)
-                    self._set_toast(f'Removed "{track.name}" from {pl.name}')
-                else:
-                    self._set_toast("Failed to remove from playlist")
-            except Exception:
-                self._set_toast("Failed to remove from playlist")
-            finally:
-                self._browse_remove_busy = False
-
-        threading.Thread(target=_run, daemon=True).start()
+        # A removal in flight is refused inside: indices would shift
+        self._run("playlist.remove", id=self._obj_id(pl), index=self._browse_cursor)
 
     def _set_toast(self, msg: str, seconds: float = 2.5):
         self._toast = msg
@@ -5123,22 +5071,8 @@ class HeadlessTidalPlayer:
         if self._picker_busy:
             return
         track = self._picker_track
-        self._picker_busy = True
         self._go_back()
-
-        def _run():
-            try:
-                added = playlist.add([str(track.id)])
-                self._remember_last_playlist(playlist)
-                self._set_toast(
-                    f'{"Added to" if added else "Already in"} "{playlist.name}"')
-            except Exception:
-                self._set_toast("Failed to add to playlist")
-            finally:
-                self._picker_busy = False
-            self._wake()
-
-        threading.Thread(target=_run, daemon=True).start()
+        self._run("playlist.add", id=self._obj_id(playlist), track_ids=[track.id])
 
     def _picker_create_and_add(self, name: str):
         if self._picker_busy:
@@ -5148,35 +5082,9 @@ class HeadlessTidalPlayer:
             self._set_toast("Playlist name can't be empty")
             return
         track = self._picker_track
-        # Set first: a second Enter on the same tick must already see this, or the playlist is created twice.
-        self._picker_busy = True
         self._picker_new_name = None
         self._go_back()
-
-        def _run():
-            try:
-                playlist = self.session.user.create_playlist(name, "")
-            except Exception:
-                self._set_toast(f'Failed to create "{name}"')
-                self._picker_busy = False
-                self._wake()
-                return
-            self._remember_last_playlist(playlist)
-            pid = str(getattr(playlist, "id", "") or "")
-            self._editable_playlists = [playlist] + [
-                p for p in self._editable_playlists
-                if not pid or str(getattr(p, "id", "") or "") != pid
-            ]
-            try:
-                playlist.add([str(track.id)])
-                self._set_toast(f'Created "{name}" and added track')
-            except Exception:
-                self._set_toast(f'Created "{name}", but failed to add track')
-            finally:
-                self._picker_busy = False
-            self._wake()
-
-        threading.Thread(target=_run, daemon=True).start()
+        self._run("playlist.create", name=name, track_ids=[track.id])
 
     def _setting_ceiling(self, spec: dict) -> int:
         if spec["key"] != "volume":
@@ -5202,12 +5110,18 @@ class HeadlessTidalPlayer:
             self.audio.set_volume(allowed)
 
     def _set_setting(self, spec: dict, value):
-        current = self.config.get(spec["key"], spec["default"])
-        if value == current:
+        if spec["key"] in PROTECTED_KEYS:
+            self._set_protected_setting(spec, value)
+        else:
+            self._run("settings.set", key=spec["key"], value=value)
+
+    def _set_protected_setting(self, spec: dict, value):
+        # The only writer of the protected rows, reached from settings keypresses alone (ADR-0007).
+        if value == self.config.get(spec["key"], spec["default"]):
             return
         self.config[spec["key"]] = value
-        self._apply_setting(spec["key"], value)
         save_config(self.config)
+        self._set_toast(f"{spec['label']}: {display_value(spec, value)}")
 
     def _change_setting(self, step: int):
         self._adjust_setting(SETTINGS_ROWS[self._settings_cursor], step)
@@ -5237,12 +5151,7 @@ class HeadlessTidalPlayer:
         self._set_setting(spec, value)
 
     def _clear_cached_songs(self):
-        removed, kept = self._cache.clear_audio()
-        if kept:
-            # On Windows a file open without delete-sharing cannot be removed at all.
-            self._set_toast(f"Cleared {removed} songs, {kept} still in use")
-        else:
-            self._set_toast(f"Cleared {removed} song{'' if removed == 1 else 's'}")
+        self._run("cache.clear")
 
     def _apply_setting(self, key: str, value):
         if key == "quality":
@@ -5324,7 +5233,7 @@ class HeadlessTidalPlayer:
             plan = self._refetch_plan
             self._refetch_plan = None
             if confirmed and plan and (plan["downloads"] or plan["cache"]):
-                self._start_refetch_job()
+                self._run("refetch")
             return
 
         if self._volume_open:
@@ -5369,10 +5278,10 @@ class HeadlessTidalPlayer:
         if not self._player_focus:
             return False
         if key == KEY_RIGHT:
-            self._seek_by(SEEK_STEP_SECONDS)
+            self._run("seek", delta=SEEK_STEP_SECONDS)
             return True
         if key == KEY_LEFT:
-            self._seek_by(-SEEK_STEP_SECONDS)
+            self._run("seek", delta=-SEEK_STEP_SECONDS)
             return True
         if key in (" ", "k"):
             self._toggle_play_key()
@@ -5384,7 +5293,8 @@ class HeadlessTidalPlayer:
 
     def _can_open_volume(self) -> bool:
         return (self._mode != self.MODE_SEARCH and not self._download_open
-                and self._settings_edit is None and self._picker_new_name is None)
+                and self._settings_edit is None and self._settings_secret is None
+                and self._picker_new_name is None)
 
     def _can_hide_footer(self) -> bool:
         return (self._mode == self.MODE_PLAYER and not self._mini_player
@@ -5396,6 +5306,7 @@ class HeadlessTidalPlayer:
         return not (
             self._mini_player or self._volume_open or self._download_open
             or self._settings_edit is not None
+            or self._settings_secret is not None
             or self._picker_new_name is not None
             or self._quit_pending or self._logout_pending
             or self._disable_songs_pending or self._clear_cache_pending
@@ -5433,9 +5344,9 @@ class HeadlessTidalPlayer:
         if key in (" ", "k"):
             self._toggle_play_key()
         elif key in ("n", KEY_RIGHT):
-            self._next_track()
+            self._run("next")
         elif key == KEY_LEFT:
-            self._prev_track()
+            self._run("prev")
         elif key == KEY_UP:
             self._focus_player()
         elif key == "s":
@@ -5451,7 +5362,7 @@ class HeadlessTidalPlayer:
         elif key == "l":
             self._toggle_like()
         elif key == "r":
-            self._start_track_radio()
+            self._run("play.radio")
         elif key == "y":
             self._open_playlist_picker()
         elif key == "d":
@@ -5462,7 +5373,7 @@ class HeadlessTidalPlayer:
         elif key == "p":
             self._enter_mode(self.MODE_PLAYLISTS)
             if not self._playlists and not self._playlists_loading:
-                self._load_playlists()
+                self._run("library.playlists")
         elif key == "c":
             self._enter_mode(self.MODE_SETTINGS)
             self._settings_cursor = 0
@@ -5555,12 +5466,9 @@ class HeadlessTidalPlayer:
         elif key == KEY_DOWN:
             self._cursor_down("_browse_cursor", len(self._browse_tracks))
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
-            if self._browse_cursor == -1:
-                self._play_all_browse()
-            else:
-                self._play_browse_track()
+            self._play_browse(max(self._browse_cursor, 0))
         elif key == "a":
-            self._play_all_browse()
+            self._play_browse(0)
         elif key == "x":
             self._remove_from_browse_playlist()
         elif key == "y":
@@ -5584,7 +5492,7 @@ class HeadlessTidalPlayer:
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
             self._select_artist_row()
         elif key == "a":
-            self._play_all_artist()
+            self._play_artist_section(0)
         elif key == "y":
             self._open_playlist_picker()
         elif key == "d":
@@ -5601,7 +5509,7 @@ class HeadlessTidalPlayer:
             self._cursor_down("_queue_cursor", len(self._queue))
         elif key in (KEY_ENTER, KEY_ENTER2):
             if self._queue:
-                self._play_queue_index(self._queue_cursor)
+                self._run("queue.play", index=self._queue_cursor)
         elif key == "x":
             self._remove_from_queue()
         elif key == "y":
@@ -5651,20 +5559,37 @@ class HeadlessTidalPlayer:
         elif key == " ":
             self._toggle_play_key()
         elif key in ("x", "X"):
-            self._cancel_download()
+            self._run("download.cancel")
         elif key == KEY_UP:
             self._download_cursor = max(0, self._download_cursor - 1)
         elif key == KEY_DOWN:
             self._download_cursor = min(len(QUALITY_CHOICES) - 1, self._download_cursor + 1)
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT, "d", "D"):
-            if self._download_bulk():
-                self._start_bulk_download_job(self._download_tier())
-            else:
-                self._start_download_job(self._download_tier())
+            bulk = self._download_bulk()
+            targets = [t for t in (self._download_tracks if bulk else [self._download_track])
+                       if t is not None]
+            if targets:
+                self._run("download", tier=self._download_tier(), label=self._download_label,
+                          track_ids=[t.id for t in targets])
+            if not bulk:
                 if self._download_run is None:
                     self._download_open = False
 
+    def _handle_secret_key(self, key: str):
+        if key == KEY_ESC:
+            self._settings_secret = None
+        elif key in (KEY_ENTER, KEY_ENTER2):
+            typed, self._settings_secret = self._settings_secret, None
+            self._set_protected_setting(get_spec("ai_control_key"), hash_ai_key(typed))
+        elif key in (KEY_BACKSPACE, KEY_BACKSPACE2):
+            self._settings_secret = self._settings_secret[:-1]
+        elif len(key) == 1 and key.isprintable():
+            self._settings_secret += key
+
     def _handle_settings_key(self, key: str):
+        if self._settings_secret is not None:
+            self._handle_secret_key(key)
+            return
         if self._settings_edit is not None:
             if key.isdigit():
                 if len(self._settings_edit) < 4:
@@ -5681,7 +5606,7 @@ class HeadlessTidalPlayer:
 
         if key in (KEY_ESC, "c"):
             if (self._refetch_job or {}).get("state") == "running":
-                self._cancel_refetch()
+                self._run("refetch.cancel")
             else:
                 self._show_player()
         elif key == " ":
@@ -5690,12 +5615,12 @@ class HeadlessTidalPlayer:
             self._logout_pending = True
         elif key in ("x", "X"):
             if (self._download_job or {}).get("state") == "running":
-                self._cancel_download()
+                self._run("download.cancel")
             else:
                 self._clear_cache_pending = True
         # Not "p": that already opens playlists on the player screen.
         elif key in ("u", "U"):
-            self._upgrade_to_pkce()
+            self._run("login.pkce")
         elif key in ("d", "D"):
             self._open_downloads()
         # Asks first: this deliberately makes hundreds of requests.
@@ -5710,7 +5635,10 @@ class HeadlessTidalPlayer:
         elif key == KEY_LEFT:
             self._change_setting(-1)
         elif key in (KEY_RIGHT, KEY_ENTER, KEY_ENTER2):
-            self._change_setting(1)
+            if SETTINGS_ROWS[self._settings_cursor]["kind"] == "secret":
+                self._settings_secret = ""
+            else:
+                self._change_setting(1)
 
     def _open_downloads(self):
         self._push_nav()
