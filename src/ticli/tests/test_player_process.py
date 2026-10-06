@@ -422,12 +422,20 @@ class TestAgentGateOverTheSocket:
 class TestTestHooks:
     def test_the_session_hook_needs_its_flag(self, monkeypatch):
         from ticli.utils import testhooks
-        monkeypatch.setenv("TICLI_TEST_SESSION", "ticli.tests.fake_tidal:session")
+        monkeypatch.setenv("TICLI_TEST_SESSION", "session")
         monkeypatch.delenv("TICLI_TEST_HOOKS", raising=False)
         assert testhooks.session_factory() is None
         monkeypatch.setenv("TICLI_TEST_HOOKS", "1")
         from ticli.tests import fake_tidal
         assert testhooks.session_factory() is fake_tidal.session
+
+    def test_the_session_hook_imports_nothing_but_the_fake(self, monkeypatch):
+        from ticli.utils import testhooks
+        monkeypatch.setenv("TICLI_TEST_HOOKS", "1")
+        for spec in ("os:system", "ticli.tests.fake_tidal:session", "Path", "_private", "nope"):
+            monkeypatch.setenv("TICLI_TEST_SESSION", spec)
+            with pytest.raises(ValueError):
+                testhooks.session_factory()
 
 
 class TestLifecycle:
