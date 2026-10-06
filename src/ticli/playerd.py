@@ -17,6 +17,7 @@ import queue
 import selectors
 import signal
 import socket
+import stat
 import sys
 import threading
 from pathlib import Path
@@ -71,11 +72,7 @@ class PlayerServer:
 
     def listen(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Safe: only the holder of the instance lock gets here, so a file left is a dead player's.
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+        self._clear_stale_socket()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         old = os.umask(0o177)
         try:
@@ -88,6 +85,21 @@ class PlayerServer:
         self.listener = sock
         self.sel.register(sock, selectors.EVENT_READ, "accept")
         self.sel.register(self.wake_r, selectors.EVENT_READ, "wake")
+
+    def _clear_stale_socket(self) -> None:
+        """Remove a dead player's socket. Anything else stays: the instance lock may
+        have been unavailable ("start anyway"), so a live player could own it."""
+        try:
+            mode = os.lstat(self.path).st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(mode):
+            raise OSError(f"{self.path} exists and is not a socket")
+        live = ipc.connect(self.path)
+        if live is not None:
+            live.close()
+            raise OSError(f"another player is listening at {self.path}")
+        self.path.unlink()
 
     def serve(self) -> None:
         while self.core.running and not self.should_exit():

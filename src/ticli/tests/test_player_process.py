@@ -443,6 +443,36 @@ class TestLifecycle:
         assert not run.thread.is_alive(), "stopped and nobody attached: the player leaves"
 
 
+class TestSocketPath:
+    def _listen(self):
+        server = playerd.PlayerServer(_core(playing=False))
+        try:
+            server.listen()
+        finally:
+            server.close()
+
+    def test_a_dead_players_socket_is_replaced(self):
+        import socket
+        path = ipc.socket_path()
+        dead = socket.socket(socket.AF_UNIX)
+        dead.bind(str(path))
+        dead.close()
+        self._listen()
+
+    def test_a_live_player_is_never_replaced(self, running):
+        running()
+        with pytest.raises(OSError, match="another player"):
+            self._listen()
+        assert ipc.connect().request("status", timeout=2)["ok"]
+
+    def test_a_file_that_is_not_a_socket_is_left_alone(self):
+        path = ipc.socket_path()
+        path.write_text("mine")
+        with pytest.raises(OSError, match="not a socket"):
+            self._listen()
+        assert path.read_text() == "mine"
+
+
 class TestSingleInstance:
     def test_a_second_player_refuses_and_says_so(self, monkeypatch):
         fd, _ = player_mod._take_instance_lock()
