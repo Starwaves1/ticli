@@ -407,7 +407,7 @@ from ticli.utils.cache import (
     is_owned_audio,
     track_record,
 )
-from ticli.utils import artwork, downloads, tags
+from ticli.utils import artwork, backend_health, downloads, tags
 
 STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
@@ -1504,39 +1504,50 @@ class AudioPlayer:
             self._stderr_path = None
             return subprocess.DEVNULL
 
-    def _last_stderr(self) -> str:
-        """The last thing the player said, trimmed to fit a toast."""
+    def _spawn(self, cmd: list) -> subprocess.Popen:
+        """Start the backend. The one place it is started, so a binary that
+        cannot be run surfaces as `SpawnError` — a type of its own, because
+        the `OSError` underneath it is also the base class of every
+        `requests` failure, and the caller has to tell the two apart."""
+        try:
+            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=self._open_stderr())
+        except OSError as e:
+            raise backend_health.SpawnError(
+                backend_health.classify_spawn_error(self.player_cmd, e)) from e
+
+    def _stderr_text(self) -> str:
+        """Everything the running (or last) player wrote to stderr."""
         if not self._stderr_path:
             return ""
         try:
-            lines = [ln.strip() for ln in
-                     Path(self._stderr_path).read_text(errors="replace").splitlines()]
+            return Path(self._stderr_path).read_text(errors="replace")
         except OSError:
             return ""
-        said = [ln for ln in lines if ln]
-        if not said:
-            return ""
-        return said[-1][:PLAYER_ERROR_CHARS]
 
-    def failure(self) -> Optional[str]:
+    def failure(self) -> Optional[backend_health.PlayerFailure]:
         """Why playback stopped, when it stopped because it failed.
 
-        None while the process is running, when it reached the end of the
-        track (exit 0), and when *we* ended it (a signal, i.e. a negative
-        return code — that is stop() and pause() doing their job). Anything
-        else is the backend refusing the stream, which the user has to be
-        told about rather than left listening to silence.
+        None while the process is running and when it exited 0 — the end of
+        the track, or a stream that ran dry, which only the clock can tell
+        apart (`_stream_ended_early`). Anything else is a failure, *signals
+        included*: every path that kills the player — `stop()`, ffplay's
+        `pause()`, a scrub's respawn — drops or replaces `_process` under
+        this same lock, so a signal on a handle still held was sent by
+        something else. Reading every negative code as "us" is what hid a
+        player dyld had refused to load (SIGABRT) behind "stopped early at
+        0:00" — see utils/backend_health.py.
         """
         with self._lock:
             process = self._process
             if process is None:
                 return None
             code = process.poll()
-            if code is None or code <= 0:
+            if code is None or code == 0:
                 return None
-            detail = self._last_stderr()
-        return f"{self.player_cmd} error: {detail}" if detail else \
-            f"{self.player_cmd} exited with status {code}"
+            stderr = self._stderr_text()
+        return backend_health.classify_exit(self.player_cmd, code, stderr,
+                                            limit=PLAYER_ERROR_CHARS)
 
     def _hls_flags(self) -> list:
         """What each backend needs to demux a local HLS playlist.
@@ -1682,11 +1693,7 @@ class AudioPlayer:
             # otherwise — a download that has only just started can't
             # satisfy a seek yet
             cmd = self._ffplay_cmd(source, seek)
-        self._process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=self._open_stderr(),
-        )
+        self._process = self._spawn(cmd)
         return have_kept, self._download_gen
 
     def _ffplay_cmd(self, source: str, seek: float) -> list:
@@ -1707,11 +1714,7 @@ class AudioPlayer:
 
     def _play_from_cache(self, seek: float):
         """Resume ffplay from local cached file at given position."""
-        self._process = subprocess.Popen(
-            self._ffplay_cmd(self._cache_file, seek),
-            stdout=subprocess.DEVNULL,
-            stderr=self._open_stderr(),
-        )
+        self._process = self._spawn(self._ffplay_cmd(self._cache_file, seek))
         self._play_start = time.time()
         self._paused = False
 
@@ -1910,11 +1913,7 @@ class AudioPlayer:
             if not source:
                 return False
             self._reap_process()
-            self._process = subprocess.Popen(
-                self._ffplay_cmd(source, position),
-                stdout=subprocess.DEVNULL,
-                stderr=self._open_stderr(),
-            )
+            self._process = self._spawn(self._ffplay_cmd(source, position))
             self._seek_offset = position
             self._play_start = time.time()
             return True
@@ -3088,9 +3087,26 @@ class HeadlessTidalPlayer:
                 self._playing = True
                 self._play_start_time = time.time()
                 self._play_offset = seek
-            except Exception:
+            except backend_health.SpawnError as e:
+                # The player binary itself would not start — uninstalled or
+                # replaced mid-session. Used to vanish into the bare
+                # `except` below: the track just never began.
                 if self._play_gen == gen:
                     self._playing = False
+                    self._report_player_failure(e.failure)
+            except Exception as e:
+                if self._play_gen == gen:
+                    self._playing = False
+                    # Never silent, and never retried: a rate limit gets the
+                    # same words the restore uses for it (WORKING-RULES)
+                    self._set_toast(
+                        "TIDAL is rate-limiting — playback stopped. "
+                        "Nothing will be retried." if _looks_rate_limited(str(e))
+                        else f"Couldn't start the track — {type(e).__name__}: "
+                             f"{str(e)[:PLAYER_ERROR_CHARS]}",
+                        seconds=PLAYER_ERROR_SECONDS)
+                    logger.warning("Track start failed: %r", e)
+                    self._wake()
             finally:
                 if self._play_gen == gen:
                     self._track_changing = False
@@ -3603,11 +3619,9 @@ class HeadlessTidalPlayer:
                     # than advancing through the whole queue in silence —
                     # whatever it could not play, the next track is usually
                     # the same kind of thing.
-                    self._set_toast(f"Playback failed — {failure}",
-                                    seconds=PLAYER_ERROR_SECONDS)
-                    logger.warning("Playback failed: %s", failure)
                     self._playing = False
                     self._play_start_time = None
+                    self._report_player_failure(failure)
                 elif (self.audio and self._current_track is not None
                         and self.audio.source_vanished()
                         and self._track_has_time_left()):
@@ -3637,6 +3651,10 @@ class HeadlessTidalPlayer:
                     self._playing = False
                     self._play_start_time = None
                     self._play_offset = position
+                    # A clean exit says the stream died, but ask the players
+                    # anyway: if the backend itself is broken, that is the
+                    # sentence the user needs, not this one
+                    self._report_player_failure(None)
                 elif self._queue and self._queue_index < len(self._queue) - 1:
                     self._play_queue_index(self._queue_index + 1)
                 else:
@@ -3672,6 +3690,34 @@ class HeadlessTidalPlayer:
             time.sleep(0.5)
 
     # ── Display builders ──
+
+    def _report_player_failure(self, failure) -> None:
+        """Say why playback failed, after asking every installed backend
+        whether it still runs.
+
+        The version probe happens here, after a failure, and never at
+        startup: it is a subprocess per backend, and a launch should not pay
+        for a check that almost always passes. Only ever called off the UI
+        thread (the monitor, a track's start-up thread); a healthy backend
+        answers in tens of milliseconds.
+
+        `failure` None means "nothing classified it" — a stream that ended
+        early, cleanly. The toast already up stays unless the probe finds
+        the backend itself broken, which then replaces it.
+        """
+        probes = backend_health.probe_backends(AUDIO_PLAYERS)
+        if failure is None:
+            player = getattr(self.audio, "player_cmd", None)
+            active = next((p for p in probes if p.player == player), None)
+            if active is None or active.ok:
+                return
+            failure = active.failure
+        message = backend_health.describe(failure, probes)
+        self._set_toast(f"Playback failed — {message}",
+                        seconds=PLAYER_ERROR_SECONDS)
+        logger.warning("Playback failed [%s]: %s (%s)",
+                       failure.code, message, failure.detail)
+        self._wake()
 
     def _track_has_time_left(self) -> bool:
         """Whether the current track stopped early enough to be worth
@@ -8889,11 +8935,10 @@ class HeadlessTidalPlayer:
         self._instance_lock_fd, other = _take_instance_lock()
         if other is not None:
             named = f" (pid {other})" if other else ""
-            self.console.print(
-                f"[red]ticli is already running{named}.[/red]\n"
-                "Only one copy can run at a time: two play over each other, "
-                "and each one's saved position overwrites the other's.\n"
-                "Quit the running copy first, or use the terminal it is in.")
+            # SIGTERM exits through the same save-and-stop path as quitting
+            stop = f", or stop it with: kill {other}" if other else "."
+            self.console.print(f"[red]ticli is already running{named}.[/red]\n"
+                               f"Switch to its terminal{stop}")
             return
 
         # Find audio player

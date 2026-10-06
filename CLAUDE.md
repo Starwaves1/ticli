@@ -43,13 +43,18 @@ Ticli uses `tidalapi` (community Python client) to authenticate via OAuth and fe
 - mpv (if available): uses IPC socket for pause/resume
 - Nothing fails silently. Neither backend is run quiet any more (`--msg-level=all=error`,
   `-loglevel error`) and stderr goes to a per-player log rather than `/dev/null`.
-  `AudioPlayer.failure()` reads it back when the process has exited with a *positive*
-  status — a zero is the end of the track and a negative one is a signal, which is
-  `stop()`/`pause()` doing their job. `_monitor_playback` checks it on the same tick
-  that already notices a dead player, toasts what the backend actually said, and stops
-  rather than advancing: whatever it could not play, the next track is usually the same
-  kind of thing. This is not decoration — the regression it exists for played an entire
-  library as silence with a normal-looking UI.
+  `AudioPlayer.failure()` reads it back when the process has exited non-zero —
+  **signals included**: ticli drops its handle on everything it kills, so a signal on a
+  held process came from elsewhere (dyld's SIGABRT for an unloadable binary, ai/INCIDENTS
+  #8). `utils/backend_health.py` classifies the exit into a `PlayerFailure` with a stable
+  `code` (`broken_install`, `crashed`, `killed`, `exit_status`, `not_runnable`), scanning
+  all of stderr for the dynamic linker's refusal on macOS and Linux. `_monitor_playback`
+  checks it on the same tick that already notices a dead player, then — only after a
+  failure, never at startup — runs each backend's version flag to tell "this stream" from
+  "this player is broken", toasts the result with a fix hint, and stops rather than
+  advancing: whatever it could not play, the next track is usually the same kind of
+  thing. This is not decoration — the regression it exists for played an entire library
+  as silence with a normal-looking UI.
 
 ### Scrubbing
 
@@ -406,6 +411,7 @@ in the scrollback.
 | `utils/credential_store.py` | OAuth token storage (keychain + fallback) |
 | `utils/cache.py` | Metadata cache, cached audio, budget + eviction |
 | `utils/artwork.py` | JPEG decoder, cover art rendering + its own disk cache |
+| `utils/backend_health.py` | Classifies player exits; post-failure `--version` probe of mpv/ffplay |
 
 ## Testing
 

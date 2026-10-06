@@ -49,7 +49,7 @@ If you are an agent picking this project up, read in this order:
 |---|---|
 | **[WORKING-RULES.md](WORKING-RULES.md)** | The constraints. Read first — several are non-obvious and violating them has already caused real damage. |
 | **[HISTORY.md](HISTORY.md)** | What happened, in order, with the reasoning behind each change. |
-| **[INCIDENTS.md](INCIDENTS.md)** | Seven things that went wrong and what each one taught. The most useful file here. |
+| **[INCIDENTS.md](INCIDENTS.md)** | Eight things that went wrong and what each one taught. The most useful file here. |
 | **[DECISIONS.md](DECISIONS.md)** | Product decisions locked by the owner, the roadmap, and specs for work not yet built. |
 | **[WORKFLOWS.md](WORKFLOWS.md)** | If you are about to run a multi-agent workflow here: what worked, what silently failed, read before authoring one. |
 | **[PR-SUMMARY.md](PR-SUMMARY.md)** | Draft material for the upstream pull request. |

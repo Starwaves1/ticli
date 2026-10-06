@@ -1674,3 +1674,74 @@ handled right — empty command plans, report-to-human, no invented verbs, no
 
 Suite 1,509 → 1,512; the new error-classification tests failed under
 mutation (classification collapsed to bare api_error) before restore.
+
+---
+
+## 2026-10-05 — a player that can't run says so: `utils/backend_health.py`
+
+Prompted by INCIDENTS #8: a Homebrew dependency mismatch left mpv unloadable,
+and ticli reported it as "the stream ended at 0:00" on every track. The owner's
+brief: *"Implement much better error codes, upon failure have it run mpv and
+ffplay --version. This way it doesn't impact startup. This project works on
+linux and mac."*
+
+**Classification** (`classify_exit`) turns a return code plus all of stderr
+into a `PlayerFailure` with a stable `code`, a toast-length `summary` led by
+what matters, the untrimmed `detail` for the log, and a `hint`. The dynamic
+linker's refusal is matched on both platforms — measured, not recalled: a
+binary built against a deleted dylib on macOS exits `-6` with `Library not
+loaded:` as its first stderr line and dyld's search path after it; glibc's
+ld.so exits 127 with `error while loading shared libraries:`. Signals split
+into `crashed` (SEGV/BUS/ILL/FPE/ABRT) and `killed` (anything else).
+`failure()` now counts signals at all — see the incident for why "negative is
+us" was never true.
+
+**The probe** runs only after a failure, from the monitor or the track's
+start-up thread, never the UI thread. Each backend on PATH gets its own
+version flag (`mpv --version`, `ffplay -version` — ffmpeg's parser takes
+single-dash long options) with a 3 s timeout. It is what turns "mpv exited"
+into "mpv is broken, ffplay is fine", and it runs on the clean-early-exit path
+too: exit 0 says the stream died, but a backend that can't print its version
+overrides that. A healthy probe adds nothing to the toast.
+
+**Hints** are per platform: a binary resolving into a Homebrew prefix (macOS
+or linuxbrew) gets `try: brew upgrade <player>` — `upgrade` rather than
+`reinstall` because it also upgrades outdated dependencies, and the stale one
+on the day was `libass`, not mpv. Anything else on Linux is pointed at the
+package manager.
+
+**The silent `except` in `_play_track`.** A track start that raised — any
+TIDAL error, or the binary gone — set `_playing = False` and said nothing.
+Now it toasts; a rate limit gets the restore's "nothing will be retried"
+wording. Spawn failures are their own type, `SpawnError`, raised from the
+single `AudioPlayer._spawn` that all three spawn sites now share, because
+`requests.RequestException` subclasses `OSError` and `except OSError` would
+have reported network errors as a broken player — caught before commit, and
+pinned by a test.
+
+**Tests.** `test_backend_health.py`: fake players as POSIX sh scripts
+(healthy, linker-aborted via `kill -ABRT $$`, hung, missing, not executable),
+a real linker refusal built with `cc` on whichever OS runs it, `describe`'s
+wording, and the 2026-10-05 failure end to end through `_monitor_playback`.
+A conftest rail stubs `probe_backends` suite-wide: the probe is a real
+subprocess against this machine's players, and on the day the bug was found
+this machine's mpv *was* the broken one. The test that asserted "a signal is
+us" is inverted, with a docstring saying why. Suite 1,512 → 1,547;
+restoring `code <= 0` in `failure()` fails the signal and dyld tests, so they
+distinguish the fix from the bug.
+
+**Not done, on purpose.** No automatic fallback to ffplay when mpv is broken —
+the toast says ffplay works, but switching backends mid-session changes the
+volume ceiling and pause semantics, and that is the owner's call. No backend
+health in `ticli agent status` yet, though it would have found this in one
+zero-request call; a natural next step. `resume()` and `seek_to()` can now
+raise `SpawnError` where they used to raise `OSError`, and neither caller
+catches either — unchanged exposure, noted rather than widened in this change.
+
+**Also: the "already running" refusal, reworded.** Was four lines explaining
+why two copies conflict, ending in "use the terminal it is in". Now two lines
+that only say what to do: *"ticli is already running (pid N). Switch to its
+terminal, or stop it with: kill N"*. `kill` is safe to suggest because the
+SIGTERM handler leaves the main loop through the same `finally` that saves
+state; no trailing period after the command, so it pastes cleanly. The why
+stays in the code comment above it, where a maintainer reads it.

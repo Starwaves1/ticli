@@ -1,6 +1,6 @@
 # Incidents
 
-Seven things that went wrong, and what each changed. This is the highest-value
+Eight things that went wrong, and what each changed. This is the highest-value
 file in `ai/` — every rule in WORKING-RULES.md that matters came from one of
 these.
 
@@ -108,6 +108,9 @@ that presents as silence is a bug you cannot diagnose.
 - Errors are captured to a per-player log; `AudioPlayer.failure()` reads the
   backend's own last line when the process exited with a *positive* status
   (zero is end-of-track, negative is a signal — i.e. `stop()`/`pause()` working).
+  **Corrected 2026-10-05 (#8): the negative half was never true** — ticli
+  drops its handle on everything it kills, so a signal on a held process is
+  someone else's, and the dynamic linker's SIGABRT hid behind this rule.
 - A failed start now **stops with a toast showing the player's real error**
   rather than burning through the queue. There is a test asserting the queue is
   not advanced.
@@ -250,6 +253,54 @@ invariant nothing was checking.
   it passed 25/25 against the unfixed code, because CPython locks are unfair
   and the releasing thread barges before the parked one wakes. It had to be
   made to fail on purpose before it was worth committing.
+
+---
+
+## 8. A broken mpv that looked like TIDAL
+
+**What happened (2026-10-05).** Every track the owner played stopped at once
+with *"Playback stopped early — the stream ended at 0:00 of 2:30"*. That reads
+as a dead stream: TIDAL, the network, an expired URL. It was none of them. A
+Homebrew upgrade the night before had moved `libunibreak` from 7 to 8 while
+the installed `libass` — an mpv dependency — still linked against 7. mpv could
+not load. Found from outside ticli by running `mpv --version` by hand; fixed by
+`brew upgrade libass mpv`. No TIDAL request was involved or needed.
+
+**Why ticli said the wrong thing.** Two stacked mistakes, both in code that
+existed precisely to stop failures being silent (#3):
+
+1. **A premise nobody had checked.** `failure()` treated every negative
+   return code as "we killed it" — `stop()`/`pause()` doing their job. dyld
+   refuses an unloadable binary by killing it with **SIGABRT (`-6`)**, so the
+   one real failure that mattered read as no failure at all, and the monitor
+   fell through to the truncated-stream branch. The premise was false in a
+   checkable way: every path that kills the player (`stop()`, ffplay's
+   pause, a scrub's respawn) drops or replaces `_process` under the same
+   lock, so a signalled process ticli still holds was signalled by somebody
+   else. A test, `test_a_player_we_killed_ourselves_is_not_a_failure`,
+   encoded the premise and passed for months.
+2. **The last line, not the useful one.** Even a correctly classified exit
+   would have shown dyld's *last* line — `Reason: tried: '…' (no such file),
+   …`, a list of search paths — when the line that says what is wrong
+   (`Library not loaded: …libunibreak.7.dylib`) comes *first*.
+
+**What changed.** `utils/backend_health.py`: exits classify into stable codes
+(`broken_install`, `crashed`, `killed`, `exit_status`, `not_runnable`), the
+dynamic linker's refusal is recognised on both OSes (dyld; glibc ld.so's exit
+127) by scanning *all* of stderr, and **after** a failure — never at startup —
+each installed backend is asked its version, so the toast can say *mpv can't
+start — broken install, libunibreak.7.dylib missing; try: brew upgrade mpv;
+ffplay is OK*. A track start that raised used to vanish into a bare `except`;
+it now toasts, with a spawn failure as its own type (`SpawnError`) because
+`requests`' exceptions are `OSError`s too. A test builds a real binary, deletes
+its library, and classifies whatever this OS's linker does about it.
+
+**The lesson.** #3 again, one level down: making errors visible is not done
+when the error path exists — it is done when the *classification* is right.
+A comment that explains why a case is benign ("negative is us") is a claim,
+and this one was checkable against the code in five minutes. And when the
+symptom names an outside party (the stream, TIDAL), confirm the local tool
+runs before believing it.
 
 ---
 
