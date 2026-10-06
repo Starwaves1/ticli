@@ -8,6 +8,7 @@ This module must not import `ticli.player`: `ticli agent` imports the gate.
 """
 
 import json
+import re
 import sys
 import threading
 import time
@@ -52,6 +53,7 @@ class Command:
     read: bool = False
     tidal: bool = False
     dangerous: object = False  # bool, or (player, args) -> bool
+    params: tuple = ()  # positional CLI order; a trailing "*" collects the rest into a list
 
     def is_dangerous(self, player, args) -> bool:
         return bool(self.dangerous(player, args) if callable(self.dangerous) else self.dangerous)
@@ -94,33 +96,95 @@ class Commands:
         self.player = player
         self._sleep = sleep
 
-    def execute(self, name: str, args: Optional[dict] = None, caller: str = HUMAN,
-                key=None) -> dict:
-        args = dict(args or {})
+    def check(self, name: str, args: dict, caller: str = AGENT, key=None) -> Optional[dict]:
+        """The refusal an agent would get for this call right now, else None."""
         cmd = COMMANDS.get(name)
         if cmd is None:
             return _error("unknown_command", f"No command named {name!r}.",
                           "Run `ticli agent docs` for the command list.")
-        caller = HUMAN if caller == HUMAN else AGENT
-        p = self.player
+        if caller == HUMAN:
+            return None
         try:
-            if caller == AGENT:
-                refused = gate(name, caller, key, p.config, read=cmd.read,
-                               dangerous=cmd.is_dangerous(p, args), sleep=self._sleep)
-                if refused:
-                    return refused
-                if cmd.read and not p.config.get("allow_ai_control", True):
-                    return offline_read(name, args, p.config)
+            dangerous = cmd.is_dangerous(self.player, args)
+        except Exception as e:
+            return _error("bad_args", f"{type(e).__name__}: {e}")
+        return gate(name, caller, key, self.player.config, read=cmd.read,
+                    dangerous=dangerous, sleep=self._sleep)
+
+    def execute(self, name: str, args: Optional[dict] = None, caller: str = HUMAN,
+                key=None, inline: bool = False) -> dict:
+        """`inline` runs a handler's TIDAL work on this thread and lets its failure out:
+        the agent queue counts and paces those requests (ADR-0001)."""
+        args = dict(args or {})
+        caller = HUMAN if caller == HUMAN else AGENT
+        refused = self.check(name, args, caller, key)
+        if refused:
+            return refused
+        cmd = COMMANDS[name]
+        p = self.player
+        was = getattr(_inline, "on", False)
+        _inline.on = inline
+        try:
+            if caller == AGENT and cmd.read and not p.config.get("allow_ai_control", True):
+                return offline_read(name, args, p.config)
             result = cmd.handler(p, args)
         except CommandError as e:
             return _error(e.code, e.reason, e.fix)
+        except throttle.Tripped as e:
+            return tripped_error(e.record)
         except Exception as e:
             if caller == HUMAN:
                 raise
-            return _error("failed", f"{type(e).__name__}: {e}")
+            return classify(e)
+        finally:
+            _inline.on = was
         if caller == AGENT and not cmd.read:
             p._note_agent_action(AGENT_TOASTS.get(name, name))
         return {"ok": True, "result": result}
+
+
+def tripped_error(record: Optional[dict] = None) -> dict:
+    return _error("rate_limited", "TIDAL rate-limited this machine; every agent TIDAL command is stopped.",
+                  "Stop and report to your human; do not retry. Only they clear it, by running "
+                  "`ticli agent unblock` in a terminal.")
+
+
+def _status_of(e) -> Optional[int]:
+    while e is not None:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if isinstance(status, int):
+            return status
+        e = e.__cause__
+    return None
+
+
+def classify(e) -> dict:
+    status = _status_of(e)
+    if status == 404 or type(e).__name__ == "ObjectNotFound":
+        return _error("not_found", f"{type(e).__name__}: {e}",
+                      "No such id. Playlist ids come from `playlist list` or `playlist create`; "
+                      "track ids from `resolve` or `search`.")
+    if status == 401 or type(e).__name__ == "AuthenticationError":
+        return _error("auth_failed", "TIDAL rejected the stored session.",
+                      "Ask your human to open ticli and log in again.")
+    return _error("api_error", f"{type(e).__name__}: {e}",
+                  "Not a rate limit and not auth. Report it to your human if it persists.")
+
+
+_inline = threading.local()
+
+
+def _background(fn) -> None:
+    if getattr(_inline, "on", False):
+        fn()
+    else:
+        threading.Thread(target=fn, daemon=True).start()
+
+
+def _reraise_inline() -> None:
+    """Call from an except block: the TUI's thread swallows, the agent queue must see it."""
+    if getattr(_inline, "on", False):
+        raise
 
 
 # ── lookups ──
@@ -341,24 +405,30 @@ def _radio(p, args):
 
 def _like(on: bool):
     def handler(p, args):
-        current = p._current_track
-        tid = args.get("track_id", getattr(current, "id", None))
-        if tid is None:
-            raise CommandError("no_track", "Nothing is playing; pass track_id.")
+        if args.get("track_ids") is not None or "track_id" in args:
+            ids = _ids(args)
+        else:
+            current = getattr(p._current_track, "id", None)
+            if current is None:
+                raise CommandError("no_track", "Nothing is playing; pass track_ids.")
+            ids = [current]
 
         def _run():
             try:
+                favorites = p.session.user.favorites
                 if on:
-                    p.session.user.favorites.add_track(tid)
-                    p._liked_ids.add(tid)
+                    # One POST for the lot: tidalapi joins a list with commas.
+                    favorites.add_track([str(t) for t in ids])
+                    p._liked_ids.update(ids)
                 else:
-                    p.session.user.favorites.remove_track(tid)
-                    p._liked_ids.discard(tid)
+                    for tid in ids:  # tidalapi's remove_track takes one id
+                        favorites.remove_track(str(tid))
+                        p._liked_ids.discard(tid)
             except Exception:
-                pass
+                _reraise_inline()
 
-        threading.Thread(target=_run, daemon=True).start()
-        return {"track_id": tid}
+        _background(_run)
+        return {"track_ids": ids} if len(ids) > 1 else {"track_id": ids[0]}
     return handler
 
 
@@ -369,32 +439,48 @@ def _editable_playlist(p, playlist_id):
     return None
 
 
+ADD_LIMIT = 100  # tidalapi Playlist.add: ids per POST
+
+
+def _live_playlist(p, playlist_id):
+    for found in (_editable_playlist(p, playlist_id), _known(p, "playlist", playlist_id)):
+        if hasattr(found, "add"):
+            return found
+    return None
+
+
 def _playlist_add(p, args) -> dict:
     if p._picker_busy:
         raise CommandError("busy", "A playlist change is still in flight.")
     playlist_id = args.get("id", "")
-    ids = [str(t) for t in _ids(args)]
+    ids = list(dict.fromkeys(str(t) for t in _ids(args)))
     playlist = args.get("playlist")
     if not hasattr(playlist, "add"):
-        playlist = _editable_playlist(p, playlist_id) or _known(p, "playlist", playlist_id)
+        playlist = _live_playlist(p, playlist_id)
     p._picker_busy = True
+    outcome = {"accepted": True}
 
     def _run():
         target = playlist
         try:
             if target is None:
                 target = p.session.playlist(playlist_id)
-            added = target.add(ids)
+            added = []
+            for start in range(0, len(ids), ADD_LIMIT):
+                # Each add is a POST plus tidalapi's reparse GET.
+                added += target.add(ids[start:start + ADD_LIMIT]) or []
+            outcome["added"] = len(added)
             p._remember_last_playlist(target)
             p._set_toast(f'{"Added to" if added else "Already in"} "{target.name}"')
         except Exception:
             p._set_toast("Failed to add to playlist")
+            _reraise_inline()
         finally:
             p._picker_busy = False
-        p._wake()
+            p._wake()
 
-    threading.Thread(target=_run, daemon=True).start()
-    return {"accepted": True}
+    _background(_run)
+    return outcome
 
 
 def _playlist_create(p, args) -> dict:
@@ -404,17 +490,22 @@ def _playlist_create(p, args) -> dict:
     if not name:
         raise CommandError("bad_args", "Playlist name can't be empty.")
     ids = [str(t) for t in args.get("track_ids") or []]
+    description = str(args.get("description") or "")
     # Set first: a second Enter on the same tick must already see this, or the playlist is created twice.
     p._picker_busy = True
+    outcome = {"accepted": True}
 
     def _run():
         try:
-            playlist = p.session.user.create_playlist(name, "")
+            playlist = p.session.user.create_playlist(name, description)
         except Exception:
             p._set_toast(f'Failed to create "{name}"')
             p._picker_busy = False
             p._wake()
+            _reraise_inline()
             return
+        outcome["playlist"] = playlist
+        p._remember("playlist", [playlist])
         p._remember_last_playlist(playlist)
         pid = _sid(playlist)
         p._editable_playlists = [playlist] + [
@@ -429,12 +520,13 @@ def _playlist_create(p, args) -> dict:
             p._set_toast(f'Created "{name}" and added track')
         except Exception:
             p._set_toast(f'Created "{name}", but failed to add track')
+            _reraise_inline()
         finally:
             p._picker_busy = False
-        p._wake()
+            p._wake()
 
-    threading.Thread(target=_run, daemon=True).start()
-    return {"accepted": True}
+    _background(_run)
+    return outcome
 
 
 def _playlist_remove(p, args) -> dict:
@@ -466,11 +558,12 @@ def _playlist_remove(p, args) -> dict:
                 p._set_toast("Failed to remove from playlist")
         except Exception:
             p._set_toast("Failed to remove from playlist")
+            _reraise_inline()
         finally:
             p._browse_remove_busy = False
             p._wake()
 
-    threading.Thread(target=_run, daemon=True).start()
+    _background(_run)
     return {"accepted": True}
 
 
@@ -583,17 +676,70 @@ def _logout(p, args):
     p.console.print("[yellow]Logged out. Tokens cleared.[/yellow]")
 
 
+SEARCH_KINDS = ("tracks", "albums", "artists", "playlists")
+
+
 def _search(p, args) -> dict:
     query = str(args.get("query") or "").strip()
     if not query:
         raise CommandError("bad_args", "query must not be empty.")
     limit, offset = int(args.get("limit") or 50), int(args.get("offset") or 0)
+    kinds = [k if k.endswith("s") else k + "s" for k in args.get("types") or SEARCH_KINDS]
+    if not set(kinds) <= set(SEARCH_KINDS):
+        raise CommandError("bad_args", "types are track, album, artist, playlist.")
     # One GET whatever the scope: `types=` carries all four and `limit` is per type.
     results = p.session.search(query, models=p._search_models(), limit=limit, offset=offset)
-    found = {kind: list(results.get(kind) or []) for kind in ("tracks", "albums", "artists", "playlists")}
+    found = {kind: list(results.get(kind) or []) for kind in SEARCH_KINDS}
     for kind, objs in found.items():
         p._remember(kind[:-1], objs)
-    return found
+    return {kind: found[kind] for kind in kinds}
+
+
+# Version qualifiers that make a track a different listen from the plain title.
+# "feat." is deliberately absent: a featured guest is the same recording.
+_QUALIFIER = re.compile(
+    r"\b(remix|edit|rework|bootleg|dub|instrumental|acoustic|acapella|"
+    r"live|demo|radio|extended|vip|version|mix)\b", re.I)
+_FEAT = re.compile(r"\s*[(\[]\s*(?:feat|ft|featuring|with)\.?\s[^)\]]*[)\]]", re.I)
+_NOISE = re.compile(r"[^a-z0-9]+")
+
+
+def normalize_title(title: str) -> str:
+    return _NOISE.sub(" ", _FEAT.sub("", title or "").lower()).strip()
+
+
+def rank_tracks(tracks, artist: str, title: str) -> dict:
+    """The strict matcher: artist is a gate, never a score; an unrequested
+    qualifier demotes; `confident` only for artist match + equal title + no qualifier."""
+    want_artist, want_title = normalize_title(artist), normalize_title(title)
+    asked_qualified = bool(_QUALIFIER.search(title or ""))
+    candidates = []
+    for t in tracks:
+        names = " ".join(a.name for a in (getattr(t, "artists", None) or []))
+        got_title = normalize_title(t.name)
+        exact = got_title == want_title
+        qualifier = not asked_qualified and bool(_QUALIFIER.search(t.name or ""))
+        score = (2 if exact else (1 if want_title in got_title else 0)) - (1 if qualifier else 0)
+        candidates.append({"track": t, "artist_match": want_artist in normalize_title(names),
+                           "title_exact": exact, "unrequested_qualifier": qualifier,
+                           "score": score})
+    candidates.sort(key=lambda c: (c["artist_match"], c["score"]), reverse=True)
+    best = candidates[0] if candidates else None
+    confident = bool(best and best["artist_match"] and best["title_exact"]
+                     and not best["unrequested_qualifier"])
+    return {"artist": artist, "title": title, "confident": confident, "best": best,
+            "candidates": candidates}
+
+
+def _resolve(p, args) -> dict:
+    artist, title = str(args.get("artist") or ""), str(args.get("title") or "")
+    if not artist or not title:
+        raise CommandError("bad_args", "resolve needs artist and title.")
+    results = p.session.search(f"{artist} {title}", models=p._search_models()[:1],
+                               limit=int(args.get("limit") or 10))
+    tracks = list(results.get("tracks") or [])
+    p._remember("track", tracks)
+    return rank_tracks(tracks, artist, title)
 
 
 def _album_tracks(p, args) -> dict:
@@ -661,41 +807,45 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("toggle", _toggle, tidal=True),
     Command("pause", _pause),
     Command("resume", _resume, tidal=True),
-    Command("seek", _seek, tidal=True),
+    Command("seek", _seek, tidal=True, params=("position",)),
     Command("next", _next, tidal=True),
     Command("prev", _prev, tidal=True),
     Command("queue.list", _queue_list, read=True),
-    Command("queue.play", _queue_play, tidal=True),
-    Command("queue.remove", _queue_remove, tidal=True),
-    Command("play.track", _play_track_cmd, tidal=True),
-    Command("play.album", _play_album, tidal=True),
-    Command("play.playlist", _play_playlist, tidal=True),
-    Command("play.artist", _play_artist, tidal=True),
+    Command("queue.play", _queue_play, tidal=True, params=("index",)),
+    Command("queue.remove", _queue_remove, tidal=True, params=("index",)),
+    Command("play.track", _play_track_cmd, tidal=True, params=("track_id",)),
+    Command("play.album", _play_album, tidal=True, params=("id", "index")),
+    Command("play.playlist", _play_playlist, tidal=True, params=("id", "index")),
+    Command("play.artist", _play_artist, tidal=True, params=("id", "section", "index")),
     Command("play.radio", _radio, tidal=True),
-    Command("like", _like(True), tidal=True),
-    Command("unlike", _like(False), tidal=True),
-    Command("playlist.create", _playlist_create, tidal=True),
-    Command("playlist.add", _playlist_add, tidal=True),
-    Command("playlist.remove", _playlist_remove, tidal=True, dangerous=True),
-    Command("download", _download, tidal=True),
+    Command("like", _like(True), tidal=True, params=("track_ids*",)),
+    Command("unlike", _like(False), tidal=True, params=("track_ids*",)),
+    Command("playlist.create", _playlist_create, tidal=True, params=("name", "track_ids*")),
+    Command("playlist.add", _playlist_add, tidal=True, params=("id", "track_ids*")),
+    Command("playlist.remove", _playlist_remove, tidal=True, dangerous=True,
+            params=("id", "index", "track_id")),
+    Command("download", _download, tidal=True, params=("track_ids*",)),
     Command("download.cancel", _download_cancel),
     Command("download.list", _download_list, read=True),
-    Command("download.delete", _download_delete, dangerous=True),
+    Command("download.delete", _download_delete, dangerous=True, params=("track_id",)),
     Command("refetch", _refetch, tidal=True),
     Command("refetch.cancel", _refetch_cancel),
     Command("settings.get", _settings_get, read=True),
-    Command("settings.set", _settings_set, dangerous=_settings_set_dangerous),
+    Command("settings.set", _settings_set, dangerous=_settings_set_dangerous,
+            params=("key", "value")),
     Command("cache.clear", _cache_clear, dangerous=True),
     Command("login.pkce", _login_pkce, tidal=True, dangerous=True),
     Command("logout", _logout, dangerous=True),
     Command("stop", _stop),
     Command("login.reload", _login_reload),
-    Command("history.add", _history_add),
-    Command("history.forget", _history_forget),
-    Command("search", _search, read=True, tidal=True),
-    Command("album.tracks", _album_tracks, read=True, tidal=True),
-    Command("playlist.tracks", _playlist_tracks, read=True, tidal=True),
-    Command("artist.section", _artist_section, read=True, tidal=True),
+    Command("history.add", _history_add, params=("query",)),
+    Command("history.forget", _history_forget, params=("query",)),
+    Command("search", _search, read=True, tidal=True, params=("query",)),
+    Command("resolve", _resolve, read=True, tidal=True, params=("artist", "title")),
+    Command("album.tracks", _album_tracks, read=True, tidal=True, params=("id",)),
+    Command("playlist.tracks", _playlist_tracks, read=True, tidal=True, params=("id",)),
+    Command("artist.section", _artist_section, read=True, tidal=True,
+            params=("id", "section", "limit")),
     Command("library.playlists", _library_playlists, read=True, tidal=True),
 )}
 

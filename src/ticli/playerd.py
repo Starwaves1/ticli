@@ -19,11 +19,13 @@ import signal
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
-from ticli import ipc
-from ticli.commands import AGENT, COMMANDS, HUMAN
+from ticli import agentq, ipc
+from ticli.commands import AGENT, COMMANDS, HUMAN, tripped_error
+from ticli.utils import throttle
 from ticli.utils.config import PROTECTED_KEYS, load_config
 
 logger = logging.getLogger(__name__)
@@ -44,7 +46,7 @@ class _Client:
 
 
 class PlayerServer:
-    def __init__(self, core, path: Optional[Path] = None):
+    def __init__(self, core, path: Optional[Path] = None, clock=time.time, sleep=time.sleep):
         self.core = core
         self.path = Path(path or ipc.socket_path())
         self.sel = selectors.DefaultSelector()
@@ -57,6 +59,9 @@ class PlayerServer:
         self._posted = collections.deque()
         self._agent_jobs: "queue.Queue" = queue.Queue()
         self._agent_worker: Optional[threading.Thread] = None
+        self.agent_queue = agentq.TidalQueue(
+            self._run_queued, lambda cmd, args: agentq.estimate(core, cmd, args),
+            clock=clock, sleep=sleep, on_idle=self.wake)
         self.wake_r, self.wake_w = os.pipe()
         os.set_blocking(self.wake_r, False)
         core._wake_r, core._wake_w = self.wake_r, self.wake_w
@@ -113,6 +118,7 @@ class PlayerServer:
         busy = ((core._download_job or {}).get("state") == "running"
                 or core._download_run is not None
                 or (core._refetch_job or {}).get("state") == "running")
+        busy = busy or self.agent_queue.busy()
         return self.had_client and not self.clients and not core._playing and not busy
 
     def wake(self) -> None:
@@ -140,6 +146,7 @@ class PlayerServer:
             except OSError:
                 pass
         self._agent_jobs.put(None)
+        self.agent_queue.stop()
         for fd in (self.wake_r, self.wake_w):
             try:
                 os.close(fd)
@@ -249,7 +256,9 @@ class PlayerServer:
         caller = HUMAN if message.get("caller") in ("tui", "human") else AGENT
         key = message.get("key")
         spec = COMMANDS.get(cmd)
-        if caller == AGENT:
+        if caller == AGENT and cmd == "status":
+            self._reply(client, rid, self._agent_status(key))
+        elif caller == AGENT:
             # One at a time, in order, off the loop: a wrong key costs a second (ADR-0007).
             self._start_agent_worker()
             self._agent_jobs.put((client, rid, cmd, args, key))
@@ -283,10 +292,164 @@ class PlayerServer:
                 if job is None:
                     return
                 client, rid, cmd, args, key = job
-                self._run_posted(client, rid, cmd, args, AGENT, key)
+                try:
+                    self._agent_intake(client, rid, cmd, args, key)
+                except Exception as e:
+                    logger.warning("Agent command %s failed: %r", cmd, e)
+                    self._post(client, rid, {"ok": False, "code": "failed", "reason": str(e)})
 
         self._agent_worker = threading.Thread(target=_work, daemon=True)
         self._agent_worker.start()
+
+    def _post(self, client, rid, message: dict) -> None:
+        self._posted.append((client, {"id": rid, **message}))
+        self.wake()
+
+    # ── agents: local commands at once, TIDAL ones through the queue ──
+
+    def _run_queued(self, job) -> dict:
+        agentq.instrument(self.core.session)
+        return self.core.commands.execute(job.cmd, job.args, caller=AGENT, key=job.key, inline=True)
+
+    def _state(self) -> dict:
+        status = self.core.commands.execute("status", caller=HUMAN)["result"]
+        return agentq.compact_state(status, len(self.agent_queue.pending()))
+
+    def _cost(self, requests=0, wait_s=0.0, eta_s=None) -> dict:
+        return {"requests": requests, "wait_s": wait_s,
+                "eta_s": self.agent_queue.eta_last() if eta_s is None else eta_s}
+
+    def _agent_status(self, key) -> dict:
+        result = {"pending": self.agent_queue.pending(), "done": self.agent_queue.done()}
+        return agentq.reply("status", {"ok": True, "result": result}, self._state(), self._cost())
+
+    def _admit(self, cmd: str, args: dict, key, queued: bool) -> tuple:
+        """("now", response) for one answered here, ("queue", waits) for one to queue,
+        or ("refused", error)."""
+        commands = self.core.commands
+        refused = commands.check(cmd, args, AGENT, key)
+        if refused:
+            return "refused", refused
+        spec = COMMANDS[cmd]
+        if spec.read and not self.core.config.get("allow_ai_control", True):
+            return "now", commands.execute(cmd, args, caller=AGENT, key=key)
+        if spec.tidal and throttle.tripped():
+            return "refused", tripped_error()
+        idle_local = (spec.tidal and not spec.read and not self.agent_queue.busy()
+                      and agentq.estimate(self.core, cmd, args) == 0)
+        if not queued and (not spec.tidal or idle_local):
+            return "now", commands.execute(cmd, args, caller=AGENT, key=key)
+        return "queue", spec.read or cmd in agentq.WAITS
+
+    def _merged_note(self, job) -> str:
+        if job.cmd == "like":
+            return f"{job.count} likes -> 1 request"
+        playlist = self.core._known.get(("playlist", str(job.args.get("id", ""))))
+        name = getattr(agentq._live_playlist(self.core, job.args.get("id", "")) or playlist,
+                       "name", job.args.get("id"))
+        return f'{job.count} adds to "{name}" -> {job.est} requests'
+
+    def _accepted(self, info: dict) -> dict:
+        job = info["job"]
+        result = {"queued": info["position"], "job": job.id}
+        if job.count > 1:
+            result["merged"] = self._merged_note(job)
+        return result
+
+    def _agent_intake(self, client, rid, cmd, args, key) -> None:
+        if cmd == "agent.do":
+            self._agent_do(client, rid, args.get("commands"), key)
+            return
+        kind, payload = self._admit(cmd, args, key, queued=False)
+        if kind == "refused":
+            self._post(client, rid, agentq.error_reply(payload))
+            return
+        if kind == "now":
+            self._post(client, rid, agentq.reply(cmd, payload, self._state(), self._cost()))
+            return
+        if payload:
+            def done(response):
+                cost = self._cost(**response.get("cost", {}))
+                self._post(client, rid, agentq.reply(cmd, response, self._state(), cost))
+            self.agent_queue.submit(cmd, args, key, on_done=done, waits=True)
+            return
+        info = self.agent_queue.submit(cmd, args, key)
+        cost = self._cost(info["job"].est, 0.0, info["eta_s"])
+        self._post(client, rid, agentq.reply(cmd, {"ok": True, "result": self._accepted(info)},
+                                             self._state(), cost))
+
+    def _agent_do(self, client, rid, items, key) -> None:
+        """Run a batch in order: local commands at once until the first TIDAL one,
+        then everything through the queue, submitted together so adds can merge."""
+        if not isinstance(items, list) or not items or not all(
+                isinstance(i, dict) and isinstance(i.get("cmd"), str)
+                and isinstance(i.get("args", {}), dict) for i in items):
+            self._post(client, rid, {"ok": False, "code": "bad_args",
+                                     "reason": 'do takes a non-empty list of {"cmd", "args"}.'})
+            return
+        records: list = [None] * len(items)
+        waits: dict = {}
+        queued, to_queue = False, []
+        for i, item in enumerate(items):
+            cmd, args = item["cmd"], dict(item.get("args") or {})
+            kind, payload = self._admit(cmd, args, key, queued)
+            if kind == "queue":
+                queued = True
+                to_queue.append((i, cmd, args, payload))
+                continue
+            records[i] = {"cmd": cmd, **(self._item(cmd, payload))}
+            if kind == "refused" or not payload.get("ok"):
+                for j in range(i + 1, len(items)):
+                    records[j] = {"cmd": items[j]["cmd"], "ok": False, "code": "skipped"}
+                break
+        lock = threading.Lock()
+        outstanding = [1 + sum(1 for *_, w in to_queue if w)]
+        requests = [0]
+        waited = [0.0]
+
+        def finish():
+            with lock:
+                outstanding[0] -= 1
+                if outstanding[0]:
+                    return
+            ok = all(r and r.get("ok") for r in records)
+            response = {"ok": True, "result": records}
+            reply = agentq.reply("do", response, self._state(),
+                                 self._cost(requests[0], round(waited[0], 1)))
+            reply["ok"] = ok
+            self._post(client, rid, reply)
+
+        def on_done(i, cmd):
+            def done(response):
+                cost = response.get("cost", {})
+                with lock:
+                    requests[0] += cost.get("requests", 0)
+                    waited[0] = max(waited[0], cost.get("wait_s", 0.0))
+                records[i] = {"cmd": cmd, **self._item(cmd, response)}
+                finish()
+            return done
+
+        infos = self.agent_queue.submit_many(
+            [(cmd, args, key, on_done(i, cmd) if w else None, w) for i, cmd, args, w in to_queue])
+        last, jobs = {}, {}
+        for (i, cmd, args, w), info in zip(to_queue, infos):
+            if not w:
+                job = info["job"]
+                records[i] = {"cmd": cmd, "ok": True, "queued": info["position"],
+                              "job": job.id, "eta_s": info["eta_s"]}
+                last[job.id], jobs[job.id] = i, job
+        for job_id, i in last.items():
+            if jobs[job_id].count > 1:
+                records[i]["merged"] = self._merged_note(jobs[job_id])
+        with lock:
+            requests[0] += sum(job.est for job in jobs.values())
+        finish()
+
+    @staticmethod
+    def _item(cmd, response) -> dict:
+        if not response.get("ok"):
+            return agentq.error_reply(response)
+        return {"ok": True, "result": agentq.render(response.get("result"))}
 
     def _deliver_posted(self) -> None:
         if not self._posted:

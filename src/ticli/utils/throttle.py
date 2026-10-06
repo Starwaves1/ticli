@@ -132,3 +132,16 @@ def unblock() -> bool:
         return was
     finally:
         os.close(fd)
+
+
+def next_free_at() -> float:
+    """When the next request slot opens (seconds since the epoch; 0 if never used)."""
+    if not _throttle_path().exists():
+        return 0.0
+    fd = _locked_state()
+    try:
+        return float(_read_state(fd).get("next_free_at", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    finally:
+        os.close(fd)
