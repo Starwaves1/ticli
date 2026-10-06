@@ -1981,15 +1981,14 @@ class HeadlessTidalPlayer:
                 self.session.audio_quality = wanted
             stream = track.get_stream()
         granted = getattr(stream, "audio_quality", None)
-        self._note_granted_quality(granted)
+        self._note_granted_quality(granted, wanted)
         manifest = stream.get_stream_manifest()
         if manifest.is_bts:
             return manifest.get_urls()[0], granted
         return (_write_hls_playlist(track.id, _hls_playlist(manifest.dash_info)),
                 granted)
 
-    def _note_granted_quality(self, granted: Optional[str]) -> None:
-        wanted = self.QUALITY_MAP.get(self._quality_name)
+    def _note_granted_quality(self, granted: Optional[str], wanted) -> None:
         if granted not in QUALITY_RANK or wanted not in QUALITY_RANK:
             return
         if QUALITY_RANK[granted] < QUALITY_RANK[wanted]:

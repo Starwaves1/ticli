@@ -791,7 +791,7 @@ class TestEntitlementGating:
 
     def test_a_missing_answer_gates_nothing(self, token_file):
         player = self._player_at("MAX")
-        player._note_granted_quality(None)
+        player._note_granted_quality(None, player.QUALITY_MAP["MAX"])
         assert player._quality_ceiling is None
 
     def test_better_news_lifts_an_earlier_ceiling(self, token_file):

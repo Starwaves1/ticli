@@ -2665,6 +2665,7 @@ class TestADownloadDoesNotLeakItsTierIntoTheSession:
         release.set()
         worker.join(5)
         playback.join(5)
+        assert not worker.is_alive() and not playback.is_alive()
         assert asked == [HeadlessTidalPlayer.QUALITY_MAP["MAX"]], \
             "a track played during a download was requested at the download's tier"
 
@@ -2689,6 +2690,7 @@ class TestADownloadDoesNotLeakItsTierIntoTheSession:
         p._apply_setting("quality", "MEDIUM")
         release.set()
         worker.join(5)
+        assert not worker.is_alive()
         assert self._playback_asks(p) == [HeadlessTidalPlayer.QUALITY_MAP["MEDIUM"]], \
             "the download put back the quality it found and undid the user's change"
 
@@ -2709,3 +2711,45 @@ class TestADownloadDoesNotLeakItsTierIntoTheSession:
         finally:
             release.set()
             worker.join(5)
+        assert not worker.is_alive()
+
+
+class TestAQualityCeilingComesFromWhatWasAskedFor:
+    """`_quality_ceiling` greys out tiers the login cannot have. Only a
+    request granted less than it asked for is evidence of that."""
+
+    def _track_granting(self, p, granted=None):
+        track = _track(tid=5)
+        track.get_stream = lambda: types.SimpleNamespace(
+            audio_quality=granted or str(p.session.config.quality),
+            get_stream_manifest=lambda: types.SimpleNamespace(
+                is_bts=True, get_urls=lambda: ["http://127.0.0.1/5.mp4"]))
+        return track
+
+    def _player(self):
+        p = _player(quality="MAX")
+        p.session = _TidalSession(HeadlessTidalPlayer.QUALITY_MAP["MAX"])
+        return p
+
+    def test_a_low_download_granted_low_sets_no_ceiling(self):
+        p = self._player()
+        p._download_stream_url(self._track_granting(p), "LOW")
+        assert p._quality_ceiling is None, \
+            "a LOW download greyed out the tiers above it"
+
+    def test_a_stepped_down_download_says_nothing_about_the_tier_above(self):
+        p = self._player()
+        p._download_stream_url(self._track_granting(p), "HIGH")
+        assert p._quality_ceiling is None
+        assert p._quality_unavailable("MAX") is False
+
+    def test_a_max_request_granted_lossless_still_sets_one(self):
+        p = self._player()
+        p._stream_url(self._track_granting(p, "LOSSLESS"))
+        assert p._quality_ceiling == "LOSSLESS"
+        assert p._quality_unavailable("MAX") is True
+
+    def test_a_download_granted_less_than_it_asked_for_sets_one(self):
+        p = self._player()
+        p._download_stream_url(self._track_granting(p, "LOW"), "HIGH")
+        assert p._quality_ceiling == "LOW"
