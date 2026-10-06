@@ -12,6 +12,8 @@ import `ticli.player` at module level: `ticli --help` stays instant.
 
 import json
 import re
+import shlex
+import time
 
 import click
 
@@ -31,8 +33,11 @@ NAMED = {"playlist.add": "playlist", "playlist.remove": "playlist", "playlist.tr
          "play.playlist": "playlist", "play.album": "album", "album.tracks": "album",
          "play.artist": "artist", "artist.section": "artist"}
 ID_FORM = {"playlist": re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
-           "album": re.compile(r"\d{3,}"), "artist": re.compile(r"\d{3,}")}
+           "album": re.compile(r"\d{5,}"), "artist": re.compile(r"\d{5,}")}
 PICK = re.compile(r"[1-9]\d?")
+PICK_TTL_SECONDS = 600
+PAGE = 100
+CONFIRM_ABOVE = 200
 URL = re.compile(r"(?:^|/)(track|album|playlist)/([0-9A-Za-z-]+)")
 CURRENT_BY_DEFAULT = ("like", "unlike", "download")
 SONG_FORMS = 'a track id, a TIDAL URL, "artist - title" or current'
@@ -57,8 +62,9 @@ class Link:
     """One connection to the player, kept for a whole verb so it cannot leave between
     the lookup and the action. Agents go through `ticli.agent.call` instead."""
 
-    def __init__(self, who: str):
+    def __init__(self, who: str, picks: bool = True):
         self.who = who
+        self.picks = picks  # `ticli agent` takes ids or names, never a number from an earlier list
         self.conn = None
 
     def running(self) -> bool:
@@ -265,20 +271,30 @@ def _picks_file():
     return throttle.STATE_DIR / "picks.json"
 
 
-def _save_picks(kind: str, rows: list) -> None:
+def _load_picks() -> dict:
+    try:
+        saved = json.loads(_picks_file().read_text())
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def _save_picks(who: str, kind: str, rows: list) -> None:
+    """Per caller, so a script's ambiguity never renumbers the list the human is reading."""
     try:
         throttle.STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _picks_file().write_text(json.dumps({"kind": kind, "rows": rows}))
+        saved = _load_picks()
+        saved[who] = {"kind": kind, "rows": rows, "at": time.time()}
+        _picks_file().write_text(json.dumps(saved))
     except OSError:
         pass
 
 
-def _take_pick(kind: str, text: str):
+def _take_pick(who: str, kind: str, text: str):
     if not PICK.fullmatch(text):
         return None
-    try:
-        saved = json.loads(_picks_file().read_text())
-    except (OSError, ValueError):
+    saved = _load_picks().get(who)
+    if not isinstance(saved, dict) or time.time() - (saved.get("at") or 0) > PICK_TTL_SECONDS:
         return None
     rows = saved.get("rows") or []
     if saved.get("kind") != kind or not 1 <= int(text) <= len(rows):
@@ -292,11 +308,11 @@ def _row(kind: str, obj: dict) -> dict:
         {"num_tracks": obj["num_tracks"]} if obj.get("num_tracks") else {})}
 
 
-def _ambiguous(kind: str, text: str, rows: list, example: str) -> Stop:
+def _ambiguous(link: Link, kind: str, text: str, rows: list, example: str) -> Stop:
     rows = rows[:TOP]
-    _save_picks(kind, rows)
-    who = caller()
-    if who == AGENT:
+    if link.picks:
+        _save_picks(link.who, kind, rows)
+    if link.who == AGENT:
         return Stop(refusal("ambiguous", f'"{text}" matches several {kind}s.',
                             "Pick one and run the command again with its id instead of the name.",
                             candidates=rows))
@@ -323,20 +339,25 @@ def resolve_name(link: Link, kind: str, token, example: str) -> tuple:
     """(id, label). Own playlists in the local index first (0 requests); else one
     TIDAL search. Several equally good matches stop with a numbered top 5."""
     text = str(token).strip()
-    picked = _take_pick(kind, text)
-    if picked:
-        return picked["id"], picked["name"]
     if ID_FORM[kind].fullmatch(text):
         return text, text
     wanted = text.casefold()
-    if kind in ("playlist", "album", "artist"):
-        own = _local_playlists(link.who) if kind == "playlist" else _local_favorites(link.who, kind)
-        exact = [p for p in own if p["name"].casefold() == wanted]
-        loose = exact or ([p for p in own if wanted in p["name"].casefold()] if kind == "playlist" else [])
-        if len(loose) == 1:
-            return loose[0]["id"], loose[0]["name"]
-        if loose:
-            raise _ambiguous(kind, text, loose, example)
+    own = _local_playlists(link.who) if kind == "playlist" else _local_favorites(link.who, kind)
+    exact = [p for p in own if p["name"].casefold() == wanted]
+    if len(exact) == 1:
+        return exact[0]["id"], exact[0]["name"]
+    picked = _take_pick(link.who, kind, text) if link.picks else None
+    if picked:
+        return picked["id"], picked["name"]
+    # Favourites match by exact name only; a loose hit there must not hide TIDAL's answer.
+    loose = exact or ([p for p in own if wanted in p["name"].casefold()] if kind == "playlist" else [])
+    if len(loose) == 1:
+        return loose[0]["id"], loose[0]["name"]
+    if loose:
+        raise _ambiguous(link, kind, text, loose, example)
+    if link.who == AGENT and not _ai_control():
+        raise Stop(refusal("not_found", f'None of your playlists matches "{text}".',
+                           "AI control is off, so TIDAL was not searched; pass an id."))
     reply = link.ask("search", {"query": text, "types": [kind], "limit": TOP})
     if not reply.get("ok"):
         raise Stop(reply)
@@ -348,7 +369,12 @@ def resolve_name(link: Link, kind: str, token, example: str) -> tuple:
     if not rows:
         raise Stop(refusal("not_found", f'No {kind} matches "{text}".',
                            f"Try `ticli search {text}` or pass an id."))
-    raise _ambiguous(kind, text, exact or rows, example)
+    raise _ambiguous(link, kind, text, exact or rows, example)
+
+
+def _ai_control() -> bool:
+    from ticli.utils.config import load_config
+    return bool(load_config().get("allow_ai_control", True))
 
 
 # ── songs ──
@@ -391,10 +417,7 @@ def resolve_song(link: Link, token) -> list:
         kind, ident = found[-1]
         if kind == "track":
             return [ident]
-        reply = link.ask(f"{kind}.tracks", {"id": ident})
-        if not reply.get("ok"):
-            raise Stop(reply)
-        return [str(t["id"]) for t in reply["result"].get("tracks", [])]
+        return _all_tracks(link, kind, ident)
     artist, sep, title = text.partition(" - ")
     if not sep or not artist.strip() or not title.strip():
         raise Stop(refusal("bad_args", f"Not a song: {text!r}.", f"Use {SONG_FORMS}."))
@@ -420,6 +443,26 @@ def _favorite_song(who: str, artist: str, title: str):
     return str(ranked["best"]["track"].id) if ranked["confident"] else None
 
 
+def _all_tracks(link: Link, kind: str, ident: str) -> list:
+    """Every track of an album or playlist, a page at a time."""
+    ids, total = [], None
+    while True:
+        reply = link.ask(f"{kind}.tracks", {"id": ident, "offset": len(ids), "limit": PAGE})
+        if not reply.get("ok"):
+            raise Stop(reply)
+        page = reply["result"].get("tracks", [])
+        total = reply["result"].get("num_tracks") or total
+        ids += [str(t["id"]) for t in page]
+        if not page or not total or len(ids) >= total:
+            break
+    if total and len(ids) < total:
+        click.echo(f"note: got {len(ids)} of {total} tracks of that {kind}", err=True)
+    if link.who == HUMAN and len(ids) > CONFIRM_ABOVE and not click.confirm(
+            f"That {kind} is {len(ids)} tracks. Use them all?", default=False):
+        raise Stop(refusal("cancelled", "cancelled"))
+    return ids
+
+
 # ── running a verb ──
 
 
@@ -437,7 +480,8 @@ def prepare(link: Link, cmd: str, args: dict) -> tuple:
     """(command, args) with names and songs turned into ids."""
     from ticli.commands import COMMANDS
     args = dict(args)
-    example = f'ticli {cmd.replace(".", " ")} 2'
+    songs = args.get("track_ids") if isinstance(args.get("track_ids"), list) else []
+    example = " ".join(["ticli", cmd.replace(".", " "), "2", *(shlex.quote(str(t)) for t in songs)])
     kind = NAMED.get(cmd)
     if kind and "id" in args:
         args["id"], _label = resolve_name(link, kind, args["id"], example)
@@ -464,12 +508,13 @@ def prepare(link: Link, cmd: str, args: dict) -> tuple:
 
 
 def run(cmd: str, args: dict, then=None, label=None) -> None:
+    from ticli.commands import COMMANDS
     who = caller()
     link = Link(who)
     try:
         try:
             if who == AGENT:
-                guard(cmd, who)
+                guard(cmd, who, read=COMMANDS[cmd].read)
             cmd, args = prepare(link, cmd, args)
             if who == HUMAN and not confirmed(cmd, args):
                 click.echo("cancelled", err=True)
@@ -493,8 +538,15 @@ def verb(dotted: str, tokens) -> None:
     run(dotted, args)
 
 
+def _saved_status() -> dict:
+    from ticli.commands import _disk_status
+    from ticli.utils.config import load_config
+    return _disk_status(load_config(), {})
+
+
 def transport(cmd: str) -> None:
-    """pause/resume/next/prev/status: never start the player just to answer."""
+    """pause/resume/next/prev/status: never start the player just to answer. Only
+    `resume` with a saved track starts it: the human asked for music."""
     from ticli.utils.config import load_config
     who = caller()
     try:
@@ -504,9 +556,17 @@ def transport(cmd: str) -> None:
     link = Link(who)
     from_disk = cmd == "status" and who == AGENT and not load_config().get("allow_ai_control", True)
     if not link.running() and not from_disk:
-        click.echo("nothing playing")
-        raise SystemExit(0 if cmd == "status" else 1)
-    say(who, cmd, link.ask(cmd))
+        saved = _saved_status()
+        if cmd == "status" and saved.get("track"):
+            click.echo(status_line({"result": saved}).replace("paused:", "paused (saved):", 1))
+            raise SystemExit(0)
+        if not (cmd == "resume" and saved.get("track")):
+            click.echo("nothing playing")
+            raise SystemExit(0 if cmd == "status" else 1)
+    try:
+        say(who, cmd, link.ask(cmd))
+    finally:
+        link.close()
 
 
 def search(words, types, limit) -> None:

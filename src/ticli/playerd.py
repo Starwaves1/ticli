@@ -352,6 +352,9 @@ class PlayerServer:
 
     def _run_queued(self, job) -> dict:
         agentq.instrument(self.core.session)
+        if job.cmd in ("playlist.add", "playlist.create"):
+            # A human's playlist write in flight finishes first; this one is not refused for it.
+            command_layer.wait_picker_idle(self.core)
         return self.core.commands.execute(job.cmd, job.args, caller=AGENT, key=job.key, inline=True)
 
     def _state(self) -> dict:
@@ -378,9 +381,9 @@ class PlayerServer:
             return "now", commands.execute(cmd, args, caller=AGENT, key=key)
         if spec.tidal and throttle.tripped():
             return "refused", tripped_error()
-        idle_local = (spec.tidal and not spec.read and not self.agent_queue.busy()
-                      and agentq.estimate(self.core, cmd, args) == 0)
-        if not queued and (not spec.tidal or idle_local):
+        local = not spec.tidal or (not spec.read and agentq.estimate(self.core, cmd, args) == 0)
+        # Behind queued TIDAL work an action keeps its place in line; reads answer at once.
+        if not queued and local and (spec.read or not self.agent_queue.busy()):
             return "now", commands.execute(cmd, args, caller=AGENT, key=key)
         # Offline the queue reconnects first; the agent waits for that answer, never a "queued".
         return "queue", spec.read or cmd in agentq.WAITS or self.core._connectivity != ONLINE
@@ -446,6 +449,7 @@ class PlayerServer:
                     records[j] = {"cmd": items[j]["cmd"], "ok": False, "code": "skipped"}
                 break
         lock = threading.Lock()
+        replied = [False]
         outstanding = [1 + sum(1 for *_, w in to_queue if w)]
         requests = [0]
         waited = [0.0]
@@ -453,8 +457,9 @@ class PlayerServer:
         def finish():
             with lock:
                 outstanding[0] -= 1
-                if outstanding[0]:
+                if outstanding[0] or replied[0]:
                     return
+                replied[0] = True
             ok = all(r and r.get("ok") for r in records)
             response = {"ok": True, "result": records}
             reply = agentq.reply("do", response, self._state(),
@@ -472,8 +477,16 @@ class PlayerServer:
                 finish()
             return done
 
-        infos = self.agent_queue.submit_many(
-            [(cmd, args, key, on_done(i, cmd) if w else None, w) for i, cmd, args, w in to_queue])
+        try:
+            infos = self.agent_queue.submit_many(
+                [(cmd, args, key, on_done(i, cmd) if w else None, w) for i, cmd, args, w in to_queue])
+        except Exception as e:
+            with lock:
+                replied[0] = True
+            logger.warning("agent.do could not queue its commands: %r", e)
+            self._post(client, rid, {"ok": False, "code": "failed", "reason": str(e) or type(e).__name__,
+                                     "result": records})
+            return
         last, jobs = {}, {}
         for (i, cmd, args, w), info in zip(to_queue, infos):
             if not w:

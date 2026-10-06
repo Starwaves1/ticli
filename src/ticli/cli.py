@@ -221,7 +221,7 @@ def agent(ctx, key):
     "message": ..., "hint": ...} with a nonzero exit. The human's TUI
     settings decide what agents may do; a refusal says what to ask them.
     """
-    ctx.obj = {"key": key}
+    ctx.obj = {**(ctx.obj or {}), **({"key": key} if key else {})}
 
 
 @agent.command()

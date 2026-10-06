@@ -15,7 +15,7 @@ from click.testing import CliRunner
 
 from ticli import commands, ipc
 from ticli.cli import cli
-from ticli.tests.agent_harness import Harness
+from ticli.tests.agent_harness import GYM, ROAD, Harness
 from ticli.tests.fakes import (
     FakeTidal, fake_album, fake_playlist, fake_track,
 )
@@ -149,10 +149,8 @@ class TestPlaylistsAndLikes:
     def test_list_and_show(self, player, tty):
         h = player()
         h.road.items = [fake_track(5, "Song", ["Band"])]
-        assert ticli("playlist", "list").output.splitlines() == [
-            "road  Road trip (1 tracks)", "gym  Gym (0 tracks)"][:0] or True
         listed = ticli("playlist", "list").output
-        assert "road  Road trip" in listed and "gym  Gym" in listed
+        assert f"{ROAD}  Road trip (1 tracks)" in listed and f"{GYM}  Gym" in listed
         shown = ticli("playlist", "show", "road trip").output
         assert "Road trip" in shown and "5  Band - Song" in shown
 
@@ -218,7 +216,7 @@ class TestStart:
     def test_no_tui_only_plays(self, player, tty, tui):
         h = player()
         h.gym.items = [fake_track(8)]
-        assert ticli("start", "playlist", "gym", "--no-tui").exit_code == 0
+        assert ticli("start", "playlist", "Gym", "--no-tui").exit_code == 0
         assert [t.id for t in h.core._queue] == [8] and tui == []
 
     def test_ambiguous_prints_a_numbered_top_five_and_a_number_picks(self, player, tty, tui):
@@ -243,7 +241,7 @@ class TestStart:
         result = ticli("start", "playlist", "edm")
         out = json.loads(result.output)
         assert out["code"] == "ambiguous"
-        assert [c["id"] for c in out["candidates"]] == ["road", "gym"]
+        assert [c["id"] for c in out["candidates"]] == [ROAD, GYM]
 
     def test_no_local_match_makes_exactly_one_tidal_request(self, player, tty, tui):
         pid = "8f1b2c3d-1111-2222-3333-444455556666"
@@ -271,7 +269,7 @@ class TestStart:
 
 class TestSongForms:
     def add(self, *song):
-        return ticli("playlist", "add", "road", *song)
+        return ticli("playlist", "add", ROAD, *song)
 
     def test_a_track_id(self, player, tty):
         h = player()
@@ -296,7 +294,7 @@ class TestSongForms:
     def test_a_playlist_url_is_all_its_tracks(self, player, tty):
         h = player()
         h.gym.items = [fake_track(81), fake_track(82)]
-        assert self.add("https://tidal.com/browse/playlist/gym").exit_code == 0
+        assert self.add(f"https://tidal.com/browse/playlist/{GYM}").exit_code == 0
         settle(h, lambda: h.road.adds)
         assert h.road.adds == [["81", "82"]]
 
@@ -308,8 +306,8 @@ class TestSongForms:
 
     def test_current_with_nothing_playing_does_not_start_the_player(self, tty, spawned):
         from ticli.tests.fakes import fake_playlist
-        MetadataCache().put_playlists([fake_playlist("road", "Road trip")])
-        result = ticli("playlist", "add", "road", "current")
+        MetadataCache().put_playlists([fake_playlist(ROAD, "Road trip")])
+        result = ticli("playlist", "add", ROAD, "current")
         assert result.exit_code == 1 and "no_track" in result.output and spawned == []
 
     def test_artist_dash_title_adds_only_when_confident(self, player, tty):
@@ -387,3 +385,147 @@ class TestQueueOps:
         h = player()
         reply = h.agent("queue.remove", {"index": 2, "track_id": 1})
         assert reply["code"] == "stale" and len(h.core._queue) == 3
+
+
+class TestSavedQueueWithNoPlayer:
+    @pytest.fixture
+    def saved(self):
+        from ticli.utils import throttle
+        throttle.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (throttle.STATE_DIR / "player_state.json").write_text(json.dumps({
+            "tracks": [{"id": 251380837, "name": "One More Time", "artists": ["Daft Punk"],
+                        "duration": 320}], "queue_index": 0, "position": 61}))
+
+    def test_status_reads_the_saved_queue(self, tty, spawned, saved):
+        result = ticli("status")
+        assert result.exit_code == 0 and spawned == []
+        assert result.output.strip() == "paused (saved): Daft Punk - One More Time [1:01/5:20] (queue 1/1)"
+
+    @pytest.mark.parametrize("verb", ["pause", "next", "prev"])
+    def test_other_transport_still_does_not_start_it(self, tty, spawned, saved, verb):
+        result = ticli(verb)
+        assert result.output.strip() == "nothing playing" and spawned == []
+
+    def test_resume_starts_the_player_and_plays(self, tty, saved, monkeypatch):
+        made = []
+
+        def spawn(*a, **kw):
+            made.append(Harness())
+            made[-1].core._playing = False
+            return "ready"
+        monkeypatch.setattr(ipc, "spawn_player", spawn)
+        try:
+            result = ticli("resume")
+            assert result.exit_code == 0 and result.output.strip() == "resumed"
+            assert len(made) == 1 and made[0].core._playing is True
+        finally:
+            for h in made:
+                h.stop()
+
+    def test_resume_with_nothing_saved_says_so(self, tty, spawned):
+        result = ticli("resume")
+        assert result.output.strip() == "nothing playing" and spawned == []
+
+
+class TestScriptReadsWithAiControlOff:
+    def test_search_and_playlist_list_answer_from_disk(self, spawned):
+        MetadataCache().put_playlists([fake_playlist(ROAD, "Foo Fighters mix")])
+        config_mod.save_config({**config_mod.DEFAULTS, "allow_ai_control": False})
+        searched = ticli("search", "foo")
+        assert searched.exit_code == 0 and "Foo Fighters mix" in searched.output
+        listed = ticli("playlist", "list")
+        assert listed.exit_code == 0 and f"{ROAD}  Foo Fighters mix" in listed.output
+        assert spawned == []
+        assert ticli("pause").exit_code == 1
+
+
+class TestLongLists:
+    def _album(self, session, n):
+        session.album_tracks["424242"] = [fake_track(251380000 + i) for i in range(n)]
+
+    def test_an_album_url_pages_through_every_track(self, player):
+        session = FakeTidal()
+        h = player(session=session)
+        self._album(session, 250)
+        assert ticli("playlist", "add", ROAD, "https://tidal.com/browse/album/424242").exit_code == 0
+        h.idle()
+        assert [len(a) for a in h.road.adds] == [100, 100, 50]
+        assert session.requests.count("GET albums/424242") == 1
+
+    def test_a_human_is_asked_above_two_hundred(self, player, tty):
+        session = FakeTidal()
+        h = player(session=session)
+        self._album(session, 250)
+        declined = ticli("playlist", "add", ROAD, "https://tidal.com/browse/album/424242", input="\n")
+        assert declined.exit_code == 1 and "250 tracks" in declined.output
+        time.sleep(0.1)
+        assert h.road.adds == []
+        accepted = ticli("playlist", "add", ROAD, "https://tidal.com/browse/album/424242", input="y\n")
+        assert accepted.exit_code == 0
+        settle(h, lambda: sum(map(len, h.road.adds)) == 250)
+
+    def test_a_list_that_comes_up_short_says_n_of_m(self, player, tty, monkeypatch):
+        import types
+        session = FakeTidal()
+        h = player(session=session)
+        tracks = [fake_track(251380000 + i) for i in range(10)]
+        monkeypatch.setattr(session, "album", lambda aid: types.SimpleNamespace(
+            id=aid, name="A", num_tracks=12,
+            tracks=lambda limit=None, offset=0: tracks[offset:offset + (limit or 10)]))
+        result = ticli("playlist", "add", ROAD, "https://tidal.com/browse/album/424242")
+        assert result.exit_code == 0 and "got 10 of 12 tracks" in result.output
+        settle(h, lambda: h.road.adds)
+
+
+class TestPicks:
+    @pytest.fixture
+    def edm(self, player):
+        h = player()
+        h.road.name, h.gym.name = "EDM one", "EDM two"
+        MetadataCache().put_playlists([h.road, h.gym])
+        h.gym.items = [fake_track(9)]
+        h.road.items = [fake_track(8)]
+        return h
+
+    @pytest.fixture
+    def tui(self, monkeypatch):
+        from ticli import player as player_mod
+        monkeypatch.setattr(player_mod, "run_tui", lambda **kw: None)
+
+    def test_a_pick_expires(self, edm, tty, tui):
+        from ticli import humancli
+        assert ticli("start", "playlist", "edm").exit_code == 1
+        saved = json.loads(humancli._picks_file().read_text())
+        saved["human"]["at"] -= humancli.PICK_TTL_SECONDS + 1
+        humancli._picks_file().write_text(json.dumps(saved))
+        assert ticli("start", "playlist", "2", "--no-tui").exit_code == 1
+        assert edm.core._queue[0].id == 1
+
+    def test_a_scripts_ambiguity_keeps_the_humans_numbering(self, edm, tty, tui, monkeypatch):
+        assert ticli("start", "playlist", "edm").exit_code == 1  # 1. EDM one  2. EDM two
+        three = fake_playlist("aaaaaaaa-0000-4000-8000-00000000000e", "EDM three")
+        MetadataCache().put_playlists([three, edm.gym, edm.road])
+        monkeypatch.setattr(commands, "cli_caller", lambda stdin=None: commands.AGENT)
+        script = json.loads(ticli("start", "playlist", "edm").output)
+        assert script["code"] == "ambiguous" and script["candidates"][0]["name"] == "EDM three"
+        monkeypatch.setattr(commands, "cli_caller", lambda stdin=None: commands.HUMAN)
+        assert ticli("start", "playlist", "1", "--no-tui").exit_code == 0
+        assert [t.id for t in edm.core._queue] == [8]
+
+    def test_an_exact_local_name_beats_a_stale_pick(self, edm, tty, tui):
+        assert ticli("start", "playlist", "edm").exit_code == 1
+        edm.road.name = "2"
+        MetadataCache().put_playlists([edm.road, edm.gym])
+        assert ticli("start", "playlist", "2", "--no-tui").exit_code == 0
+        assert [t.id for t in edm.core._queue] == [8]
+
+    def test_the_add_hint_keeps_the_song(self, edm, tty):
+        result = ticli("playlist", "add", "edm", "251380837")
+        assert result.exit_code == 1 and "ticli playlist add 2 251380837" in result.output
+
+    def test_a_short_number_is_an_album_name(self, player, tty, tui):
+        album = fake_album(424242, "1989", "Taylor Swift", [fake_track(61)])
+        h = player(session=FakeTidal(search_albums=[album]))
+        assert ticli("start", "album", "1989", "--no-tui").exit_code == 0
+        assert h.session.requests.count("GET search") == 1
+        assert [t.id for t in h.core._queue] == [61]

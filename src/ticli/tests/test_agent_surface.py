@@ -24,7 +24,7 @@ from click.testing import CliRunner
 from ticli import agent as agent_mod
 from ticli import ipc
 from ticli.cli import cli
-from ticli.tests.agent_harness import Harness
+from ticli.tests.agent_harness import GYM, ROAD, Harness
 from ticli.tests.fakes import FakeResponse, FakeTidal
 from ticli.utils import throttle
 
@@ -335,8 +335,8 @@ class TestCliContract:
 
     def test_do_reads_a_batch_from_stdin_and_merges_adds(self, player):
         h = player()
-        batch = json.dumps(["playlist add road 1",
-                            {"cmd": "playlist.add", "args": {"id": "road", "track_ids": [2]}},
+        batch = json.dumps([f"playlist add {ROAD} 1",
+                            {"cmd": "playlist.add", "args": {"id": ROAD, "track_ids": [2]}},
                             "queue list"])
         result, out = agent("do", input=batch)
         assert result.exit_code == 0 and out["ok"]
@@ -345,14 +345,14 @@ class TestCliContract:
         assert len(listed["result"]["tracks"]) == 3
         h.idle()
         assert h.road.adds == [["1", "2"]]
-        assert h.session.requests == ["POST playlists/road/items", "GET playlists/road"]
+        assert h.session.requests == [f"POST playlists/{ROAD}/items", f"GET playlists/{ROAD}"]
 
     def test_status_lists_what_the_running_player_has_queued(self, player, monkeypatch):
         h = player()
         monkeypatch.setattr(agent_mod, "_player_running", lambda: True)
         h.hold()
-        agent("playlist", "add", "road", "1")
-        agent("playlist", "add", "road", "2")
+        agent("playlist", "add", ROAD, "1")
+        agent("playlist", "add", ROAD, "2")
         _, out = agent("status")
         assert out["pending"] == [{"job": 1, "cmd": "playlist.add", "eta_s": 4.0, "merged": 2}]
         assert out["state"]["pending"] == 1 and "status" in out["next"]
@@ -362,7 +362,7 @@ class TestCliContract:
 
     def test_a_typical_reply_stays_small(self, player):
         player()
-        for args in (("pause",), ("playlist", "add", "road", "1"), ("next",)):
+        for args in (("pause",), ("playlist", "add", ROAD, "1"), ("next",)):
             result = CliRunner().invoke(cli, ["agent", *args])
             assert result.exit_code == 0 and len(result.output) < 450, result.output
 
@@ -456,14 +456,14 @@ class TestAgentDocs:
 class TestErrorClassification:
     def test_a_404_is_not_found_not_an_outage(self, player):
         player()
-        result, out = agent("playlist", "show", "nope")
+        result, out = agent("playlist", "show", "aaaaaaaa-0000-4000-8000-000000000404")
         assert result.exit_code == 1 and out["error"] == "not_found"
         assert "playlist list" in out["hint"]  # says where real ids come from
 
     def test_other_failures_are_api_error_with_a_hint(self, player):
         h = player()
         h.session.request_session.answers = [FakeResponse(500)]
-        result, out = agent("playlist", "show", "road")
+        result, out = agent("playlist", "show", ROAD)
         assert result.exit_code == 1 and out["error"] == "api_error"
         assert out["hint"]  # the docs promise every code carries one
 
@@ -496,7 +496,7 @@ class TestPermissions:
 
     def test_ai_control_off_refuses_actions_without_starting_the_player(self, no_player):
         self._settings(allow_ai_control=False)
-        for args in (("playlist", "add", "road", "1"), ("pause",), ("do", '["pause"]')):
+        for args in (("playlist", "add", ROAD, "1"), ("pause",), ("do", '["pause"]')):
             result, out = agent(*args)
             refusal = out["result"][0] if args[0] == "do" else out
             assert result.exit_code == 1 and refusal["code"] == "ai_control_off", args
@@ -537,7 +537,7 @@ class TestPermissions:
         by_env, out_env = agent("playlist", "list", env={"TICLI_AI_KEY": "open sesame"})
         _, out_flag = agent("--key", "open sesame", "queue", "list")
         assert out_env["ok"] and out_flag["ok"]
-        assert [p["id"] for p in out_env["playlists"]] == ["road", "gym"]
+        assert [p["id"] for p in out_env["playlists"]] == [ROAD, GYM]
         h.core.commands._sleep = lambda s: None
         _, wrong = agent("pause", env={"TICLI_AI_KEY": "nope"})
         assert wrong["code"] == "wrong_key"
@@ -556,3 +556,100 @@ class TestPermissions:
         for phrase in ("Only the human can change them", "never edit config.json",
                        "TICLI_AI_KEY", "Ask your human", "dangerous_off", "key_required"):
             assert phrase in render(), phrase
+
+
+class TestAgentNamesAndSongs:
+    """`ticli agent <verb>` takes names and songs like `ticli <verb>`, at the same request cost."""
+
+    def _added(self, h, playlist):
+        h.idle()
+        return playlist.adds
+
+    def test_a_track_id_and_a_uuid_cost_nothing_to_resolve(self, player):
+        h = player()
+        result, out = agent("playlist", "add", ROAD, "251380837")
+        assert result.exit_code == 0 and out["ok"]
+        assert self._added(h, h.road) == [["251380837"]]
+        assert h.session.requests == [f"POST playlists/{ROAD}/items", f"GET playlists/{ROAD}"]
+
+    def test_an_own_playlist_name_is_found_locally(self, player):
+        from ticli.utils.cache import MetadataCache
+        h = player()
+        MetadataCache().put_playlists([h.road, h.gym])
+        result, out = agent("playlist", "add", "road trip", "251380837")
+        assert result.exit_code == 0 and out["playlist_id"] == ROAD
+        assert self._added(h, h.road) == [["251380837"]]
+        assert "GET search" not in h.session.requests
+        from ticli.tests.fakes import fake_track
+        h.gym.items = [fake_track(251380838)]
+        result, out = agent("play", "playlist", "Gym")
+        assert result.exit_code == 0 and out["ok"]
+        h.idle()
+        assert [t.id for t in h.core._queue] == [251380838]
+        assert "GET search" not in h.session.requests
+
+    def test_another_name_is_exactly_one_search(self, player):
+        from ticli.tests.fakes import fake_track
+        pid = "8f1b2c3d-1111-2222-3333-444455556666"
+        session = FakeTidal()
+        player(session=session)
+        session.search_playlists = [session.add_playlist(pid, "EDM Mix", [fake_track(251380837)])]
+        result, out = agent("playlist", "show", "edm mix")
+        assert result.exit_code == 0 and [t["id"] for t in out["tracks"]] == [251380837]
+        assert session.requests.count("GET search") == 1
+
+    def test_an_ambiguous_name_returns_candidates_and_saves_no_pick(self, player):
+        from ticli import humancli
+        from ticli.utils.cache import MetadataCache
+        h = player()
+        h.road.name, h.gym.name = "EDM one", "EDM two"
+        MetadataCache().put_playlists([h.road, h.gym])
+        result, out = agent("playlist", "add", "edm", "251380837")
+        assert result.exit_code == 1 and out["code"] == "ambiguous"
+        assert [c["id"] for c in out["candidates"]] == [ROAD, GYM]
+        assert not humancli._picks_file().exists()
+
+    def test_artist_dash_title_adds_only_when_confident(self, player):
+        from ticli.tests.fakes import fake_track
+        session = FakeTidal(search_tracks=[fake_track(251380837, "One More Time", ["Daft Punk"])])
+        h = player(session=session)
+        result, out = agent("playlist", "add", ROAD, "Daft Punk - One More Time")
+        assert result.exit_code == 0 and out["requested"] == 1
+        assert self._added(h, h.road) == [["251380837"]]
+        assert session.requests.count("GET search") == 1
+        session.search_tracks = [fake_track(251380838, "One More Time (Remix)", ["Daft Punk"])]
+        result, out = agent("like", "Daft Punk - One More Time")
+        assert result.exit_code == 1 and out["code"] == "not_confident"
+        assert out["candidates"][0]["id"] == "251380838"
+
+    def test_ai_control_off_matches_own_playlists_only(self, monkeypatch, spawned):
+        from ticli.tests.fakes import fake_playlist
+        from ticli.utils import config as config_mod
+        from ticli.utils.cache import MetadataCache
+        connects = []
+        monkeypatch.setattr(ipc, "connect", lambda *a: connects.append(a))
+        config_mod.save_config({**config_mod.DEFAULTS, "allow_ai_control": False})
+        MetadataCache().put_playlists([fake_playlist(ROAD, "Road trip")])
+        result, out = agent("playlist", "show", "nothing like it")
+        assert result.exit_code == 1 and out["code"] == "not_found"
+        assert "not searched" in out["fix"] and spawned == [] and connects == []
+
+
+class TestKeyAndDocsFixes:
+    def test_the_top_level_key_reaches_agent_verbs(self, player):
+        from ticli.utils.config import DEFAULTS, hash_ai_key, save_config
+        save_config({**DEFAULTS, "ai_control_key": hash_ai_key("sesame")})
+        h = player()
+        result = CliRunner().invoke(cli, ["--key", "sesame", "agent", "pause"])
+        assert result.exit_code == 0, result.output
+        assert h.core._playing is False
+
+    def test_docs_say_create_waits_and_what_do_returns(self):
+        from ticli.agent_docs import render
+        docs = render()
+        create = next(line for line in docs.splitlines() if "(`playlist.create`)" in line)
+        assert "waits its turn and returns the result" in create
+        for phrase in ("Local\n  items before the first TIDAL item run immediately",
+                       "A queued item that fails later\n  skips nothing",
+                       "items queued before it still run", "one record per item, in order"):
+            assert " ".join(phrase.split()) in " ".join(docs.split()), phrase

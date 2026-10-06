@@ -315,7 +315,7 @@ class TestTheApiStaysSerialAndPaced:
         assert source.count("_PacedRun(") == 2
         assert "workers=1" in inspect.getsource(
             HeadlessTidalPlayer._start_refetch_job)
-        assert "workers=DOWNLOAD_WORKERS" in inspect.getsource(
+        assert "else DOWNLOAD_WORKERS" in inspect.getsource(
             HeadlessTidalPlayer._start_bulk_download_job)
 
 
