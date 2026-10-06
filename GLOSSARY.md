@@ -71,8 +71,12 @@ _Avoid_: filter (in prose)
 The state where `↑` has handed the arrow keys to the progress bar, so `←`/`→` seek instead of navigating; `↓`, Esc or any other key drops it.
 _Avoid_: seek mode, scrub mode
 
+**Player (process)**:
+The background `ticli.playerd` that owns audio, the TIDAL session, queue, saved state, downloads and caches. Every TUI and CLI call is a client of its socket; it outlives the terminal and leaves when idle and alone.
+_Avoid_: daemon, server (in prose)
+
 **Agent surface**:
-`ticli agent <verb>`, the JSON-only CLI for programs. `HeadlessTidalPlayer` is the TUI, despite its name.
+`ticli agent <verb>`, the JSON-only CLI for programs. `HeadlessTidalPlayer` is the player core, and the TUI when attached with `remote`, despite its name.
 _Avoid_: API, headless mode
 
 **Command**:
