@@ -388,7 +388,6 @@ class PlayerServer:
                                      "reason": 'do takes a non-empty list of {"cmd", "args"}.'})
             return
         records: list = [None] * len(items)
-        waits: dict = {}
         queued, to_queue = False, []
         for i, item in enumerate(items):
             cmd, args = item["cmd"], dict(item.get("args") or {})

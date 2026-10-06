@@ -58,7 +58,62 @@ def cli(ctx, quality, login_flow):
     run_tui(quality=quality, login_flow=login_flow)
 
 
-@cli.group()
+# Registry commands the original verbs above already cover, under their old names.
+COVERED = {"status", "search", "resolve", "library.playlists", "playlist.tracks",
+           "playlist.create", "playlist.add"}
+
+
+def _cost_line(spec) -> str:
+    if not spec.tidal:
+        return "Local: 0 requests, runs at once."
+    if spec.read:
+        return "Reads TIDAL: waits its turn in the 2 s queue, then answers with the data."
+    return "TIDAL action: queued 2 s apart; answered at once with queue position and ETA."
+
+
+class AgentGroup(click.Group):
+    """The original verbs plus one generated verb per player command, so a new
+    command in `ticli.commands` appears here with no edit. The registry is
+    imported only when a verb is looked up, never for `ticli --help`."""
+
+    def _registry(self) -> dict:
+        from ticli.commands import COMMANDS
+        return {n: c for n, c in COMMANDS.items() if n not in COVERED}
+
+    def list_commands(self, ctx):
+        return sorted(self.commands) + sorted(n.replace(".", " ") for n in self._registry())
+
+    def get_command(self, ctx, name):
+        if name in self.commands:
+            return self.commands[name]
+        dotted = name.replace(" ", ".")
+        spec = self._registry().get(dotted)
+        if spec is None:
+            return None
+        shape = " ".join(f"[{p}...]" if p.endswith("*") else f"[{p}]" for p in spec.params)
+
+        def callback(tokens):
+            from ticli import agent as impl
+            impl.run_form(dotted, tokens)
+
+        return click.Command(
+            name.replace(".", " "), callback=callback,
+            params=[click.Argument(["tokens"], nargs=-1, type=click.UNPROCESSED)],
+            context_settings={"ignore_unknown_options": True},
+            help=(f"`{dotted}`. {_cost_line(spec)}" + (" DANGEROUS: needs that switch on."
+                                                     if spec.dangerous is True else "")
+                  + f"\n\nArgs {shape or '(none)'}: positional, key=value, or one JSON object."),
+            short_help=_cost_line(spec))
+
+    def resolve_command(self, ctx, args):
+        if len(args) >= 2 and not args[0].startswith("-"):
+            dotted = f"{args[0]}.{args[1]}"
+            if dotted in self._registry():
+                return dotted.replace(".", " "), self.get_command(ctx, dotted), args[2:]
+        return super().resolve_command(ctx, args)
+
+
+@cli.group(cls=AgentGroup)
 @click.option("--key", envvar="TICLI_AI_KEY", default=None, help="The AI control key, if your human set one (or TICLI_AI_KEY).")
 @click.pass_context
 def agent(ctx, key):
@@ -147,6 +202,18 @@ def playlist_add(playlist_id, track_ids):
     """Add tracks by id. One add is one request however many ids. Costs 2 requests."""
     from ticli import agent as impl
     impl.playlist_add(playlist_id, track_ids)
+
+
+@agent.command("do")
+@click.argument("commands", required=False)
+def do_(commands):
+    """Run a JSON array of commands in order, coalescing adds and likes, with one
+    combined reply. Items are {"cmd": "playlist.add", "args": {...}} or verb
+    strings like "playlist add <id> 1 2". Reads the array from stdin if omitted."""
+    import sys
+
+    from ticli import agent as impl
+    impl.do(commands if commands is not None else sys.stdin.read())
 
 
 @agent.command()

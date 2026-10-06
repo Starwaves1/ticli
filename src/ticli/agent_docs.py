@@ -60,9 +60,10 @@ human can change them**, by keypress in the TUI. No command or verb can
 change them, and you must never edit `config.json`, write ticli's files or
 pretend to be the TUI to get around them. Any change shows up in the TUI.
 
-- **Allow AI control** (on by default). Off: every verb that reaches TIDAL
-  is refused with `ai_control_off`; `status` still answers, and
-  `playlist list` answers from what is saved on disk (`"source": "disk"`).
+- **Allow AI control** (on by default). Off: every action is refused with
+  `ai_control_off`; reads (`status`, `playlist list`, `search`, `queue list`,
+  `download list`, `settings get`) answer from what is saved on disk
+  (`"source": "disk"`), with 0 requests and without starting the player.
 - **Allow dangerous commands** (off by default). Dangerous: deleting or
   renaming a playlist, removing tracks from one, deleting downloads,
   clearing the cache, lowering the cache budget, logging out, changing the
@@ -73,6 +74,33 @@ pretend to be the TUI to get around them. Any change shows up in the TUI.
 
 `status` reports all three as `ai_control`. On any refusal: stop and ask
 your human, quoting the refusal's `hint`. That is the whole procedure.
+
+## Through the player
+
+Every verb except `docs`, `status` and `unblock` runs inside ticli's
+background player, which the verb starts if it isn't running. Every agent
+command that reaches TIDAL waits in one queue, in arrival order across all
+agents, requests 2 s apart. **Reads** (search, resolve, playlist list/show,
+queue list) wait their turn and answer with the data. **Actions** (play,
+next, playlist add, like, download...) answer at once with `"queued"`
+(position) and `"job"`; `cost.eta_s` says when the last one queued should
+be done. Local commands (pause, queue edits, settings) cost 0 requests.
+
+Waiting adds to one playlist merge into one request (up to 100 ids per
+request, plus TIDAL's re-read: 2 requests for 1-100 ids), and waiting likes
+into one; the reply says so in `"merged"`. So batch them, never add in a
+loop: `ticli agent do '["playlist add ID 1 2", "like 3"]'` (or the JSON
+array on stdin, or `{"cmd": "playlist.add", "args": {...}}` items) runs a
+batch in order with one combined reply.
+
+Replies also carry `state` (now playing, playing, queue, switches),
+`next` (up to 5 verbs that apply now) and `cost` (`requests`, `wait_s`,
+`eta_s`). Errors are `{"ok": false, "code", "reason", "fix"}`; the
+original verbs also keep `error`, `message` and `hint`. `playlist add` no
+longer reports `added` (it is queued, so not known yet): check with
+`playlist show`. `status` lists `pending` and `done` jobs while the player
+runs. Every player command is a verb — `ticli agent --help` lists them;
+arguments are positional, `key=value`, or one JSON object.
 
 ## Verbs
 

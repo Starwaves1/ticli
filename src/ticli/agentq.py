@@ -25,6 +25,7 @@ MERGES = frozenset({"playlist.add", "like"})
 LOCAL_MOSTLY = frozenset({"seek", "resume", "toggle"})
 DONE_KEPT = 5
 NEXT_MAX = 5
+FINDS_TRACKS = frozenset({"search", "album.tracks", "playlist.tracks", "artist.section"})
 
 _local = threading.local()
 
@@ -342,7 +343,7 @@ def next_forms(cmd: str, result, state: dict) -> list:
     """Up to five `ticli agent ...` forms that apply right now, most useful first."""
     r = result if isinstance(result, dict) else {}
     forms = []
-    track = _first_id(r, "tracks")
+    track = _first_id(r, "tracks") if cmd in FINDS_TRACKS else None
     if cmd == "resolve" and r.get("best"):
         track = (r["best"].get("track") or r["best"]).get("id")
     if track is not None:
