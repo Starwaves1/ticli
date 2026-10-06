@@ -628,6 +628,10 @@ def _play_target(link: Link, text: str) -> tuple:
     picked = _take_pick(link.who, "any", text) if link.picks else None
     if picked:
         return picked["kind"], picked["id"], picked["name"]
+    if ID_FORM["playlist"].fullmatch(text):
+        return "playlist", text, text
+    if ID_FORM["album"].fullmatch(text):
+        return "id", text, text
     wanted = text.casefold()
     own = [p for p in _local_playlists(link.who) if p["name"].casefold() == wanted]
     if len(own) == 1:
@@ -667,10 +671,14 @@ def play(words) -> None:
     try:
         try:
             kind, ident, label = _play_target(link, text)
-            cmd = f"play.{kind}"
-            if who == AGENT:
-                guard(cmd, who)
-            reply = link.ask(cmd, {"track_id": ident} if kind == "track" else {"id": ident})
+            # A bare number is a track or an album id; TIDAL numbers both, so try the track first.
+            for kind in (("track", "album") if kind == "id" else (kind,)):
+                cmd = f"play.{kind}"
+                if who == AGENT:
+                    guard(cmd, who)
+                reply = link.ask(cmd, {"track_id": ident} if kind == "track" else {"id": ident})
+                if reply.get("ok") or reply.get("code") not in ("not_found", "api_error"):
+                    break
         except Stop as stop:
             reply, kind, label = stop.reply, "", text
     finally:

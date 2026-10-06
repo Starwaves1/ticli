@@ -302,6 +302,21 @@ class TestPlayAnything:
         assert ticli("play", "2").exit_code == 0
         assert [t.id for t in h.core._queue] == [71]
 
+    def test_a_bare_number_plays_that_track_without_searching(self, player, tty):
+        h = player()
+        before = len(h.session.requests)
+        result = ticli("play", "307345598")
+        assert result.exit_code == 0, result.output
+        assert str(h.core._current_track.id) == "307345598"
+        assert "GET search" not in h.session.requests[before:]
+
+    def test_a_playlist_uuid_plays_that_playlist(self, player, tty):
+        from ticli.tests.agent_harness import ROAD
+        h = player()
+        h.road.items = [fake_track(5)]
+        assert ticli("play", ROAD).exit_code == 0
+        assert [t.id for t in h.core._queue] == [5]
+
     def test_the_kinded_verbs_still_work(self, player, tty):
         album = fake_album(4242, "Discovery", "Daft Punk", [fake_track(61), fake_track(62)])
         h = player(session=FakeTidal(search_albums=[album]))
