@@ -1860,9 +1860,7 @@ class HeadlessTidalPlayer:
                             self._playing = False
                         return
                     if real is not track:
-                        queue = self._queue
-                        if track in queue:
-                            self._queue = [real if t is track else t for t in queue]
+                        self._swap_queue_entry(self._queue, track, real)
                         if self._play_gen == gen:
                             self._current_track = real
                     url, granted = (self._take_prefetched(real.id)
@@ -1879,6 +1877,8 @@ class HeadlessTidalPlayer:
                 self._playing = True
                 self._play_start_time = time.time()
                 self._play_offset = seek
+                if local and getattr(track, "cached", False) and not artwork.cover_id_of(track):
+                    self._resolve_for_artwork(track, gen)
             except backend_health.SpawnError as e:
                 if self._play_gen == gen:
                     self._playing = False
@@ -1897,6 +1897,30 @@ class HeadlessTidalPlayer:
             finally:
                 if self._play_gen == gen:
                     self._track_changing = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _swap_queue_entry(self, queue, row, resolved) -> None:
+        # In place, by identity: rebuilding the list could undo a removal made meanwhile
+        if self._queue is not queue:
+            return
+        i = next((i for i, t in enumerate(queue) if t is row), None)
+        if i is not None:
+            queue[i] = resolved
+
+    def _resolve_for_artwork(self, track, gen) -> None:
+        queue = self._queue
+
+        def _run():
+            if self._play_gen != gen:
+                return
+            real = self._resolve_track(track)
+            if real is None or real is track:
+                return
+            self._swap_queue_entry(queue, track, real)
+            if self._play_gen == gen and self._current_track is track:
+                self._current_track = real
+                self._wake()
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1961,9 +1985,8 @@ class HeadlessTidalPlayer:
         def _run():
             try:
                 real = self._resolve_track(nxt)
-                if real is not None and real is not nxt and self._play_gen == gen \
-                        and self._queue is queue:
-                    self._queue = [real if t is nxt else t for t in queue]
+                if real is not None and real is not nxt and self._play_gen == gen:
+                    self._swap_queue_entry(queue, nxt, real)
                 if real is not None:
                     url, granted = self._stream_description(real)
                     self._prefetch = (real.id, url, granted, time.time())

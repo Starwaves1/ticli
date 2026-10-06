@@ -2540,3 +2540,85 @@ class TestAPrefetchedRowIsResolvedOnce:
         _settle()
         assert p._queue is replacement
         assert [t.id for t in p._queue] == [5, 6]
+
+    def test_a_row_removed_during_the_prefetch_stays_removed(self):
+        gate = threading.Event()
+        p = self._player_near_the_end(self._CountingSession(gate))
+        queue = p._queue
+        p._queue.append(_track(13))
+        p._maybe_prefetch_next()
+        assert _wait_for(lambda: p.session.track_calls)
+        p._queue.pop(1)
+        gate.set()
+        assert _wait_for(lambda: p._prefetch is not None)
+        _settle()
+        assert p._queue is queue
+        assert [t.id for t in p._queue] == [1, 13]
+
+    def test_the_swap_keeps_the_queue_object(self):
+        p = self._player_near_the_end(self._CountingSession())
+        queue = p._queue
+        p._maybe_prefetch_next()
+        assert _wait_for(lambda: p._prefetch is not None)
+        _settle()
+        assert p._queue is queue
+        assert not getattr(queue[1], "cached", False)
+
+
+class TestAnOldCoverlessRowGetsItsArtwork:
+    COVER = "0a1b2c3d-1111-2222-3333-444455556666"
+
+    class _Session(_FakeSession):
+        def __init__(self, fail=False):
+            super().__init__(latency=0)
+            self.track_calls = []
+            self.fail = fail
+
+        def track(self, tid):
+            self.track_calls.append(tid)
+            if self.fail:
+                raise ConnectionError("no network")
+            real = _streaming_track(tid, [])
+            real.album.cover = TestAnOldCoverlessRowGetsItsArtwork.COVER
+            return real
+
+    def _play_old_row(self, session):
+        p = HeadlessTidalPlayer(quality="HIGH")
+        p.session = session
+        p._cache = MetadataCache(songs=True)
+        p.audio = _RecordingAudio()
+        _cached_file(p._cache, 12)
+        row = CachedTrack({"id": 12, "name": "Track 12", "duration": 200,
+                           "artists": ["A"], "album": "Album"})
+        p._queue = [row]
+        p._queue_index = 0
+        p._play_track(row)
+        assert _wait_for(lambda: p.audio.plays)
+        return p, row
+
+    def test_online_it_resolves_once_after_playback_starts(self):
+        p, row = self._play_old_row(self._Session())
+        assert p.audio.plays[0]["local"] is not None
+        assert _wait_for(lambda: artwork.cover_id_of(p._current_track) == self.COVER)
+        _settle()
+        assert p.session.track_calls == [12]
+        assert p._queue[0] is p._current_track
+        p._save_state()
+        saved = json.loads(player_mod.STATE_FILE.read_text())
+        assert saved["tracks"][0]["cover"] == self.COVER
+
+    def test_offline_it_fails_quietly_and_keeps_playing(self):
+        p, row = self._play_old_row(self._Session(fail=True))
+        _settle()
+        _settle()
+        assert p.session.track_calls in ([], [12])
+        assert p._current_track is row and p._queue[0] is row
+        assert p._playing
+
+    def test_a_cover_with_no_album_name_round_trips(self):
+        real = _track(3)
+        real.album.name = ""
+        real.album.cover = self.COVER
+        row = CachedTrack(cache_mod.track_record(real))
+        assert artwork.cover_id_of(row) == self.COVER
+        assert cache_mod.track_record(row)["cover"] == self.COVER

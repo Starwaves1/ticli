@@ -184,7 +184,7 @@ class CachedTrack:
     """A track as far as a list row is concerned. Never raises: `name` a
     non-empty str (else "?"), `duration` a number (else 0), `artists` a list of
     `_Named` from the non-empty str elements only, `album` an `_Album` (its
-    `cover` a str or None) or None. `id` is kept verbatim."""
+    `name` a str, possibly empty, and `cover` a str or None) or None. `id` is kept verbatim."""
 
     cached = True
     __slots__ = ("id", "name", "duration", "artists", "album")
@@ -200,7 +200,8 @@ class CachedTrack:
                         for artist in (artists if isinstance(artists, list) else [])
                         if _clean_str(artist)]
         album = _clean_str(record.get("album"))
-        self.album = _Album(album, _clean_str(record.get("cover"))) if album else None
+        cover = _clean_str(record.get("cover"))
+        self.album = _Album(album or "", cover) if album or cover else None
 
 
 class CachedPlaylist:
