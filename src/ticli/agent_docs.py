@@ -41,7 +41,11 @@ Every verb prints **one JSON object** on stdout and exits (`docs` is markdown).
   `player_unavailable`. Act on `fix`. The original verbs (`search`, `resolve`,
   `playlist ...`) also keep `error`, `message`, `hint`, and their own result keys.
 - Arguments are positional in the order shown below, `key=value`, or one JSON
-  object. Ids are what verbs take: get them from `search`, `resolve`, `playlist list`.
+  object. Ids are best (from `search`, `resolve`, `playlist list`); a playlist,
+  album or artist may also be a name (your own playlists first, 0 requests;
+  else 1 search; with AI control off only your own playlists) and a song a
+  TIDAL URL or `"artist - title"` (added only on a confident match). Ambiguous
+  ones fail with `candidates` carrying ids: pick one, pass its id.
 
 ## The queue: pacing, ETAs, coalescing
 
@@ -52,18 +56,29 @@ agents, **requests 2 s apart**; you never pace by hand and cannot bypass it.
   what the queue made them wait.
 - **Actions** (play, like, playlist add, download...) answer at once with
   `result.queued` (position) and `result.job`; `cost.eta_s` is when the last
-  one should finish. `ticli agent status` lists `pending` and recent `done`.
-- **Local** commands (pause, queue edits, settings reads) cost 0 requests and
-  run at once.
+  one should finish. `ticli agent status` lists `pending` and recent `done`
+  (a merged job's row says `merged`, and a partial add `added`, `failed_from`,
+  `not_added`). `playlist create` waits and returns the new playlist.
+- **Local** commands (pause, queue edits, settings) cost 0 requests and run at
+  once, unless agent commands are already queued: then an action takes its place
+  in line (`next` then `pause` ends paused) and a local read still answers at once.
+- **Downloads** take one track at a time, each through the same 2 s spacing.
 - **Coalescing**: waiting adds to one playlist merge into one add (up to 100 ids
   per request, plus TIDAL's re-read: 2 requests for 1-100 ids); waiting likes
   merge too. The reply says so in `result.merged`:
   batch them, never add in a loop.
-- **`ticli agent do`** runs a JSON array in order with one combined reply, local
-  commands first, TIDAL ones queued together so they coalesce:
+- **`ticli agent do`** runs a JSON array in order:
   `ticli agent do '["playlist add ID 1 2", "like 3", "queue list"]'` (or the
-  array on stdin; items may be `{"cmd": "playlist.add", "args": {...}}`). A
-  failing item skips the rest (`"code": "skipped"`).
+  array on stdin; items may be `{"cmd": "playlist.add", "args": {...}}`). Local
+  items before the first TIDAL item run immediately; from that item on, every
+  item queues in order, submitted together so adds and likes coalesce. A refused
+  item, or an immediate one that fails, skips the items after it (`"code":
+  "skipped"`); items queued before it still run. A queued item that fails later
+  skips nothing. The reply's `result` is one record per item, in order: run items
+  carry `result`, queued reads and `playlist create` wait and carry `result`,
+  queued actions carry `queued`, `job`, `eta_s` (and `merged`; their outcome is in
+  `status`). `ok` is true only if every record is; `cost.requests` counts what the
+  waited items used plus the estimate for queued actions.
 - Queue entries: pass the `track_id` you saw with the index
   (`queue remove 2 TRACK_ID`); if the queue moved you get `stale`, not another track.
 
@@ -92,8 +107,7 @@ files or impersonate the TUI.** Changes show in the TUI.
 On any refusal quote its `fix` to your human and stop.
 
 `ticli <verb>` (no `agent`) without a terminal on stdin is treated as you too:
-same switches and key, readable text output, and it accepts names and songs
-(a playlist name from your own playlists, a TIDAL URL, `"artist - title"`,
+same switches and key, readable text output, the same names and songs (plus
 `current`); ambiguous ones return `candidates` with ids as JSON.
 
 ## Verbs
@@ -162,18 +176,22 @@ and coalesced (2 requests per 100 ids); the reply has `requested`, `queued`, no
 """
 
 
-def _cost(spec) -> str:
+def _cost(name, spec) -> str:
+    from ticli.agentq import WAITS
     if not spec.tidal:
         return "0 requests, at once"
-    return "1+ requests, waits its turn, returns data" if spec.read \
-        else "queued, answers at once with position and ETA"
+    if spec.read:
+        return "1+ requests, waits its turn, returns data"
+    if name in WAITS:
+        return "queued, waits its turn and returns the result"
+    return "queued, answers at once with position and ETA"
 
 
 def _row(name, spec) -> str:
     verb = LEGACY_VERBS.get(name, name.replace(".", " "))
     args = " ".join(f"[{p[:-1]}...]" if p.endswith("*") else f"[{p}]" for p in spec.params)
     flags = " **DANGEROUS** (needs that switch)" if spec.dangerous else ""
-    return (f"- `ticli agent {verb}{' ' + args if args else ''}` (`{name}`): {_cost(spec)}{flags}")
+    return (f"- `ticli agent {verb}{' ' + args if args else ''}` (`{name}`): {_cost(name, spec)}{flags}")
 
 
 def render() -> str:

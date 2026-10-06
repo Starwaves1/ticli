@@ -422,12 +422,47 @@ def split_form(words) -> tuple:
     raise ValueError(f"no command {' '.join(words[:2])!r}")
 
 
+def _needs_names(cmd: str, args: dict) -> bool:
+    from ticli import humancli
+
+    kind = humancli.NAMED.get(cmd)
+    if kind and "id" in args and not humancli.ID_FORM[kind].fullmatch(str(args["id"]).strip()):
+        return True
+    if cmd.startswith("queue."):
+        return False
+    given = args.get("track_ids", args.get("track_id"))
+    tokens = given if isinstance(given, list) else ([] if given is None else [given])
+    return any(not str(t).strip().isdigit() for t in tokens)
+
+
+def with_ids(cmd: str, args: dict) -> tuple:
+    """(cmd, args, None) with names and songs turned into ids as `ticli <verb>` does,
+    or (cmd, args, refusal): ambiguous names come back as `candidates` with ids."""
+    if not _needs_names(cmd, args):
+        return cmd, args, None
+    from ticli import humancli
+
+    link = humancli.Link(humancli.AGENT, picks=False)
+    try:
+        cmd, args = humancli.prepare(link, cmd, args)
+    except humancli.Stop as stop:
+        return cmd, args, stop.reply
+    finally:
+        link.close()
+    return cmd, args, None
+
+
+def _call_named(cmd: str, args: dict) -> dict:
+    cmd, args, refused = with_ids(cmd, args)
+    return refused if refused is not None else call(cmd, args)
+
+
 def run_form(name: str, tokens) -> None:
     try:
         args = form_args(name, tokens)
     except ValueError as e:
         raise fail_reply("bad_args", str(e), f"See `ticli agent {name.replace('.', ' ')} --help`.")
-    finish(call(name, args))
+    finish(_call_named(name, args))
 
 
 def fail_reply(code: str, reason: str, fix: str) -> SystemExit:
@@ -501,7 +536,7 @@ def playlist_list() -> None:
 
 
 def playlist_show(playlist_id: str) -> None:
-    _legacy(call("playlist.tracks", {"id": playlist_id}),
+    _legacy(_call_named("playlist.tracks", {"id": playlist_id}),
             lambda r: {"playlist": r.get("playlist"), "tracks": r.get("tracks", [])})
 
 
@@ -512,8 +547,10 @@ def playlist_create(name: str, description: str) -> None:
 
 def playlist_add(playlist_id: str, track_ids: tuple) -> None:
     """Queued: answered at once; `added` is gone because it is not known yet."""
-    _legacy(call("playlist.add", {"id": playlist_id, "track_ids": [str(t) for t in track_ids]}),
-            lambda r: {"playlist_id": str(playlist_id), "requested": len(track_ids), **r})
+    cmd, args, refused = with_ids("playlist.add", {"id": playlist_id,
+                                                   "track_ids": [str(t) for t in track_ids]})
+    _legacy(refused if refused is not None else call(cmd, args),
+            lambda r: {"playlist_id": str(args["id"]), "requested": len(args["track_ids"]), **r})
 
 
 def unblock() -> None:
