@@ -144,9 +144,13 @@ class FakeTidal:
 
     is_pkce = True
 
-    def __init__(self, search_tracks=()):
+    def __init__(self, search_tracks=(), search_playlists=(), search_albums=(), search_artists=()):
         self.request_session = FakeHTTP()
         self.search_tracks = list(search_tracks)
+        self.search_playlists = list(search_playlists)
+        self.search_albums = list(search_albums)
+        self.search_artists = list(search_artists)
+        self.album_tracks = {}
         self.playlists = {}
         self.user = FakeUser(self)
 
@@ -166,8 +170,8 @@ class FakeTidal:
 
     def search(self, query, models=None, limit=50, offset=0):
         self.http("GET", "search")
-        return {"tracks": self.search_tracks[:limit], "albums": [], "artists": [],
-                "playlists": []}
+        return {"tracks": self.search_tracks[:limit], "albums": self.search_albums[:limit],
+                "artists": self.search_artists[:limit], "playlists": self.search_playlists[:limit]}
 
     def playlist(self, pid):
         self.http("GET", f"playlists/{pid}")
@@ -175,9 +179,28 @@ class FakeTidal:
             raise FakeHTTPError(FakeResponse(404))
         return self.playlists[pid]
 
+    def album(self, aid):
+        import types
+        self.http("GET", f"albums/{aid}")
+        tracks = self.album_tracks.get(str(aid), [])
+        return types.SimpleNamespace(id=aid, name=f"Album {aid}", tracks=lambda: tracks)
+
     def track(self, tid):
         self.http("GET", f"tracks/{tid}")
         return fake_track(tid)
+
+
+def fake_playlist(pid, name, num_tracks=3):
+    import types
+    return types.SimpleNamespace(id=pid, name=name, num_tracks=num_tracks, creator=None,
+                                 description="")
+
+
+def fake_album(aid, name, artist="Artist", tracks=()):
+    import types
+    return types.SimpleNamespace(id=aid, name=name, num_tracks=10, year=2020, cover=None, tracks=lambda: list(tracks),
+                                 artist=types.SimpleNamespace(name=artist),
+                                 artists=[types.SimpleNamespace(name=artist)])
 
 
 class FakeClock:

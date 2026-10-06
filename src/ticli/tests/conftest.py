@@ -63,6 +63,12 @@ def never_the_real_config(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def never_the_real_cache(tmp_path, monkeypatch):
+    from ticli.utils import cache as cache_mod
+    monkeypatch.setattr(cache_mod, "CACHE_DIR", tmp_path / "cache")
+
+
+@pytest.fixture(autouse=True)
 def never_probe_the_real_backends(monkeypatch):
     monkeypatch.setattr(backend_health_mod, "probe_backends", lambda *a, **k: [])
 
