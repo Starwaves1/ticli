@@ -52,7 +52,7 @@ def _make_player(position=0.0, playing=True, seek_ok=True, index=1):
     p._play_offset = position
     p.audio = _FakeAudio(seek_ok)
     p._plays = []
-    p._play_track = lambda track, seek=0: p._plays.append((track.id, seek))
+    p._play_track = lambda track, seek=0, automatic=False: p._plays.append((track.id, seek))
     return p
 
 
