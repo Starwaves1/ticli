@@ -77,7 +77,7 @@ def home(monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("TICLI_TEST_HOOKS", "1")
-    monkeypatch.setenv("TICLI_TEST_SESSION", "ticli.tests.fake_tidal:session")
+    monkeypatch.setenv("TICLI_TEST_SESSION", "session")
     for name in ("XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_MUSIC_DIR"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(throttle, "STATE_DIR", state)

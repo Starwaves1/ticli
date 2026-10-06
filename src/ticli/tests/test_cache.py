@@ -2231,17 +2231,20 @@ class TestClearWhilePlaying:
         song = path / "12.m4a"
         song.write_bytes(b"z" * 4096)
 
-        # Opens the file, then keeps reading it slowly — what a player does
+        # Opens the file, says so, then keeps reading it slowly — what a player does
         proc = subprocess.Popen(
             [_sys.executable, "-c",
              "import sys,time\n"
              "f=open(sys.argv[1],'rb')\n"
+             "print('open', flush=True)\n"
              "time.sleep(0.2)\n"
              "assert len(f.read())==4096\n"
              "time.sleep(1.5)\n", str(song)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         try:
-            time.sleep(0.1)  # let it open the file
+            # Not a fixed sleep: interpreter start-up on a loaded CI runner can
+            # outlast it, and then the clear wins and the child never opens the file.
+            assert proc.stdout.readline().strip() == "open"
             removed, kept = cache.clear_audio()
 
             assert (removed, kept) == (1, 0)
@@ -2251,6 +2254,7 @@ class TestClearWhilePlaying:
         finally:
             proc.terminate()
             proc.wait(timeout=5)
+            proc.stdout.close()
 
     def test_a_player_that_had_not_opened_it_yet_is_restarted_not_skipped(self):
         """The race the existing source_vanished/_monitor_playback path was

@@ -14,6 +14,7 @@ import json
 import re
 import shlex
 import time
+from urllib.parse import urlsplit
 
 import click
 
@@ -39,6 +40,17 @@ PICK_TTL_SECONDS = 600
 PAGE = 100
 CONFIRM_ABOVE = 200
 URL = re.compile(r"(?:^|/)(track|album|playlist)/([0-9A-Za-z-]+)")
+
+
+def _is_tidal_url(text: str) -> bool:
+    """A URL whose host is tidal.com or a subdomain; the scheme may be left off."""
+    raw = str(text).strip()
+    try:
+        host = urlsplit(raw if "://" in raw else "https://" + raw).hostname or ""
+    except ValueError:
+        return False
+    return host == "tidal.com" or host.endswith(".tidal.com")
+
 CURRENT_BY_DEFAULT = ("like", "unlike", "download")
 SONG_FORMS = 'a track id, a TIDAL URL, "artist - title" or current'
 
@@ -409,7 +421,7 @@ def resolve_song(link: Link, token) -> list:
         return [text]
     if text.lower() == "current":
         return [_current(link)]
-    if "tidal.com" in text:
+    if _is_tidal_url(text):
         found = URL.findall(text)
         if not found:
             raise Stop(refusal("bad_args", f"Not a TIDAL track, album or playlist URL: {text}",
@@ -498,7 +510,7 @@ def prepare(link: Link, cmd: str, args: dict) -> tuple:
         if not tokens and cmd in CURRENT_BY_DEFAULT:
             tokens = ["current"]
         if cmd == "play.track" and tokens:
-            url = URL.findall(str(tokens[0])) if "tidal.com" in str(tokens[0]) else []
+            url = URL.findall(str(tokens[0])) if _is_tidal_url(tokens[0]) else []
             if url and url[-1][0] != "track":
                 return f"play.{url[-1][0]}", {"id": url[-1][1]}
         ids = [i for t in tokens for i in resolve_song(link, t)]
