@@ -24,7 +24,8 @@ Every verb prints **one JSON object** on stdout and exits (`docs` is markdown).
 {"ok": true, "result": {...},
  "state": {"track": {"id": 1, "title": "T", "artist": "A", "pos": 12, "dur": 200},
            "playing": true, "queue": {"len": 3, "index": 0},
-           "switches": {"ai": true, "dangerous": false}, "pending": 2},
+           "switches": {"ai": true, "dangerous": false}, "connectivity": "online",
+           "pending": 2},
  "next": ["pause", "next", "queue list"],
  "cost": {"requests": 1, "wait_s": 4.0, "eta_s": 10.0}}
 ```
@@ -38,7 +39,7 @@ Every verb prints **one JSON object** on stdout and exits (`docs` is markdown).
   `rate_limited`, `not_logged_in`, `auth_failed`, `not_found` (stale or wrong
   id), `stale` (the queue moved; the reply carries the current `queue`),
   `bad_args`, `empty`, `no_track`, `human_only`, `api_error`,
-  `player_unavailable`. Act on `fix`. The original verbs (`search`, `resolve`,
+  `player_unavailable`, `offline`, `signed_out`. Act on `fix`. The original verbs (`search`, `resolve`,
   `playlist ...`) also keep `error`, `message`, `hint`, and their own result keys.
 - Arguments are positional in the order shown below, `key=value`, or one JSON
   object. Ids are what verbs take: get them from `search`, `resolve`, `playlist list`.
@@ -66,6 +67,20 @@ agents, **requests 2 s apart**; you never pace by hand and cannot bypass it.
   failing item skips the rest (`"code": "skipped"`).
 - Queue entries: pass the `track_id` you saw with the index
   (`queue remove 2 TRACK_ID`); if the queue moved you get `stale`, not another track.
+
+## Offline
+
+`state.connectivity` is `online`, `offline` (TIDAL unreachable) or `signed_out`
+(TIDAL rejected the stored login; only your human can sign in again, with [o]
+in the TUI). The player never probes: a verb that needs TIDAL tries to reconnect
+once, then answers. Offline:
+- Reads answer from what was opened before, with `"offline": true`, `cached_at`
+  and `age` ("cached 3 days ago"); never opened is `offline`. `search` and
+  `resolve` answer from your playlists, favourites and downloads
+  (`"source": "local"`).
+- Writes (like, playlist edits, download) are refused with `offline`, never queued.
+- Downloads and cached songs play: `play downloads INDEX`, `play track ID`; `next`
+  and auto-advance skip entries with no local copy.
 
 ## The trip
 

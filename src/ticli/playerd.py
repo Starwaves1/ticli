@@ -26,7 +26,7 @@ from typing import Optional
 
 from ticli import agentq, ipc
 from ticli import commands as command_layer
-from ticli.commands import AGENT, COMMANDS, HUMAN, tripped_error
+from ticli.commands import AGENT, COMMANDS, HUMAN, ONLINE, tripped_error
 from ticli.utils import throttle
 from ticli.utils.config import PROTECTED_KEYS, UNREADABLE, load_config
 
@@ -382,7 +382,8 @@ class PlayerServer:
                       and agentq.estimate(self.core, cmd, args) == 0)
         if not queued and (not spec.tidal or idle_local):
             return "now", commands.execute(cmd, args, caller=AGENT, key=key)
-        return "queue", spec.read or cmd in agentq.WAITS
+        # Offline the queue reconnects first; the agent waits for that answer, never a "queued".
+        return "queue", spec.read or cmd in agentq.WAITS or self.core._connectivity != ONLINE
 
     def _merged_note(self, job) -> str:
         if job.cmd == "like":

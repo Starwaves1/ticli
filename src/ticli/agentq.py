@@ -25,7 +25,8 @@ MERGES = frozenset({"playlist.add", "like"})
 LOCAL_MOSTLY = frozenset({"seek", "resume", "toggle"})
 DONE_KEPT = 5
 NEXT_MAX = 5
-FINDS_TRACKS = frozenset({"search", "album.tracks", "playlist.tracks", "artist.section"})
+FINDS_TRACKS = frozenset({"search", "album.tracks", "playlist.tracks", "artist.section",
+                          "mix.tracks", "library.favorites"})
 
 _local = threading.local()
 
@@ -302,7 +303,8 @@ def _playlist_json(p) -> dict:
 
 
 _RENDER = {"track": _track_json, "album": _album_json, "playlist": _playlist_json,
-           "artist": lambda a: {"id": a.id, "name": a.name}}
+           "artist": lambda a: {"id": a.id, "name": a.name},
+           "mix": lambda m: {"id": m.id, "name": getattr(m, "title", None) or getattr(m, "name", None)}}
 
 
 def render(value):
@@ -329,6 +331,8 @@ def compact_state(status: dict, pending: int = 0) -> dict:
              "queue": {"len": queue.get("length", 0), "index": queue.get("index", -1)},
              "switches": {"ai": switches.get("allow_ai_control", True),
                           "dangerous": switches.get("allow_dangerous_commands", False)}}
+    if status.get("connectivity"):
+        state["connectivity"] = status["connectivity"]
     if pending:
         state["pending"] = pending
     return state
@@ -342,6 +346,8 @@ def _first_id(result: dict, kind: str):
 def next_forms(cmd: str, result, state: dict) -> list:
     """Up to five `ticli agent ...` forms that apply right now, most useful first."""
     r = result if isinstance(result, dict) else {}
+    if state.get("connectivity") in ("offline", "signed_out"):
+        return _offline_forms(r, state)
     forms = []
     track = _first_id(r, "tracks") if cmd in FINDS_TRACKS else None
     if cmd == "resolve" and r.get("best"):
@@ -365,6 +371,21 @@ def next_forms(cmd: str, result, state: dict) -> list:
         forms.append("queue list")
     if not forms:
         forms.append("search <query>")
+    return list(dict.fromkeys(forms))[:NEXT_MAX]
+
+
+def _offline_forms(r: dict, state: dict) -> list:
+    """Offline only what plays from disk applies; TIDAL reads answer from the cache."""
+    forms = []
+    track = _first_id(r, "tracks")
+    if track is not None:
+        forms.append(f"play track {track}")
+    forms.append("play downloads 0")
+    if state.get("playing"):
+        forms += ["pause", "next"]
+    elif state.get("track"):
+        forms.append("resume")
+    forms += ["download list", "search <query>", "queue list"]
     return list(dict.fromkeys(forms))[:NEXT_MAX]
 
 

@@ -241,7 +241,9 @@ HIDE_HOLD_KEYS = frozenset({KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, " "})
 
 HIDE_HINT_RANK = 9
 
-from ticli.commands import HUMAN, OFFLINE, ONLINE, SIGNED_OUT, Commands, auth_rejected
+from ticli.commands import (
+    HUMAN, OFFLINE, ONLINE, SIGNED_OUT, Commands, auth_rejected, download_tracks,
+)
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
     PROTECTED_KEYS,
@@ -261,7 +263,9 @@ from ticli.utils.config import (
 )
 from ticli.utils.cache import (
     PLAY_COUNTS_AFTER,
+    age_label,
     cached_audio_path,
+    kind_of,
     CachedTrack,
     MetadataCache,
     format_gb,
@@ -1352,7 +1356,9 @@ class HeadlessTidalPlayer:
         "MAX": tidalapi.Quality.hi_res_lossless,
     }
     SEARCH_FILTERS = ("all", "tracks", "albums", "artists",
-                      "tidal_playlists", "playlists")
+                      "tidal_playlists", "playlists", "music")
+    # Answered from disk with no request; offline, search opens on "music" (ADR-0009).
+    LOCAL_SCOPES = ("playlists", "music")
     SEARCH_FILTER_LABELS = {
         "all": "All",
         "tracks": "Tracks",
@@ -1360,6 +1366,7 @@ class HeadlessTidalPlayer:
         "artists": "Artists",
         "tidal_playlists": "Playlists",
         "playlists": "My Playlists",
+        "music": "My Music",
     }
     SEARCH_FILTER_KINDS = {
         "all": ("tracks", "albums", "artists", "playlists"),
@@ -1451,6 +1458,8 @@ class HeadlessTidalPlayer:
         self._browse_cursor = 0
         self._browse_loading = False
         self._browse_message = ""
+        self._browse_fetched = None
+        self._playlists_fetched = None
         self._browse_playlist = None
         self._artist = None
         self._artist_section = self.ARTIST_SECTIONS[0]
@@ -1764,6 +1773,18 @@ class HeadlessTidalPlayer:
                 "as before; [x] clears them", seconds=6)
         else:
             self._set_toast("Sign-in cancelled — still signed in as before")
+
+    def _sign_in_again(self) -> None:
+        """TIDAL rejected the stored login: sign in here (it needs this terminal), then the
+        player loads the new tokens. Same flow as the tokens it replaces."""
+        data = load_tokens() or {}
+        with self._suspended_tui():
+            signed_in = (self._login_pkce() if data.get("is_pkce") else self._login_device()) \
+                and self._finish_login()
+        if signed_in:
+            self._run("login.reload")
+        else:
+            self._set_toast("Sign-in cancelled — still signed out; downloads still play")
 
     def _suspended_tui(self):
         import contextlib
@@ -2969,15 +2990,18 @@ class HeadlessTidalPlayer:
     def _page_rows(self) -> int:
         return max(1, min(self._page_size, self._fit.page_rows))
 
-    def _tab_row(self, order, labels, active, mark=None) -> Text:
-        row = Text()
-        row.append("\n   [Tab]", style="bold")
-        for i, name in enumerate(order):
-            row.append("  " if i == 0 else " · ", style="dim")
-            row.append(labels[name],
-                       style="bold cyan" if name == active else "dim")
-            if mark is not None and mark(name):
-                row.append("·", style="dim cyan")
+    def _tab_row(self, order, labels, active, mark=None, tight=False) -> Text:
+        for separator in (" · ", "  ") if tight else (" · ",):
+            row = Text()
+            row.append("\n   [Tab]", style="bold")
+            for i, name in enumerate(order):
+                row.append("  " if i == 0 else separator, style="dim")
+                row.append(labels[name],
+                           style="bold cyan" if name == active else "dim")
+                if mark is not None and mark(name):
+                    row.append("·", style="dim cyan")
+            if cell_len(row.plain.lstrip("\n")) < self._fit.inner:
+                break
         if cell_len(row.plain.lstrip("\n")) > self._fit.inner:
             row = Text("\n   [Tab]", style="bold")
             row.append(f"  {labels[active]}", style="bold cyan")
@@ -3006,7 +3030,7 @@ class HeadlessTidalPlayer:
 
         content.append_text(self._tab_row(
             self.SEARCH_FILTERS, self.SEARCH_FILTER_LABELS,
-            self._search_filter, mark=self._scope_answered))
+            self._search_filter, mark=self._scope_answered, tight=True))
 
         if self._search_loading and not self._search_results:
             content.append("\n\n   Searching...", style="dim yellow")
@@ -3063,9 +3087,15 @@ class HeadlessTidalPlayer:
 
         return content
 
+    def _age_note(self, content: Text, fetched) -> None:
+        """Offline, a list from disk says how old it is (ADR-0009)."""
+        if fetched is not None and self._connectivity != ONLINE:
+            content.append(f"  {age_label(fetched)}", style="yellow")
+
     def _build_browse_display(self) -> Text:
         content = Text()
         content.append(f"   {self._browse_title}", style="bold magenta")
+        self._age_note(content, self._browse_fetched)
 
         if self._browse_loading:
             content.append("\n\n   Loading...", style="dim yellow")
@@ -3106,6 +3136,7 @@ class HeadlessTidalPlayer:
         content = Text()
         name = getattr(self._artist, "name", "") or "Artist"
         content.append(f"   {name}", style="bold magenta")
+        self._age_note(content, (self._artist_record() or {}).get("fetched"))
 
         content.append_text(self._tab_row(
             self.ARTIST_SECTIONS, self.ARTIST_SECTION_LABELS,
@@ -3214,6 +3245,7 @@ class HeadlessTidalPlayer:
     def _build_playlists_display(self) -> Text:
         content = Text()
         content.append("   Your Playlists", style="bold magenta")
+        self._age_note(content, self._playlists_fetched)
 
         if self._playlists_loading:
             content.append("\n\n   Loading playlists...", style="dim yellow")
@@ -3765,6 +3797,7 @@ class HeadlessTidalPlayer:
         if self._mode == self.MODE_DOWNLOADS:
             hints = [Hint("\u2191/\u2193", "navigate", "move", 1)]
             if self._downloads():
+                hints.append(Hint("Enter", "play", None, 0))
                 hints.append(Hint("x", "delete", "del", 0))
             hints += [Hint("Space", "pause/play", "pause", 4),
                       Hint("v", "volume", "vol", 3),
@@ -4147,10 +4180,16 @@ class HeadlessTidalPlayer:
 
         content = Text("\n").join(lines)
         content.no_wrap = True
+        title = "[bold cyan]Ticli[/bold cyan]"
+        if self.config.get("allow_ai_control"):
+            title += " [dim]· AI control[/dim]"
+        if self._connectivity == OFFLINE:
+            title += " [yellow]· offline[/yellow]"
+        elif self._connectivity == SIGNED_OUT:
+            title += " [red]· signed out: [o] sign in[/red]"
         return Panel(
             content,
-            title=("[bold cyan]Ticli[/bold cyan] [dim]· AI control[/dim]"
-                   if self.config.get("allow_ai_control") else "[bold cyan]Ticli[/bold cyan]"),
+            title=title,
             border_style="cyan",
             padding=(0, 1) if mini else (1, 2),
         )
@@ -4445,6 +4484,9 @@ class HeadlessTidalPlayer:
         if scope == "playlists":
             self._search_own_playlists(query)
             return
+        if scope == "music":
+            self._search_own_music(query)
+            return
         if self._search_reservoir["message"]:
             self._put_search_view(scope, loading=False, message=self._search_reservoir["message"])
             return
@@ -4496,7 +4538,7 @@ class HeadlessTidalPlayer:
 
     def _search_more(self):
         scope = self._search_filter
-        if self._search_loading or self._search_fetching or scope == "playlists":
+        if self._search_loading or self._search_fetching or scope in self.LOCAL_SCOPES:
             return
         if self._search_servable(scope):
             self._fill_search_view(scope)
@@ -4548,6 +4590,19 @@ class HeadlessTidalPlayer:
                 "No results in your playlists" if scanned else
                 "Nothing cached to search yet — open Playlists once to index them"))
 
+    def _search_own_music(self, query: str):
+        needle = query.casefold()
+        results = []
+        for track in download_tracks():
+            album = track.album.name if track.album else ""
+            artist = ", ".join(a.name for a in track.artists)
+            if needle in " ".join([track.name, artist, album]).casefold():
+                results.append({"type": "track", "name": track.name, "artist": artist, "obj": track})
+        self._put_search_view(
+            "music", loading=False, results=results, cursor=0, cached=False,
+            message="" if results else ("No results in your downloads" if self._downloads()
+                                        else "Nothing downloaded yet — [d] on a track downloads it"))
+
     def _select_search_result(self):
         if not self._search_results:
             return
@@ -4569,9 +4624,12 @@ class HeadlessTidalPlayer:
         source = ("album", self._obj_id(album))
         self._browse_source = source
         self._browse_title = album.name
-        self._browse_tracks = []
+        key = f"album:{source[1]}"
+        cached = self._cache.get_items(key)
+        self._browse_tracks = cached or []
+        self._browse_fetched = self._cache.fetched_at(key) if cached else None
         self._browse_cursor = -1
-        self._browse_loading = True
+        self._browse_loading = not cached
         self._browse_message = ""
 
         def _done(response):
@@ -4579,10 +4637,12 @@ class HeadlessTidalPlayer:
                 return
             if response.get("ok"):
                 self._browse_tracks = list(response["result"]["tracks"])
+                self._browse_fetched = response["result"].get("cached_at")
+                self._browse_cursor = min(self._browse_cursor, len(self._browse_tracks) - 1)
                 if not self._browse_tracks:
                     self._browse_message = "No tracks found"
-            else:
-                self._browse_message = "Failed to load album"
+            elif not self._browse_tracks:
+                self._browse_message = response.get("reason") or "Failed to load album"
             self._browse_loading = False
 
         self._fetch("album.tracks", {"id": source[1]}, _done, known=[("album", album)])
@@ -4630,13 +4690,22 @@ class HeadlessTidalPlayer:
             return
         section = self._artist_section
         limit = max(20, self._page_size)
-        self._artist_sections = {**self._artist_sections, key: {"state": "loading", "items": [], "message": ""}}
+        disk_key = f"artist:{key[0]}:{section}"
+        cached = self._cache.get_items(disk_key)
+        first = ({"state": "ready", "items": [{"type": kind_of(o) or "track", "obj": o}
+                                               for o in cached],
+                  "message": "", "fetched": self._cache.fetched_at(disk_key)}
+                 if cached else {"state": "loading", "items": [], "message": ""})
+        self._artist_sections = {**self._artist_sections, key: first}
 
         def _done(response):
             if response.get("ok"):
                 items = list(response["result"]["items"])
                 record = {"state": "ready", "items": items,
-                          "message": "" if items else self.ARTIST_SECTION_EMPTY[section]}
+                          "message": "" if items else self.ARTIST_SECTION_EMPTY[section],
+                          "fetched": response["result"].get("cached_at")}
+            elif cached:
+                return
             else:
                 record = {"state": "failed", "items": [], "message": self.ARTIST_SECTION_FAILED[section]}
             # Whole-dict assignment: the paint thread only reads complete records.
@@ -4727,6 +4796,7 @@ class HeadlessTidalPlayer:
     def _load_playlists(self):
         cached = self._cache.get_playlists()
         self._playlists = cached or []
+        self._playlists_fetched = self._cache.fetched_at("playlists") if cached else None
         self._playlists_loading = not cached
         self._playlists_cursor = 0
         self._playlists_message = ""
@@ -4735,9 +4805,10 @@ class HeadlessTidalPlayer:
             try:
                 if not response.get("ok"):
                     if not self._playlists:
-                        self._playlists_message = "Failed to load playlists"
+                        self._playlists_message = response.get("reason") or "Failed to load playlists"
                     return
                 fresh = list(response["result"]["playlists"])
+                self._playlists_fetched = response["result"].get("cached_at")
                 self._playlists = fresh
                 if self._playlists_cursor >= len(fresh):
                     self._playlists_cursor = max(0, len(fresh) - 1)
@@ -4757,6 +4828,7 @@ class HeadlessTidalPlayer:
         self._browse_title = playlist.name if hasattr(playlist, "name") else "Playlist"
         cached = self._cache.get_playlist_tracks(playlist_id) if playlist_id else None
         self._browse_tracks = cached or []
+        self._browse_fetched = self._cache.fetched_at(f"playlist:{playlist_id}") if cached else None
         self._browse_cursor = -1
         self._browse_loading = not cached
         self._browse_message = ""
@@ -4767,9 +4839,10 @@ class HeadlessTidalPlayer:
             try:
                 if not response.get("ok"):
                     if not self._browse_tracks:
-                        self._browse_message = "Failed to load playlist"
+                        self._browse_message = response.get("reason") or "Failed to load playlist"
                     return
                 live, tracks = response["result"]["playlist"], list(response["result"]["tracks"])
+                self._browse_fetched = response["result"].get("cached_at")
                 if self._browse_source == ("playlist", playlist_id) and self._is_editable(live):
                     self._browse_playlist = live
                 if self._browse_title != title:
@@ -5792,12 +5865,14 @@ class HeadlessTidalPlayer:
             self._enter_mode(self.MODE_SEARCH)
             self._search_query = ""
             self._search_history_cursor = None
-            self._search_filter = "all"
+            self._search_filter = "all" if self._connectivity == ONLINE else "music"
             self._reset_search_results()
         elif key == "t":
             self._mini_player = not self._mini_player
         elif key == "m":
             self._show_more = not self._show_more
+        elif key == "o" and self._connectivity == SIGNED_OUT:
+            self._sign_in_again()
         elif key == "l":
             self._toggle_like()
         elif key == "r":
@@ -6053,6 +6128,8 @@ class HeadlessTidalPlayer:
                 self._show_player()
         elif key == " ":
             self._toggle_play_key()
+        elif key in ("o", "O") and self._connectivity == SIGNED_OUT:
+            self._sign_in_again()
         elif key in ("o", "O"):
             self._logout_pending = True
         elif key in ("x", "X"):
@@ -6101,6 +6178,9 @@ class HeadlessTidalPlayer:
             self._downloads_cursor = min(len(rows) - 1, self._downloads_cursor + 1)
         elif key in ("x", "X") and rows:
             self._downloads_delete = rows[min(self._downloads_cursor, len(rows) - 1)]
+        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT) and rows:
+            row = rows[min(self._downloads_cursor, len(rows) - 1)]
+            self._run("play.downloads", index=self._downloads_cursor, track_id=row["id"])
 
     def _read_keys(self, select_mod, timeout=IDLE_POLL_SECONDS):
         watch = [sys.stdin]

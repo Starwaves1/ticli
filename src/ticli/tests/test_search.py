@@ -926,8 +926,8 @@ class TestCommunityPlaylistScope:
         assert "Playlists" in text and "My Playlists" in text
         assert text.count("Playlists") == 2  # two rows, two different things
         labels = list(HeadlessTidalPlayer.SEARCH_FILTER_LABELS.values())
-        assert labels[-1] == "My Playlists"      # the local one stays last
-        assert labels[-2] == "Playlists"         # the new one joins the network scopes
+        assert labels[-2:] == ["My Playlists", "My Music"]  # the local ones stay last
+        assert labels[-3] == "Playlists"         # the new one joins the network scopes
 
     def test_tab_reaches_it_before_my_playlists(self, config_file):
         p, _ = _search(page_size=10)

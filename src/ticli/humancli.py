@@ -167,6 +167,15 @@ def line(cmd: str, reply: dict) -> str:
     result = reply.get("result")
     if isinstance(result, dict) and "queued" in result:
         return _queued(reply)
+    text = _line(cmd, reply, result)
+    if isinstance(result, dict) and result.get("age"):
+        return f'offline, {result["age"]}\n{text}'
+    if isinstance(result, dict) and result.get("source") == "local" and result.get("offline"):
+        return f"offline: from your own music\n{text}"
+    return text
+
+
+def _line(cmd: str, reply: dict, result) -> str:
     if cmd == "status":
         return status_line(reply)
     r = result if isinstance(result, dict) else {}
@@ -176,7 +185,12 @@ def line(cmd: str, reply: dict) -> str:
         return _resolve_line(r)
     if cmd == "library.playlists":
         return _lines(r.get("playlists", []), _named)
-    if cmd in ("playlist.tracks", "album.tracks"):
+    if cmd == "library.favorites":
+        rows = next((r[k] for k in ("tracks", "albums", "artists") if k in r), [])
+        return _lines(rows, lambda o: _song(o) if "duration_seconds" in o else _named(o))
+    if cmd == "library.mixes":
+        return _lines(r.get("mixes", []), _named)
+    if cmd in ("playlist.tracks", "album.tracks", "mix.tracks"):
         head = f'{_named(r["playlist"])}\n' if r.get("playlist") else ""
         return head + _lines(r.get("tracks", []), _song)
     if cmd == "queue.list":
@@ -291,6 +305,13 @@ def _ambiguous(kind: str, text: str, rows: list, example: str) -> Stop:
                         f"Run `{example}` to pick (the number, or the id)."))
 
 
+def _local_favorites(who: str, kind: str) -> list:
+    guard("library.favorites", who, read=True)
+    from ticli.utils.cache import MetadataCache
+    return [{"id": str(o.id), "name": o.name}
+            for o in MetadataCache().get_items(f"favorites:{kind}s") or []]
+
+
 def _local_playlists(who: str) -> list:
     guard("library.playlists", who, read=True)
     from ticli.utils.cache import MetadataCache
@@ -308,10 +329,10 @@ def resolve_name(link: Link, kind: str, token, example: str) -> tuple:
     if ID_FORM[kind].fullmatch(text):
         return text, text
     wanted = text.casefold()
-    if kind == "playlist":
-        own = _local_playlists(link.who)
+    if kind in ("playlist", "album", "artist"):
+        own = _local_playlists(link.who) if kind == "playlist" else _local_favorites(link.who, kind)
         exact = [p for p in own if p["name"].casefold() == wanted]
-        loose = exact or [p for p in own if wanted in p["name"].casefold()]
+        loose = exact or ([p for p in own if wanted in p["name"].casefold()] if kind == "playlist" else [])
         if len(loose) == 1:
             return loose[0]["id"], loose[0]["name"]
         if loose:
@@ -377,6 +398,9 @@ def resolve_song(link: Link, token) -> list:
     artist, sep, title = text.partition(" - ")
     if not sep or not artist.strip() or not title.strip():
         raise Stop(refusal("bad_args", f"Not a song: {text!r}.", f"Use {SONG_FORMS}."))
+    liked = _favorite_song(link.who, artist.strip(), title.strip())
+    if liked:
+        return [liked]
     reply = link.ask("resolve", {"artist": artist.strip(), "title": title.strip(), "limit": 10})
     if not reply.get("ok"):
         raise Stop(reply)
@@ -385,6 +409,15 @@ def resolve_song(link: Link, token) -> list:
     if result.get("confident") and best:
         return [str((best.get("track") or best)["id"])]
     raise _song_candidates(result, text)
+
+
+def _favorite_song(who: str, artist: str, title: str):
+    """A favourite with exactly this artist and title, from the local cache (0 requests)."""
+    guard("library.favorites", who, read=True)
+    from ticli.commands import rank_tracks
+    from ticli.utils.cache import MetadataCache
+    ranked = rank_tracks(MetadataCache().get_items("favorites:tracks") or [], artist, title)
+    return str(ranked["best"]["track"].id) if ranked["confident"] else None
 
 
 # ── running a verb ──
