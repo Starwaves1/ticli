@@ -908,19 +908,23 @@ def _playlist_remove(p, args) -> dict:
     return {"accepted": True}
 
 
-def _download(p, args) -> dict:
-    _require_online(p)
-    tier = str(args.get("tier") or p._quality_name).upper()
-    tracks = _tracks(p, _ids(args), [p._download_track], p._download_tracks)
+def _start_downloads(p, tracks, tier, label) -> dict:
     if _by_agent():
         # One slot, each track's stream request through the shared 2 s throttle (ADR-0001).
-        p._start_bulk_download_job(tier, tracks=tracks, label=args.get("label"), paced=True)
+        p._start_bulk_download_job(tier, tracks=tracks, label=label, paced=True)
     elif len(tracks) > 1:
-        p._start_bulk_download_job(tier, tracks=tracks, label=args.get("label"))
+        p._start_bulk_download_job(tier, tracks=tracks, label=label)
     else:
         p._download_track = tracks[0]
         p._start_download_job(tier)
     return {"accepted": True, "tracks": len(tracks), "tier": tier}
+
+
+def _download(p, args) -> dict:
+    _require_online(p)
+    tier = str(args.get("tier") or p._quality_name).upper()
+    tracks = _tracks(p, _ids(args), [p._download_track], p._download_tracks)
+    return _start_downloads(p, tracks, tier, args.get("label"))
 
 
 def _download_cancel(p, args):
@@ -1557,7 +1561,25 @@ def _favorite(kind: str, on: bool):
 
 def _download_whole(kind: str):
     def handler(p, args) -> dict:
-        raise NotImplementedError
+        list_id = str(args.get("id", "")).strip()
+        if not list_id:
+            raise CommandError("bad_args", f"download {kind} needs an id.")
+        _require_online(p)
+        tier = str(args.get("tier") or p._quality_name).upper()
+        if tier not in ("LOW", "MEDIUM", "HIGH", "MAX"):
+            raise CommandError("bad_args", "tier is LOW, MEDIUM, HIGH or MAX.")
+        tracks = LIST_SOURCES[kind][0](p, list_id)
+        if not tracks:
+            raise CommandError("empty", f"That {kind} has no tracks.")
+        if kind == "album":
+            name = getattr(_known(p, "album", list_id), "name", None)
+            if not name:
+                name = getattr(getattr(tracks[0], "album", None), "name", None)
+        else:
+            name = (getattr(_live_playlist(p, list_id) or _known(p, "playlist", list_id), "name", None)
+                    or _cached_playlist(p, list_id).name)
+        label = name or list_id
+        return {**_start_downloads(p, tracks, tier, label), "label": label, "id": list_id}
     return handler
 
 

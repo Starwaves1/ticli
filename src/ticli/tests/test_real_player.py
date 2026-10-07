@@ -12,6 +12,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -281,3 +282,17 @@ def test_queue_add_starts_the_player_queues_without_playing_and_is_saved(home):
     assert _wait(lambda: _status(b)["playing"])
     assert _status(b)["track"]["id"] == 2
     b.close()
+
+
+def test_agent_resume_starts_the_player_and_plays_the_saved_track(home):
+    _saved_paused_track(home)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+    done = subprocess.run([sys.executable, "-m", "ticli.cli", "agent", "resume"], env=env,
+                          cwd=str(home), stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, timeout=30)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert json.loads(done.stdout)["ok"] is True, done.stdout
+    conn = ipc.connect()
+    assert _wait(lambda: _status(conn)["playing"]), "the saved track plays"
+    assert _status(conn)["track"]["id"] == 1
+    conn.close()
