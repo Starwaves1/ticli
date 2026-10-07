@@ -15,11 +15,13 @@ from collections import deque
 from typing import Callable, Optional
 
 from ticli import ipc
-from ticli.commands import ADD_LIMIT, COMMANDS, _live_playlist, tripped_error, unknown_tracks
+from ticli.commands import (
+    ADD_LIMIT, COMMANDS, _live_playlist, queue_add_cost, tripped_error, unknown_tracks,
+)
 from ticli.utils import throttle
 
 SPACING = throttle.MIN_INTERVAL_SECONDS
-WAITS = frozenset({"playlist.create"})  # actions whose answer the agent needs before going on
+WAITS = frozenset({"playlist.create", "queue.add"})  # actions whose answer the agent needs before going on
 MERGES = frozenset({"playlist.add", "like"})
 # Usually local: they move the stream already playing. Ordered with the queue, but take no slot.
 LOCAL_MOSTLY = frozenset({"seek", "resume", "toggle"})
@@ -96,6 +98,8 @@ def estimate(core, cmd: str, args: dict) -> int:
         return 0
     if cmd in LOCAL_MOSTLY:
         return 0
+    if cmd == "queue.add":
+        return queue_add_cost(core, args)
     if cmd == "queue.remove":
         return 1 if args.get("index") == getattr(core, "_queue_index", None) else 0
     return 1 if COMMANDS[cmd].tidal else 0
@@ -375,7 +379,8 @@ def next_forms(cmd: str, result, state: dict) -> list:
     if cmd == "resolve" and r.get("best"):
         track = (r["best"].get("track") or r["best"]).get("id")
     if track is not None:
-        forms += [f"play track {track}", f"playlist add <playlist_id> {track}", f"like {track}"]
+        forms += [f"play track {track}", f"queue add {track}", f"playlist add <playlist_id> {track}",
+                  f"like {track}"]
     playlist = (r.get("playlist") or {}).get("id") if isinstance(r.get("playlist"), dict) else None
     if cmd in ("playlist.create", "playlist.tracks") and playlist:
         forms += [f"playlist add {playlist} <track_id>", f"play playlist {playlist}"]

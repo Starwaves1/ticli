@@ -382,7 +382,8 @@ def parse_value(token: str):
 
 def form_args(name: str, tokens) -> dict:
     """Positional tokens fill the command's params in order (a trailing `x*` takes the
-    rest as a list); `key=value` sets one by name; a lone JSON object is the args."""
+    rest as a list); `key=value` sets one by name, `--flag` sets it true; a lone JSON
+    object is the args."""
     from ticli.commands import COMMANDS
 
     tokens = list(tokens)
@@ -394,6 +395,9 @@ def form_args(name: str, tokens) -> dict:
     params = list(COMMANDS[name].params)
     args: dict = {}
     for token in tokens:
+        if token.startswith("--") and token[2:].isidentifier():
+            args[token[2:]] = True
+            continue
         field, sep, value = token.partition("=")
         if sep and field.isidentifier():
             args[field] = parse_value(value)
@@ -428,7 +432,10 @@ def _needs_names(cmd: str, args: dict) -> bool:
     kind = humancli.NAMED.get(cmd)
     if kind and "id" in args and not humancli.ID_FORM[kind].fullmatch(str(args["id"]).strip()):
         return True
-    if cmd.startswith("queue."):
+    if cmd == "queue.add" and any(k in args and not humancli.ID_FORM[k].fullmatch(str(args[k]).strip())
+                                  for k in ("album", "playlist")):
+        return True
+    if cmd in humancli.QUEUE_ENTRY:
         return False
     given = args.get("track_ids", args.get("track_id"))
     tokens = given if isinstance(given, list) else ([] if given is None else [given])

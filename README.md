@@ -62,6 +62,7 @@ ticli status | pause | resume | next | prev          # "nothing playing" if no p
 ticli play                                           # bare: the same as resume ("nothing to play" if nothing was playing)
 ticli start playlist edm                             # play it, then open the TUI here (--no-tui: just play)
 ticli start                                          # bare: resume what was playing, then open the TUI
+ticli queue "marc rebillet - reach out" --next       # add after the current track (default: the end); never starts playback
 ticli playlist create "Road trip"
 ticli playlist add "Road trip" "daft punk - one more time"
 ticli like                                           # the playing track

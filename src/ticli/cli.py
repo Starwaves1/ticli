@@ -137,10 +137,29 @@ class HumanGroup(RegistryGroup):
                   "songs take an id, a TIDAL URL, \"artist - title\" or current.")
 
     def resolve_command(self, ctx, args):
-        # `ticli play <anything>`; `play album|track|...` keeps its own verbs.
+        # `ticli play <anything>`; `play album|track|...` keeps its own verbs. `queue` likewise.
         if args and args[0] == "play" and not (len(args) > 1 and f"play.{args[1]}" in self._registry()):
             return "play", self._play, args[1:]
+        if args and args[0] == "queue" and not (len(args) > 1 and f"queue.{args[1]}" in self._registry()):
+            return "queue", self._queue, args[1:]
         return super().resolve_command(ctx, args)
+
+    @property
+    def _queue(self):
+        def callback(words, next_):
+            from ticli import humancli
+            if not words:
+                humancli.run("queue.list", {})
+                return
+            humancli.queue(words, next_)
+        return click.Command("queue", callback=callback,
+                             params=[click.Argument(["words"], nargs=-1, type=click.UNPROCESSED),
+                                     click.Option(["--next", "next_"], is_flag=True,
+                                                  help="Play it after the current track, not at the end.")],
+                             help="Add to the queue without replacing it: a song, album or playlist by "
+                                  "name, \"artist - title\", an id or a TIDAL URL, matched like `ticli play`. "
+                                  "Never starts playback. Bare `ticli queue` lists it; `ticli queue add|list|"
+                                  "play|remove` are the plain verbs.")
 
     @property
     def _play(self):
@@ -172,8 +191,8 @@ def cli(ctx, key, quality, login_flow):
     """Ticli - Terminal music player for TIDAL. Plain `ticli` runs the player.
 
     \b
-    Verbs: `ticli play NAME`, `ticli pause|resume|next|prev|status`, `ticli start playlist
-    NAME`, `ticli playlist add NAME SONG`, `ticli like`... A SONG is a track
+    Verbs: `ticli play NAME`, `ticli queue NAME [--next]`, `ticli pause|resume|next|prev|status`,
+    `ticli start playlist NAME`, `ticli playlist add NAME SONG`, `ticli like`... A SONG is a track
     id, a TIDAL URL, "artist - title" or current.
 
     \b

@@ -622,6 +622,35 @@ class TestAgentNamesAndSongs:
         assert result.exit_code == 1 and out["code"] == "not_confident"
         assert out["candidates"][0]["id"] == "251380838"
 
+    def test_queue_add_takes_ids_songs_and_a_next_flag(self, player):
+        from ticli.tests.fakes import fake_track
+        session = FakeTidal(search_tracks=[fake_track(251380837, "Reach Out", ["Marc Rebillet"])])
+        h = player(session=session)
+        result, out = agent("queue", "add", "2", "--next")
+        assert result.exit_code == 0 and out["result"]["index"] == 1 and out["cost"]["requests"] == 0
+        result, out = agent("queue", "add", "Marc Rebillet - Reach Out")
+        assert result.exit_code == 0, out
+        assert out["result"]["tracks"][0]["title"] == "Reach Out" and out["result"]["position"] == "end"
+        assert [t.id for t in h.core._queue] == [1, 2, 2, 3, 251380837]
+        assert session.requests.count("GET search") == 1
+        assert len(result.output) < 800, result.output
+
+    def test_queue_add_takes_a_playlist_by_name(self, player):
+        from ticli.tests.fakes import fake_track
+        from ticli.utils.cache import MetadataCache
+        h = player()
+        MetadataCache().put_playlists([h.road, h.gym])
+        h.road.items = [fake_track(5), fake_track(6)]
+        result, out = agent("queue", "add", "playlist=road trip")
+        assert result.exit_code == 0, out
+        assert out["result"]["added"] == 2 and [t.id for t in h.core._queue][-2:] == [5, 6]
+        assert "GET search" not in h.session.requests
+
+    def test_queue_add_of_nothing_is_bad_args(self, player):
+        h = player()
+        result, out = agent("queue", "add")
+        assert result.exit_code == 1 and out["code"] == "bad_args" and len(h.core._queue) == 3
+
     def test_ai_control_off_matches_own_playlists_only(self, monkeypatch, spawned):
         from ticli.tests.fakes import fake_playlist
         from ticli.utils import config as config_mod
@@ -653,3 +682,11 @@ class TestKeyAndDocsFixes:
                        "A queued item that fails later\n  skips nothing",
                        "items queued before it still run", "one record per item, in order"):
             assert " ".join(phrase.split()) in " ".join(docs.split()), phrase
+
+
+def test_docs_teach_queue_add():
+    from ticli.agent_docs import render
+    docs = " ".join(render().split())
+    for phrase in ("queue add ID... [--next]", "never starts playback", "Never `play track`: that replaces the queue",
+                   "`ticli agent queue add [track_ids...]` (`queue.add`): 0 requests for tracks already known"):
+        assert phrase in docs, phrase

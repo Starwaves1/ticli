@@ -57,6 +57,7 @@ def _is_tidal_url(text: str) -> bool:
     return host == "tidal.com" or host.endswith(".tidal.com")
 
 CURRENT_BY_DEFAULT = ("like", "unlike", "download")
+QUEUE_ENTRY = ("queue.play", "queue.remove")  # their track_id pins an entry; it is not a song
 SONG_FORMS = 'a track id, a TIDAL URL, "artist - title" or current'
 
 
@@ -241,6 +242,8 @@ def _line(cmd: str, reply: dict, result) -> str:
     if cmd == "download.list":
         return _lines(r.get("downloads", []), lambda d: f'{d.get("artist")} - {d.get("title")}') \
             if r.get("downloads") else "no downloads"
+    if cmd == "queue.add" and "queue_length" in r:
+        return _queue_added(r)
     if cmd.startswith("play.") and "queue_length" in r:
         return f'playing: queue of {r["queue_length"]}'
     if cmd == "playlist.create" and isinstance(r.get("playlist"), dict):
@@ -248,6 +251,14 @@ def _line(cmd: str, reply: dict, result) -> str:
     if cmd in DONE:
         return DONE[cmd]
     return json.dumps(result, separators=(",", ":")) if result else "done"
+
+
+def _queue_added(r: dict) -> str:
+    tracks = r.get("tracks") or []
+    what = _song(tracks[0]) if r.get("added") == 1 and tracks else f'{r.get("added")} tracks'
+    where = "next" if r.get("position") == "next" else "at the end"
+    text = f'queued {what} {where} (#{r["index"] + 1} of {r["queue_length"]})'
+    return text + (f'\n{r["note"]}' if r.get("note") else "")
 
 
 def fail(reply: dict) -> "SystemExit":
@@ -521,11 +532,15 @@ def prepare(link: Link, cmd: str, args: dict) -> tuple:
     kind = NAMED.get(cmd)
     if kind and "id" in args:
         args["id"], _label = resolve_name(link, kind, args["id"], example)
-    if cmd in ("queue.play", "queue.remove") and "track_id" not in args:
+    if cmd == "queue.add":
+        for named in ("album", "playlist"):
+            if named in args:
+                args[named], _label = resolve_name(link, named, args[named], example)
+    if cmd in QUEUE_ENTRY and "track_id" not in args:
         args = {**args, **_queue_guard(link, args)}
     params = COMMANDS[cmd].params
     for field in ("track_id", "track_ids"):
-        if cmd.startswith("queue."):
+        if cmd in QUEUE_ENTRY:
             break
         if field not in params and field + "*" not in params:
             continue
@@ -537,6 +552,10 @@ def prepare(link: Link, cmd: str, args: dict) -> tuple:
             url = URL.findall(str(tokens[0])) if _is_tidal_url(tokens[0]) else []
             if url and url[-1][0] != "track":
                 return f"play.{url[-1][0]}", {"id": url[-1][1]}
+        if cmd == "queue.add" and len(tokens) == 1:
+            url = URL.findall(str(tokens[0])) if _is_tidal_url(tokens[0]) else []
+            if url and url[-1][0] != "track":
+                return cmd, {**args, url[-1][0]: url[-1][1]}
         ids = [i for t in tokens for i in resolve_song(link, t)]
         if ids:
             args["track_id" if field == "track_id" else "track_ids"] = ids[0] if field == "track_id" else ids
@@ -693,7 +712,7 @@ PLAY_ORDER = ("album", "playlist", "track", "artist")
 PLAY_URL = re.compile(r"(?:^|/)(track|album|playlist|artist|mix)/([0-9A-Za-z-]+)")
 
 
-def _play_target(link: Link, text: str) -> tuple:
+def _play_target(link: Link, text: str, verb: str = "play") -> tuple:
     """(kind, id, label) for free text: a TIDAL URL, a pick, one of your playlists by
     exact name (0 requests), else one search across all four kinds. An exact name
     wins (album, then playlist, track, artist); otherwise a single result does."""
@@ -737,7 +756,7 @@ def _play_target(link: Link, text: str) -> tuple:
                            "Run it again with one candidate's URL or id.", candidates=rows))
     shown = "\n".join(f'  {i}. {r["kind"]}: {r["name"]}' for i, r in enumerate(rows, 1))
     raise Stop(refusal("ambiguous", f'"{text}" matches several things:\n{shown}',
-                       "Run `ticli play 2` to pick."))
+                       f"Run `ticli {verb} 2` to pick."))
 
 
 def play(words) -> None:
@@ -765,3 +784,40 @@ def play(words) -> None:
         click.echo(f'playing {kind} "{label}"' + (f": {n} tracks" if n and kind != "track" else ""))
     else:
         say(who, f"play.{kind}" if kind else "play", reply)
+
+
+def _queue_args(kind: str, ident: str) -> dict:
+    if kind == "artist":
+        raise Stop(refusal("bad_args", "That is an artist; the queue takes songs, albums and playlists.",
+                           'Name a song ("artist - title"), an album or a playlist.'))
+    return {"track_ids": [ident]} if kind == "track" else {kind: ident}
+
+
+def queue(words, next_: bool) -> None:
+    """Add to the play queue by name, song, URL or pick, without replacing it."""
+    text = " ".join(words).strip()
+    who = caller()
+    link = Link(who)
+    where = {"position": "next" if next_ else "end"}
+    try:
+        try:
+            if who == AGENT:
+                guard("queue.add", who)
+            if " - " in text and not _is_tidal_url(text):
+                reply = link.ask("queue.add", {**where, "track_ids": resolve_song(link, text)})
+            else:
+                kind, ident, _label = _play_target(link, text, "queue")
+                # A bare number is a track or an album id; TIDAL numbers both, so try the track first.
+                first = None
+                for kind in (("track", "album") if kind == "id" else (kind,)):
+                    reply = link.ask("queue.add", {**where, **_queue_args(kind, ident)})
+                    if reply.get("ok") or reply.get("code") not in ("not_found", "api_error"):
+                        break
+                    first = first or reply
+                else:
+                    reply = first or reply
+        except Stop as stop:
+            reply = stop.reply
+    finally:
+        link.close()
+    say(who, "queue.add", reply)

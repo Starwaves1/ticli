@@ -548,36 +548,132 @@ def _queue_remove(p, args) -> dict:
     return {"queue_length": len(p._queue)}
 
 
+QUEUE_SHOWN = 10
+
+
+def _queue_position(args) -> str:
+    where = args.get("position") or ("next" if args.get("next") is True else "end")
+    if where not in ("next", "end"):
+        raise CommandError("bad_args", "position must be next or end.")
+    return where
+
+
+def _queue_source(args):
+    """("tracks", ids) or (kind, list id): exactly one of track_ids, album, playlist, mix."""
+    named = [k for k in LIST_SOURCES if args.get(k) not in (None, "")]
+    has_ids = args.get("track_ids") is not None or "track_id" in args
+    if len(named) + has_ids != 1:
+        raise CommandError("bad_args", "queue.add takes track_ids, or one album, playlist or mix id.")
+    return ("tracks", _ids(args)) if has_ids else (named[0], str(args[named[0]]))
+
+
+def queue_add_cost(p, args) -> int:
+    try:
+        kind, ident = _queue_source(args)
+    except CommandError:
+        return 0
+    if kind != "tracks":
+        return 0 if _local_list(p, kind, ident) else LIST_SOURCES[kind][1]
+    return sum(1 for t in _lookup(p, ident) if t is None)
+
+
+def _queue_tracks(p, args) -> list:
+    """All or nothing: an unknown id queues none of them."""
+    kind, ident = _queue_source(args)
+    if kind != "tracks":
+        return LIST_SOURCES[kind][0](p, ident)
+    found = _lookup(p, ident, [r["obj"] for r in p._search_results if r["type"] == "track"])
+    if any(t is None for t in found):
+        _require_online(p)
+    tracks = []
+    for tid, track in zip(ident, found):
+        if track is None:
+            try:
+                track = p.session.track(tid)
+            except Exception as e:
+                if classify(e)["code"] != "not_found":
+                    raise
+                raise CommandError("not_found", f"No track {tid} on TIDAL; nothing was queued.",
+                                   "Track ids come from `resolve` or `search`.")
+        tracks.append(track)
+    return tracks
+
+
+def _queue_add(p, args) -> dict:
+    """Into the play queue without replacing it. Never starts playback: with nothing
+    loaded the first added track becomes current, paused at 0:00."""
+    where = _queue_position(args)
+    tracks = _queue_tracks(p, args)
+    if not tracks:
+        raise CommandError("empty", "Nothing to queue: that list has no tracks.")
+    if not p._queue and p._current_track is not None:
+        p._queue, p._queue_index = [p._current_track], 0
+    if not p._queue:
+        index = 0
+        p._queue, p._queue_index = list(tracks), 0
+        p._current_track = tracks[0]
+        p._play_offset, p._play_start_time = 0, None
+    else:
+        index = p._queue_index + 1 if where == "next" else len(p._queue)
+        p._queue[index:index] = tracks
+        if where == "next":
+            p._prefetch_id = None
+    p._wake()
+    result = {"added": len(tracks), "position": where, "index": index,
+              "queue_length": len(p._queue),
+              "tracks": [_track_json(t) for t in tracks[:QUEUE_SHOWN]]}
+    if not p._playing:
+        start = "`resume` plays it" if index == p._queue_index else f"`queue play {index}` plays it"
+        result.update(playing=False, note=f"Not playing, so nothing started; {start}.")
+    return result
+
+
 def _play_track_cmd(p, args) -> dict:
     tracks = _tracks(p, _ids(args), [r["obj"] for r in p._search_results if r["type"] == "track"])
     return _play_list(p, tracks[:1], 0)
 
 
-def _play_album(p, args) -> dict:
-    album_id = str(args.get("id", ""))
-    tracks = _list(p, ("album", album_id)) or p._cache.get_items(f"album:{album_id}")
+def _local_list(p, kind, list_id):
+    """A list's tracks as already opened or cached, else None: 0 requests."""
+    cached = (p._cache.get_playlist_tracks(list_id) if kind == "playlist"
+              else p._cache.get_items(f"{kind}:{list_id}"))
+    return _list(p, (kind, list_id)) or cached or None
+
+
+def _album_list(p, album_id) -> list:
+    tracks = _local_list(p, "album", album_id)
     if not tracks:
         _require_online(p)
         album = _known(p, "album", album_id) or p.session.album(album_id)
         tracks = list(album.tracks())
-    return _play_list(p, tracks, _index(args))
+    return tracks
 
 
-def _play_playlist(p, args) -> dict:
-    playlist_id = str(args.get("id", ""))
-    tracks = _list(p, ("playlist", playlist_id)) or p._cache.get_playlist_tracks(playlist_id)
+def _playlist_list(p, playlist_id) -> list:
+    tracks = _local_list(p, "playlist", playlist_id)
     if not tracks:
         _require_online(p)
         tracks = list(p.session.playlist(playlist_id).tracks())
-    return _play_list(p, tracks, _index(args))
+    return tracks
+
+
+def _mix_list(p, mix_id) -> list:
+    return _local_list(p, "mix", mix_id) or _mix_tracks(p, {"id": mix_id})["tracks"]
+
+
+LIST_SOURCES = {"album": (_album_list, 2), "playlist": (_playlist_list, 2), "mix": (_mix_list, 2)}
+
+
+def _play_album(p, args) -> dict:
+    return _play_list(p, _album_list(p, str(args.get("id", ""))), _index(args))
+
+
+def _play_playlist(p, args) -> dict:
+    return _play_list(p, _playlist_list(p, str(args.get("id", ""))), _index(args))
 
 
 def _play_mix(p, args) -> dict:
-    mix_id = str(args.get("id", ""))
-    tracks = _list(p, ("mix", mix_id)) or p._cache.get_items(f"mix:{mix_id}")
-    if not tracks:
-        tracks = _mix_tracks(p, {"id": mix_id})["tracks"]
-    return _play_list(p, tracks, _index(args))
+    return _play_list(p, _mix_list(p, str(args.get("id", ""))), _index(args))
 
 
 def _play_downloads(p, args) -> dict:
@@ -1205,6 +1301,7 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("queue.list", _queue_list, read=True),
     Command("queue.play", _queue_play, tidal=True, params=("index", "track_id")),
     Command("queue.remove", _queue_remove, tidal=True, params=("index", "track_id")),
+    Command("queue.add", _queue_add, tidal=True, params=("track_ids*",)),
     Command("play.track", _play_track_cmd, tidal=True, params=("track_id",)),
     Command("play.album", _play_album, tidal=True, params=("id", "index")),
     Command("play.playlist", _play_playlist, tidal=True, params=("id", "index")),
@@ -1250,7 +1347,8 @@ COMMANDS = {cmd.name: cmd for cmd in (
 AGENT_TOASTS = {
     "toggle": "play/pause", "pause": "paused", "resume": "resumed", "seek": "seeked",
     "next": "next track", "prev": "previous track", "queue.play": "played from the queue",
-    "queue.remove": "removed a queue entry", "play.track": "played a track",
+    "queue.remove": "removed a queue entry", "queue.add": "added to the queue",
+    "play.track": "played a track",
     "play.album": "played an album", "play.playlist": "played a playlist",
     "play.artist": "played an artist", "play.mix": "played a mix",
     "play.downloads": "played your downloads", "play.radio": "started radio", "like": "liked a track",

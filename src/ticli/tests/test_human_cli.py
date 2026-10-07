@@ -663,3 +663,99 @@ class TestPicks:
         assert ticli("start", "album", "1989", "--no-tui").exit_code == 0
         assert h.session.requests.count("GET search") == 1
         assert [t.id for t in h.core._queue] == [61]
+
+
+class TestQueue:
+    def ids(self, h):
+        return [t.id for t in h.core._queue]
+
+    def test_a_song_by_name_goes_at_the_end_and_keeps_playing(self, player, tty):
+        h = player(session=FakeTidal(search_tracks=[fake_track(7, "Reach Out", ["Marc Rebillet"])]))
+        result = ticli("queue", "reach", "out")
+        assert result.exit_code == 0, result.output
+        assert result.output.strip() == "queued Marc Rebillet - Reach Out at the end (#4 of 4)"
+        assert self.ids(h) == [1, 2, 3, 7] and h.core._current_track.id == 1 and h.core._playing
+
+    def test_next_and_artist_dash_title(self, player, tty):
+        h = player(session=FakeTidal(search_tracks=[fake_track(7, "Reach Out", ["Marc Rebillet"])]))
+        result = ticli("queue", "--next", "Marc", "Rebillet", "-", "Reach", "Out")
+        assert result.exit_code == 0, result.output
+        assert "next (#2 of 4)" in result.output and self.ids(h) == [1, 7, 2, 3]
+
+    def test_your_playlist_by_name_costs_no_request(self, player, tty):
+        h = player()
+        h.road.items = [fake_track(5), fake_track(6)]
+        before = len(h.session.requests)
+        result = ticli("queue", "road", "trip")
+        assert result.output.strip() == "queued 2 tracks at the end (#4 of 5)"
+        assert self.ids(h) == [1, 2, 3, 5, 6]
+        assert "GET search" not in h.session.requests[before:]
+
+    def test_a_bare_number_is_a_track_without_searching(self, player, tty):
+        h = player()
+        before = len(h.session.requests)
+        assert ticli("queue", "307345598").exit_code == 0
+        assert str(self.ids(h)[-1]) == "307345598"
+        assert "GET search" not in h.session.requests[before:]
+
+    def test_ambiguous_numbers_them_and_a_number_picks(self, player, tty):
+        a = fake_album(4242, "Discovery Live", "Daft Punk")
+        b = fake_album(4343, "Discovery Remixes", "Daft Punk", [fake_track(71)])
+        h = player(session=FakeTidal(search_albums=[a, b]))
+        first = ticli("queue", "discovery")
+        assert first.exit_code == 1 and "ticli queue 2" in first.output and len(h.core._queue) == 3
+        picked = ticli("queue", "2")
+        assert picked.exit_code == 0, picked.output
+        assert self.ids(h) == [1, 2, 3, 71]
+
+    def test_an_artist_is_refused(self, player, tty):
+        from types import SimpleNamespace
+        h = player(session=FakeTidal(search_artists=[SimpleNamespace(id=5, name="Marc Rebillet")]))
+        result = ticli("queue", "marc", "rebillet")
+        assert result.exit_code == 1 and "artist" in result.output and len(h.core._queue) == 3
+
+    def test_bare_queue_lists_it(self, player, tty):
+        player()
+        assert ticli("queue").output.splitlines()[0] == "> 0  Artist 1 - Track 1"
+
+    def test_the_plain_verbs_still_work(self, player, tty):
+        h = player()
+        assert ticli("queue", "add", "2", "--next").exit_code == 0
+        assert self.ids(h) == [1, 2, 2, 3]
+        assert ticli("queue", "remove", "1").exit_code == 0 and self.ids(h) == [1, 2, 3]
+
+    def test_paused_queues_without_playing_and_says_how(self, player, tty):
+        h = player()
+        ticli("pause")
+        result = ticli("queue", "307345598")
+        assert "Not playing, so nothing started; `queue play 3` plays it." in result.output
+        assert h.core._playing is False
+
+    def test_no_player_starts_one_and_queues_without_playing(self, tty, monkeypatch):
+        made = []
+
+        def spawn(*a, **kw):
+            made.append(Harness())
+            h = made[-1]
+            h.core._queue, h.core._queue_index, h.core._current_track = [], -1, None
+            h.core._playing = False
+            return "ready"
+        monkeypatch.setattr(ipc, "spawn_player", spawn)
+        try:
+            result = ticli("queue", "307345598")
+            assert result.exit_code == 0, result.output
+            assert "starting the player..." in result.stderr
+            assert "`resume` plays it" in result.stdout
+            core = made[0].core
+            assert [str(t.id) for t in core._queue] == ["307345598"] and core._queue_index == 0
+            assert core._playing is False
+        finally:
+            for h in made:
+                h.stop()
+
+    def test_a_script_is_gated_like_an_agent(self, player):
+        config_mod.save_config({**config_mod.DEFAULTS, "allow_ai_control": False})
+        h = player()
+        result = ticli("queue", "307345598")
+        assert result.exit_code == 1 and "ai_control_off" in result.output
+        assert len(h.core._queue) == 3

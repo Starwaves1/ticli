@@ -82,6 +82,14 @@ agents, **requests 2 s apart**; you never pace by hand and cannot bypass it.
   waited items used plus the estimate for queued actions.
 - Queue entries: pass the `track_id` you saw with the index
   (`queue remove 2 TRACK_ID`); if the queue moved you get `stale`, not another track.
+- Adding to the play queue: `queue add ID... [--next]` (or `album=ID`, `playlist=ID`,
+  `mix=ID` for all of a list's tracks; a song may be `"artist - title"` or a URL).
+  Default is the end; `--next` plays it after the current track. It never replaces the
+  queue and never starts playback: with nothing playing it says so in `result.note`
+  (and with nothing loaded the first track becomes current, paused). Known tracks cost
+  0 requests; each unknown id is 1, waited for in the queue. One unknown id queues
+  none (`not_found`). Duplicates are allowed. The reply: `added`, `position`, `index`
+  (of the first added entry), `queue_length`, the first 10 `tracks`.
 
 ## Offline
 
@@ -139,6 +147,10 @@ rest by name. N songs is about N+2 requests, 2 s each: say so for long lists.
 versions are demoted (`unrequested_qualifier`), `feat.` credits are ignored;
 `confident` means right artist, exact title, no unrequested qualifier.
 
+**"Queue this song" / "play X next".** `queue add "artist - title"` (add `--next`
+for "next"), or `resolve` first and `queue add ID`. Never `play track`: that replaces
+the queue.
+
 **"Add this to my X playlist."** `playlist list`, match X case-insensitively;
 more than one match or no match: ask. Ask first; never auto-create a playlist the user called existing.
 
@@ -191,8 +203,14 @@ and coalesced (2 requests per 100 ids); the reply has `requested`, `queued`, no
 """
 
 
+COSTS = {"queue.add": "0 requests for tracks already known, else 1 per unknown id; "
+                      "waits its turn and returns the result"}
+
+
 def _cost(name, spec) -> str:
     from ticli.agentq import WAITS
+    if name in COSTS:
+        return COSTS[name]
     if not spec.tidal:
         return "0 requests, at once"
     if spec.read:

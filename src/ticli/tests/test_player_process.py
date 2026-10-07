@@ -270,6 +270,18 @@ class TestPushedState:
         time.sleep(0.05)
         assert second._get_position() == frozen
 
+    def test_an_agents_queue_add_reaches_the_tuis_queue_view(self, running):
+        run = running()
+        run.core._remember("track", [_track(9)])
+        ui = _tui()
+        reply = ipc.connect().request("queue.add", {"track_ids": [9], "position": "next"},
+                                      caller="agent", timeout=2)
+        assert reply["ok"] and reply["result"]["index"] == 1, reply
+        assert reply["cost"]["requests"] == 0 and reply["state"]["queue"]["len"] == 4
+        assert _pump(ui, lambda: [t.id for t in ui._queue] == [1, 9, 2, 3])
+        assert "Track 9" in ui._build_queue_display().plain
+        assert run.core._current_track.id == 1, "the playing track carries on"
+
     def test_a_player_toast_reaches_the_tui(self, running):
         run = running()
         ui = _tui()

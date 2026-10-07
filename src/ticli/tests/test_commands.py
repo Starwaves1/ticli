@@ -512,3 +512,109 @@ class TestSettingsPage:
         p.config["allow_ai_control"] = False
         assert "AI control" not in str(p._build_display().title)
 
+
+
+class TestQueueAdd:
+    def test_end_appends_and_keeps_the_playing_entry(self):
+        p = _player()
+        p._playing = True
+        p._known[("track", "9")] = _track(9)
+        result = _agent(p, "queue.add", track_ids=[9])
+        assert result["ok"], result
+        assert [t.id for t in p._queue] == [1, 2, 3, 9] and p._queue_index == 1
+        assert result["result"] == {"added": 1, "position": "end", "index": 3, "queue_length": 4,
+                                    "tracks": [commands._track_json(p._queue[3])]}
+        assert p._plays == [] and p.session.asked == []
+
+    def test_next_goes_after_the_current_entry(self):
+        p = _player()
+        p._playing = True
+        p._known[("track", "8")], p._known[("track", "9")] = _track(8), _track(9)
+        result = _agent(p, "queue.add", track_ids=[8, 9], next=True)
+        assert [t.id for t in p._queue] == [1, 2, 8, 9, 3]
+        assert result["result"]["index"] == 2 and result["result"]["position"] == "next"
+        assert _human(p, "next")["ok"] and p._plays == [8]
+
+    def test_an_unknown_id_is_one_lookup(self):
+        p = _player()
+        p.session = types.SimpleNamespace(track=lambda tid: _track(int(tid)), is_pkce=False)
+        p._reconnect = lambda recheck=False: commands.ONLINE
+        assert _human(p, "queue.add", track_ids=["44"])["ok"]
+        assert p._queue[-1].id == 44
+
+    def test_an_id_tidal_does_not_know_queues_nothing(self):
+        class NotFound(Exception):
+            pass
+        NotFound.__name__ = "ObjectNotFound"
+
+        def track(tid):
+            raise NotFound(tid)
+        p = _player()
+        p._known[("track", "9")] = _track(9)
+        p.session = types.SimpleNamespace(track=track, is_pkce=False)
+        p._reconnect = lambda recheck=False: commands.ONLINE
+        for caller in (_agent, _human):
+            result = caller(p, "queue.add", track_ids=[9, 404])
+            assert result["ok"] is False and result["code"] == "not_found", result
+            assert "404" in result["reason"] and len(p._queue) == 3
+
+    def test_duplicates_are_kept(self):
+        p = _player()
+        _human(p, "queue.add", track_ids=[2])
+        assert [t.id for t in p._queue] == [1, 2, 3, 2]
+
+    def test_nothing_loaded_loads_the_first_without_playing(self):
+        p = _player()
+        p._queue, p._queue_index, p._current_track = [], -1, None
+        p._known[("track", "9")] = _track(9)
+        result = _human(p, "queue.add", track_ids=[9])["result"]
+        assert p._current_track.id == 9 and p._queue_index == 0 and not p._playing
+        assert p._plays == [] and result["playing"] is False and "`resume`" in result["note"]
+
+    def test_paused_says_how_to_play_it(self):
+        p = _player()
+        result = _human(p, "queue.add", track_ids=[1])["result"]
+        assert result["note"].endswith("`queue play 3` plays it.")
+
+    def test_an_album_from_the_cache_costs_nothing(self):
+        p = _player()
+        p._cache.put_items("album:77", [_track(10), _track(11)])
+        result = _agent(p, "queue.add", album="77")
+        assert result["ok"] and result["result"]["added"] == 2
+        assert [t.id for t in p._queue][-2:] == [10, 11] and p.session.asked == []
+
+    def test_a_playlist_open_in_the_player_costs_nothing(self):
+        p = _player()
+        p._lists[("playlist", "pl")] = [_track(20)]
+        assert _agent(p, "queue.add", playlist="pl", position="next")["ok"]
+        assert [t.id for t in p._queue] == [1, 2, 20, 3]
+
+    @pytest.mark.parametrize("args", [{}, {"track_ids": []}, {"track_ids": [1], "album": "7"},
+                                      {"track_ids": [1], "position": "middle"}])
+    def test_bad_args(self, args):
+        p = _player()
+        assert _agent(p, "queue.add", **args)["code"] == "bad_args"
+        assert len(p._queue) == 3
+
+    def test_an_empty_list_is_empty(self):
+        p = _player()
+        p._lists[("playlist", "pl")] = []
+        p._cache.put_playlist_tracks("pl", [])
+        p.session = types.SimpleNamespace(
+            playlist=lambda pid: types.SimpleNamespace(tracks=lambda: []), is_pkce=False)
+        p._reconnect = lambda recheck=False: commands.ONLINE
+        assert _agent(p, "queue.add", playlist="pl")["code"] == "empty"
+
+    def test_ai_control_off_refuses(self):
+        p = _player(allow_ai_control=False)
+        _assert_refusal(_agent(p, "queue.add", track_ids=[1]), "ai_control_off")
+        assert len(p._queue) == 3
+
+    def test_cost_counts_only_what_is_not_known(self):
+        p = _player()
+        p._known[("track", "9")] = _track(9)
+        assert commands.queue_add_cost(p, {"track_ids": [1, 9]}) == 0
+        assert commands.queue_add_cost(p, {"track_ids": [1, 55, 66]}) == 2
+        assert commands.queue_add_cost(p, {"album": "77"}) == 2
+        p._cache.put_items("album:77", [_track(10)])
+        assert commands.queue_add_cost(p, {"album": "77"}) == 0

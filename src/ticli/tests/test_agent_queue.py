@@ -102,6 +102,34 @@ class TestCoalescing:
         assert h.session.requests == []
 
 
+class TestQueueAdd:
+    def test_known_tracks_cost_nothing_and_answer_at_once(self, player):
+        h = player()
+        reply = h.agent("queue.add", {"track_ids": [2]})
+        assert reply["ok"] and reply["result"]["queue_length"] == 4
+        assert reply["cost"] == {"requests": 0, "wait_s": 0, "eta_s": 0.0}
+        assert h.session.requests == []
+
+    def test_unknown_ids_wait_their_turn_two_seconds_apart_and_return_the_result(self, player):
+        h = player()
+        h.do(_adds(ROAD, 7))  # the POST at 0 s, its reparse GET at 2 s
+        reply = h.agent("queue.add", {"track_ids": [500, 501], "position": "next"})
+        assert reply["ok"] and reply["result"]["added"] == 2, reply
+        assert [t["id"] for t in reply["result"]["tracks"]] == [500, 501]
+        assert h.clock.sleeps == [2.0, 2.0, 2.0], "four requests, 2 s apart"
+        assert reply["cost"]["requests"] == 2
+        assert h.session.requests[-2:] == ["GET tracks/500", "GET tracks/501"]
+        assert [t.id for t in h.core._queue] == [1, 500, 501, 2, 3]
+
+    def test_an_album_not_yet_opened_is_one_queued_job(self, player):
+        h = player()
+        h.session.album_tracks["77"] = [fake_track(10), fake_track(11)]
+        reply = h.agent("queue.add", {"album": "77"})
+        assert reply["ok"] and reply["result"]["added"] == 2
+        assert h.session.requests == ["GET albums/77"]
+        assert [t.id for t in h.core._queue][-2:] == [10, 11]
+
+
 class TestTiming:
     def test_eta_counts_two_seconds_per_request_ahead(self):
         clock = FakeClock()
@@ -196,7 +224,7 @@ class TestReplies:
     def test_next_forms_follow_the_result_and_the_state(self, player):
         h = player(session=FakeTidal(search_tracks=[fake_track(42)]))
         reply = h.agent("search", {"query": "x"})
-        assert reply["next"][:2] == ["play track 42", "playlist add <playlist_id> 42"]
+        assert reply["next"][:3] == ["play track 42", "queue add 42", "playlist add <playlist_id> 42"]
         assert "pause" in reply["next"] and len(reply["next"]) <= 5
         h.agent("pause")
         assert "resume" in h.agent("status")["next"]

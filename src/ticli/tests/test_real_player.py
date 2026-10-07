@@ -257,3 +257,27 @@ def test_human_resume_gives_up_readably_on_a_player_that_does_not_answer(home):
     assert code == 1 and "has not answered" in out and "ticli status" in out, out
     assert took < 10, took
     a.close()
+
+
+def test_queue_add_starts_the_player_queues_without_playing_and_is_saved(home):
+    a, status = ipc.connect_or_start()
+    assert status is None and a is not None, status
+    pid = _pid()
+    reply = a.request("queue.add", {"track_ids": [2, 3]}, caller="agent", timeout=10)
+    assert reply["ok"] and reply["result"]["added"] == 2, reply
+    assert reply["result"]["playing"] is False and reply["state"]["queue"] == {"len": 2, "index": 0}
+    assert not _status(a)["playing"] and not _mpv_running(home)
+    a.close()
+    assert _wait(lambda: _exited(pid)), "nothing playing and nobody left: it leaves"
+    saved = json.loads((throttle.STATE_DIR / "player_state.json").read_text())
+    assert saved["track_ids"] == [2, 3] and saved["queue_index"] == 0
+
+    b, status = ipc.connect_or_start()
+    assert status is None and b is not None, status
+    assert _status(b)["queue"] == {"length": 2, "index": 0}
+    reply = b.request("queue.add", {"track_ids": [1], "position": "next"}, caller="agent", timeout=10)
+    assert reply["ok"] and reply["result"]["index"] == 1, reply
+    assert b.request("resume", timeout=5)["ok"]
+    assert _wait(lambda: _status(b)["playing"])
+    assert _status(b)["track"]["id"] == 2
+    b.close()
