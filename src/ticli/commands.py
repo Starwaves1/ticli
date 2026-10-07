@@ -17,7 +17,8 @@ from typing import Callable, Optional
 
 from ticli.utils import downloads, throttle
 from ticli.utils.cache import (
-    CachedPlaylist, CachedTrack, MetadataCache, age_label, item_from, kind_of, record_of,
+    CachedPlaylist, CachedTrack, MetadataCache, _dir_size, age_label, cached_audio_path,
+    index_file, item_from, kind_of, lists_dir, manifest_file, record_of,
 )
 from ticli.utils.config import (
     PROTECTED_KEYS, SETTINGS_SPEC, UNREADABLE, UNREADABLE_MESSAGE, ConfigUnreadable,
@@ -1322,23 +1323,93 @@ def _history_forget(p, args):
 
 
 def _queue_move(p, args) -> dict:
-    raise NotImplementedError
+    index = _queue_entry(p, args)
+    to = args.get("to")
+    if not isinstance(to, int) or isinstance(to, bool) or not 0 <= to < len(p._queue):
+        raise CommandError("bad_args", f"to must be 0..{len(p._queue) - 1}.")
+    cur = p._queue_index
+    p._queue.insert(to, p._queue.pop(index))
+    if index == cur:
+        cur = to
+    elif index < cur <= to:
+        cur -= 1
+    elif to <= cur < index:
+        cur += 1
+    p._queue_index = cur
+    p._prefetch_id = None
+    p._wake()
+    return {"index": to, "queue_index": p._queue_index, "queue_length": len(p._queue)}
 
 
 def _queue_clear(p, args) -> dict:
-    raise NotImplementedError
+    before = len(p._queue)
+    if p._current_track is not None and 0 <= p._queue_index < before:
+        p._queue = [p._queue[p._queue_index]]
+    elif p._current_track is not None:
+        p._queue = [p._current_track]
+    else:
+        p._queue = []
+    p._queue_index = 0 if p._queue else -1
+    p._prefetch_id = None
+    p._wake()
+    return {"removed": max(0, before - len(p._queue)), "queue_length": len(p._queue)}
 
 
 def _history_list(p, args) -> dict:
-    raise NotImplementedError
+    return {"history": list(p._search_history)}
+
+
+def cache_figures(cache) -> dict:
+    """Songs, downloads and metadata sizes from disk alone: no request."""
+    rows = downloads.present()
+    metadata = _dir_size(lists_dir()) + sum(
+        path.stat().st_size for path in (index_file(), manifest_file()) if path.is_file())
+    return {"songs": {"count": cache.audio_count(), "bytes": cache.total_bytes(),
+                      "budget_bytes": cache.budget_bytes, "enabled": cache.keeps_audio},
+            "downloads": {"count": len(rows), "bytes": sum(r["bytes"] for r in rows),
+                          "dir": str(downloads.download_dir())},
+            "metadata": {"bytes": metadata, "cap_bytes": cache.cap_bytes,
+                         "enabled": cache.enabled}}
 
 
 def _cache_status(p, args) -> dict:
-    raise NotImplementedError
+    return cache_figures(p._cache)
+
+
+def _disk_cache_status(cfg, args) -> dict:
+    cache = MetadataCache(metadata=cfg["cache_metadata"], songs=cfg["cache_songs"],
+                          budget_gb=cfg["cache_budget_gb"])
+    return {**cache_figures(cache), "source": "disk"}
 
 
 def _track_info(p, args) -> dict:
-    raise NotImplementedError
+    tid = args.get("track_id")
+    if tid in (None, ""):
+        raise CommandError("bad_args", "track info needs a track_id.")
+    track = _lookup(p, [tid])[0]
+    source = "local"
+    if track is None:
+        _require_online(p)
+        track = p.session.track(tid)
+        source = "tidal"
+        p._remember("track", [track])
+    key = str(track.id)
+    downloaded = cached = None
+    path = downloads.path_for(track.id)
+    if path is not None:
+        entry = downloads.load_index().get(key) or {}
+        downloaded = {"tier": p._tier_name(entry.get("granted")), "bytes": entry.get("bytes"),
+                      "path": str(path)}
+    if cached_audio_path(track.id) is not None:
+        record = p._cache.audio_record(track.id) or {}
+        cached = {"tier": p._tier_name(record.get("quality")), "bytes": record.get("bytes")}
+    return {"track": {**_track_json(track), "explicit": bool(getattr(track, "explicit", False)),
+                      "album_id": getattr(getattr(track, "album", None), "id", None),
+                      "artist_ids": [getattr(a, "id", None)
+                                     for a in getattr(track, "artists", None) or []]},
+            "quality": p._tier_name(getattr(track, "audio_quality", None)),
+            "liked": key in {str(i) for i in p._liked_ids},
+            "downloaded": downloaded, "cached": cached, "source": source}
 
 
 # ── parity: playlists and favourites ──
@@ -1569,7 +1640,7 @@ _DISK_READS = {
     "status": _disk_status, "queue.list": _disk_queue_list,
     "settings.get": lambda cfg, args: {**_settings_view(cfg), "source": "disk"},
     "library.playlists": _disk_playlists, "download.list": _disk_downloads,
-    "search": _disk_search,
+    "search": _disk_search, "cache.status": _disk_cache_status,
 }
 
 
