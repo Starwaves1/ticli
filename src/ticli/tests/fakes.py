@@ -99,6 +99,7 @@ class FakePlaylist:
         self.items = list(tracks)
         self.adds = []
         self.description = ""
+        self.edits = []
 
     @property
     def num_tracks(self):
@@ -115,16 +116,44 @@ class FakePlaylist:
         self.session.http("GET", f"playlists/{self.id}/items")
         return _paged(self.items, limit, offset)
 
+    def delete(self):
+        self.session.http("DELETE", f"playlists/{self.id}")
+        self.session.playlists.pop(self.id, None)
+        return True
+
+    def edit(self, title=None, description=None):
+        self.session.http("POST", f"playlists/{self.id}")
+        self.edits.append((title, description))
+        return True
+
 
 class FakeFavorites:
     def __init__(self, session):
         self.session = session
+        self.albums, self.artists, self.playlists = set(), set(), set()
 
     def add_track(self, ids):
         self.session.http("POST", "favorites/tracks")
 
     def remove_track(self, tid):
         self.session.http("DELETE", f"favorites/tracks/{tid}")
+
+
+def _favorite_methods():
+    def make(kind, on):
+        store = f"{kind}s"
+
+        def method(self, obj_id):
+            self.session.http("POST" if on else "DELETE", f"favorites/{store}/{obj_id}")
+            (getattr(self, store).add if on else getattr(self, store).discard)(str(obj_id))
+        return method
+
+    for kind in ("album", "artist", "playlist"):
+        setattr(FakeFavorites, f"add_{kind}", make(kind, True))
+        setattr(FakeFavorites, f"remove_{kind}", make(kind, False))
+
+
+_favorite_methods()
 
 
 class FakeUser:

@@ -1415,21 +1415,140 @@ def _track_info(p, args) -> dict:
 # ── parity: playlists and favourites ──
 
 
+NOT_YOURS_FIX = "Ids from `playlist list` that you created are yours."
+
+
+def _not_yours(verb: str) -> CommandError:
+    return CommandError(
+        "not_yours", f"That playlist isn't one of yours; only your own playlists can be {verb}.",
+        NOT_YOURS_FIX)
+
+
+def _playlist_id(args) -> str:
+    return str(args.get("id", "")).strip()
+
+
 def _playlist_delete(p, args) -> dict:
-    raise NotImplementedError
+    pid = _playlist_id(args)
+    if not pid:
+        raise CommandError("bad_args", "playlist delete needs a playlist id.")
+    _require_online(p)
+    target = _live_playlist(p, pid)
+    name = getattr(target or _known(p, "playlist", pid), "name", None)
+    held = _claim_picker(p)
+    outcome = {"accepted": True, "id": pid, "name": name}
+
+    def _run():
+        try:
+            found = target if target is not None else p.session.playlist(pid)
+            if not hasattr(found, "delete"):
+                raise _not_yours("deleted")
+            if not found.delete():
+                raise CommandError("api_error", "TIDAL did not delete that playlist.")
+            outcome.update(deleted=True, name=found.name)
+            p._editable_playlists = [q for q in p._editable_playlists if _sid(q) != pid]
+            p._known.pop(("playlist", pid), None)
+            p._lists.pop(("playlist", pid), None)
+            if p._last_playlist_id == pid:
+                p._last_playlist_id = None
+            records = p._cache.get("playlists")
+            if records:
+                p._cache.put("playlists", [r for r in records if str(r.get("id")) != pid])
+            p._set_toast(f'Deleted playlist "{found.name}"')
+        except Exception:
+            p._set_toast(f'Failed to delete "{name or pid}"')
+            _reraise_inline()
+        finally:
+            if held:
+                _set_picker_busy(p, False)
+            p._wake()
+
+    _background(_run)
+    return outcome
+
+
+def _playlist_edit(p, args, title=None, description=None) -> dict:
+    pid = _playlist_id(args)
+    if not pid:
+        raise CommandError("bad_args", "playlist edit needs a playlist id.")
+    _require_online(p)
+    target = _live_playlist(p, pid)
+    held = _claim_picker(p)
+    outcome = {"accepted": True, "id": pid}
+
+    def _run():
+        try:
+            found = target if target is not None else p.session.playlist(pid)
+            if not hasattr(found, "edit"):
+                raise _not_yours("edited")
+            if not found.edit(title, description):
+                raise CommandError("api_error", "TIDAL did not change that playlist.")
+            was = found.name
+            if title:
+                found.name = title
+            if description:
+                found.description = description
+            outcome.update(name=found.name, was=was,
+                           description=getattr(found, "description", "") or "")
+            p._remember("playlist", [found])
+            records = p._cache.get("playlists")
+            if records:
+                p._cache.put("playlists", [
+                    {**r, "name": found.name} if str(r.get("id")) == pid else r for r in records])
+            p._set_toast(f'Renamed "{was}" to "{found.name}"' if title
+                         else f'Changed the description of "{found.name}"')
+        except Exception:
+            p._set_toast("Failed to change the playlist")
+            _reraise_inline()
+        finally:
+            if held:
+                _set_picker_busy(p, False)
+            p._wake()
+
+    _background(_run)
+    return outcome
 
 
 def _playlist_rename(p, args) -> dict:
-    raise NotImplementedError
+    name = str(args.get("name") or "").strip()
+    if not name:
+        raise CommandError("bad_args", "Playlist name can't be empty.")
+    return _playlist_edit(p, args, title=name)
 
 
 def _playlist_describe(p, args) -> dict:
-    raise NotImplementedError
+    text = str(args.get("description") or "").strip()
+    if not text:
+        raise CommandError(
+            "bad_args", "TIDAL keeps the old description when given an empty one; pass some text.")
+    return _playlist_edit(p, args, description=text)
 
 
 def _favorite(kind: str, on: bool):
     def handler(p, args) -> dict:
-        raise NotImplementedError
+        obj_id = str(args.get("id", "")).strip()
+        if not obj_id:
+            raise CommandError("bad_args", f"{kind} id is required.")
+        _require_online(p)
+
+        def _run():
+            try:
+                favorites = p.session.user.favorites
+                getattr(favorites, f'{"add" if on else "remove"}_{kind}')(obj_id)
+                key = f"favorites:{kind}s"
+                items = p._cache.get_items(key)
+                if items is not None:
+                    items = [i for i in items if str(getattr(i, "id", "")) != obj_id]
+                    known = _known(p, kind, obj_id) if on else None
+                    if known is not None:
+                        items.insert(0, known)
+                    p._cache.put_items(key, items)
+                p._set_toast("Added to favorites" if on else "Removed from favorites")
+            except Exception:
+                _reraise_inline()
+
+        _background(_run)
+        return {"kind": kind, "id": obj_id, "favorite": on}
     return handler
 
 
@@ -1471,8 +1590,8 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("playlist.remove", _playlist_remove, tidal=True, dangerous=True,
             params=("id", "index", "track_id")),
     Command("playlist.delete", _playlist_delete, tidal=True, dangerous=True, params=("id",)),
-    Command("playlist.rename", _playlist_rename, tidal=True, params=("id", "name")),
-    Command("playlist.describe", _playlist_describe, tidal=True, params=("id", "description")),
+    Command("playlist.rename", _playlist_rename, tidal=True, dangerous=True, params=("id", "name")),
+    Command("playlist.describe", _playlist_describe, tidal=True, dangerous=True, params=("id", "description")),
     *(Command(f"{verb}.{kind}", _favorite(kind, verb == "favorite"), tidal=True, params=("id",))
       for verb in ("favorite", "unfavorite") for kind in ("album", "artist", "playlist")),
     Command("download", _download, tidal=True, params=("track_ids*",), options=("tier", "label")),

@@ -88,7 +88,8 @@ class TestRegistry:
 
     def test_the_dangerous_ones_are_exactly_the_destructive_ones(self):
         dangerous = {name for name, cmd in commands.COMMANDS.items() if cmd.dangerous is True}
-        assert dangerous == {"playlist.remove", "playlist.delete", "download.delete", "cache.clear",
+        assert dangerous == {"playlist.remove", "playlist.delete", "playlist.rename",
+                             "playlist.describe", "download.delete", "cache.clear",
                              "login.pkce", "logout", "refetch"}
 
     def test_unknown_command(self):

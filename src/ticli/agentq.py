@@ -22,7 +22,8 @@ from ticli.commands import (
 from ticli.utils import throttle
 
 SPACING = throttle.MIN_INTERVAL_SECONDS
-WAITS = frozenset({"playlist.create", "queue.add"})  # actions whose answer the agent needs before going on
+WAITS = frozenset({"playlist.create", "queue.add", "playlist.delete", "playlist.rename",
+                   "playlist.describe"})  # actions whose answer the agent needs before going on
 MERGES = frozenset({"playlist.add", "like"})
 # Usually local: they move the stream already playing. Ordered with the queue, but take no slot.
 LOCAL_MOSTLY = frozenset({"seek", "resume", "toggle"})
@@ -360,7 +361,8 @@ def compact_state(status: dict, pending: int = 0) -> dict:
     state = {"track": None if not track else {
                  "id": track.get("id"), "title": track.get("title"),
                  "artist": ", ".join(track.get("artists") or []),
-                 "pos": round(status.get("position") or 0), "dur": track.get("duration_seconds")},
+                 "pos": round(status.get("position") or 0), "dur": track.get("duration_seconds"),
+                 **{k: track[k] for k in ("liked", "quality") if k in track}},
              "playing": bool(status.get("playing")),
              "queue": {"len": queue.get("length", 0), "index": queue.get("index", -1)},
              "switches": {"ai": switches.get("allow_ai_control", True),
