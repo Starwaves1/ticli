@@ -296,3 +296,35 @@ def test_agent_resume_starts_the_player_and_plays_the_saved_track(home):
     assert _wait(lambda: _status(conn)["playing"]), "the saved track plays"
     assert _status(conn)["track"]["id"] == 1
     conn.close()
+
+
+def test_agent_queue_move_and_clear_reach_a_watching_tui_with_a_notice(home):
+    tui, status = ipc.connect_or_start()
+    assert status is None and tui is not None, status
+    assert tui.request("subscribe", timeout=5)["ok"]
+    assert tui.request("queue.add", {"track_ids": [1, 2, 3]}, timeout=10)["ok"]
+    assert tui.request("resume", timeout=5)["ok"]
+    assert _wait(lambda: _status(tui)["playing"])
+    agent = ipc.connect()
+
+    def pushed(key):
+        tui.wait_for(-1, timeout=0.05)
+        return [m["state"][key] for m in tui.held if m.get("event") == "state" and key in m["state"]]
+
+    reply = agent.request("queue.move", {"index": 2, "to": 0, "track_id": 3}, caller="agent", timeout=5)
+    assert reply["ok"] and reply["cost"]["requests"] == 0, reply
+    assert _wait(lambda: any(t[0] == "agent: moved queue entry 3 to 1" for t in pushed("toast")))
+    assert _wait(lambda: [t.id for t in pushed("queue")[-1]] == [3, 1, 2])
+    assert _wait(lambda: pushed("queue_index") and pushed("queue_index")[-1] == 1)
+    assert _status(tui)["track"]["id"] == 1 and _status(tui)["playing"], "playback untouched"
+
+    stale = agent.request("queue.move", {"index": 0, "to": 2, "track_id": 1}, caller="agent", timeout=5)
+    assert stale["code"] == "stale"
+
+    reply = agent.request("queue.clear", caller="agent", timeout=5)
+    assert reply["ok"] and reply["result"]["removed"] == 2, reply
+    assert _wait(lambda: any(t[0] == "agent: cleared the queue (2 tracks)" for t in pushed("toast")))
+    assert _wait(lambda: [t.id for t in pushed("queue")[-1]] == [1])
+    assert _status(tui)["playing"]
+    agent.close()
+    tui.close()

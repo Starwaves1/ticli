@@ -22,7 +22,8 @@ is everything you can do. To work on ticli's *source*, read `CLAUDE.md` instead.
 Every verb prints **one JSON object** on stdout and exits (`docs` is markdown).
 ```json
 {"ok": true, "result": {...},
- "state": {"track": {"id": 1, "title": "T", "artist": "A", "pos": 12, "dur": 200},
+ "state": {"track": {"id": 1, "title": "T", "artist": "A", "pos": 12, "dur": 200,
+                     "liked": false, "quality": "HIGH"},
            "playing": true, "queue": {"len": 3, "index": 0},
            "switches": {"ai": true, "dangerous": false}, "connectivity": "online",
            "pending": 2},
@@ -33,12 +34,18 @@ Every verb prints **one JSON object** on stdout and exits (`docs` is markdown).
   `pending` appears only while agent commands wait). `next` is up to 5 verbs
   that apply right now. `cost`: TIDAL `requests` used, `wait_s` you waited in
   the queue, `eta_s` until the last queued command finishes. Track durations
-  are `duration_seconds` everywhere (`dur` in `state`).
+  are `duration_seconds` everywhere (`dur` in `state`). `state.track.liked` is
+  whether it is in the user's favourites; `quality` is the tier TIDAL granted for
+  it (`LOW`, `MEDIUM`, `HIGH`, `MAX`; null until known).
+  `state.jobs` appears while a download or re-fetch runs (`state`, `done`, `total`
+  or `tracks`, `failed`); `status` shows the last one even when finished.
+- Every action you take shows in your human's TUI as a short `agent: ...` line
+  ("agent: queued 3 tracks"); they watch what you do.
 - Failure: `{"ok": false, "code", "reason", "fix"}` and exit 1. Codes:
   `ai_control_off`, `dangerous_off`, `key_required`, `wrong_key` (permissions),
   `rate_limited`, `not_logged_in`, `auth_failed`, `not_found` (stale or wrong
   id), `stale` (the queue moved; the reply carries the current `queue`),
-  `bad_args`, `empty`, `no_track`, `human_only`, `api_error`,
+  `bad_args`, `empty`, `no_track`, `not_yours` (a playlist you don't own), `human_only`, `api_error`,
   `player_unavailable`, `offline`, `signed_out`. Act on `fix`. The original verbs (`search`, `resolve`,
   `playlist ...`) also keep `error`, `message`, `hint`, and their own result keys.
 - Arguments are positional in the order shown below, `key=value`, or one JSON
@@ -81,7 +88,9 @@ agents, **requests 2 s apart**; you never pace by hand and cannot bypass it.
   `status`). `ok` is true only if every record is; `cost.requests` counts what the
   waited items used plus the estimate for queued actions.
 - Queue entries: pass the `track_id` you saw with the index
-  (`queue remove 2 TRACK_ID`); if the queue moved you get `stale`, not another track.
+  (`queue remove 2 TRACK_ID`, `queue move 5 1 TRACK_ID` to put entry 5 at 1); if the
+  queue moved you get `stale`, not another track. `queue clear` keeps only the
+  current track; neither touches playback.
 - Adding to the play queue: `queue add ID... [--next]` (or `album=ID`, `playlist=ID`,
   `mix=ID` for all of a list's tracks; a song may be `"artist - title"` or a URL).
   Default is the end; `--next` plays it after the current track. It never replaces the
@@ -120,11 +129,12 @@ no command or verb can. **Ask your human; never edit config.json, write ticli's
 files or impersonate the TUI.** Changes show in the TUI.
 - **Allow AI control** (on by default). Off: actions are refused with
   `ai_control_off`; reads (`status`, `queue list`, `download list`,
-  `settings get`, `playlist list`, `search` over your own playlists) answer from
+  `settings get`, `cache status`, `playlist list`, `search` over your own playlists) answer from
   disk, 0 requests, `"source": "disk"`, and never start the player.
-- **Allow dangerous commands** (off by default): deleting playlists or
-  downloads, removing playlist tracks, clearing the cache, lowering the cache
-  budget, logout, changing the login flow. Refused with `dangerous_off`.
+- **Allow dangerous commands** (off by default): deleting, renaming or
+  re-describing playlists, deleting downloads, removing playlist tracks,
+  re-fetching the library, clearing the cache, lowering the cache budget, logout,
+  changing the login flow. Refused with `dangerous_off`.
 - **AI control key** (unset by default). Set: every verb except `status` needs
   it via `TICLI_AI_KEY` or `ticli agent --key KEY <verb>`; wrong keys cost 1 s.
 On any refusal quote its `fix` to your human and stop.
@@ -153,6 +163,19 @@ the queue.
 
 **"Add this to my X playlist."** `playlist list`, match X case-insensitively;
 more than one match or no match: ask. Ask first; never auto-create a playlist the user called existing.
+
+**"More results."** `search QUERY --offset 10` is the next page of 10 (1 request each).
+
+**"Upgrade my music to FLAC."** `refetch plan` first (0 requests): it says how many
+songs, the requests (2 per song) and the time (2 s per song at least). Tell your
+human those numbers; run `refetch` (dangerous) only on their yes. A tier the login
+isn't served comes back in `note`.
+
+**"Delete / rename that playlist."** Only by id from `playlist list` (`playlist
+delete` refuses names); say the name back to your human and get their yes first.
+
+**"What is this track?"** `track info ID`: album, duration, explicit, the tier TIDAL
+offers, liked, and whether it is downloaded or cached; 0 requests when known locally.
 
 **Setup questions.** `status` is free: `flow` is `pkce` (FLAC) or `device`
 (AAC only); `flac_capable` false means the human presses `u` in TUI settings.
@@ -185,15 +208,15 @@ THE verb for "the user named a song". Answers `{"confident": bool, "best": {...}
 "candidates": [...]}`; candidates are `{id, title, artists, album,
 duration_seconds, explicit, artist_match, title_exact, unrequested_qualifier, score}`.
 
-### `ticli agent search QUERY [--type track|album|artist|playlist] [--limit N]` — 1 request
-One request however many `--type`. Output `{"query", "tracks": [...], ...}`: tracks as
+### `ticli agent search QUERY [--type track|album|artist|playlist] [--limit N] [--offset N]` — 1 request
+One request however many `--type`; `--offset` pages (each page 1 request). Output `{"query", "tracks": [...], ...}`: tracks as
 above minus ranking; albums `{id, title, artists, num_tracks, year}`; artists
 `{id, name}`; playlists `{id, name, num_tracks, description}`.
 
 ### `ticli agent playlist list|show|create|add`
 `playlist list` (1 request) `{"playlists": [...]}`; `playlist show ID` (2)
-`{"playlist", "tracks"}`; `playlist create NAME [--description D]` (1) answers
-`{"playlist": {"id"}}`, capture the id; `playlist add ID TRACK_ID...` is queued
+`{"playlist", "tracks"}`; `playlist create NAME [TRACK_ID...] [--description D]` (1, plus
+2 per 100 tracks) waits and answers `{"playlist": {"id"}, "added"}`, capture the id; `playlist add ID TRACK_ID...` is queued
 and coalesced (2 requests per 100 ids); the reply has `requested`, `queued`, no
 `added` (not known yet): check with `playlist show`.
 
@@ -203,8 +226,21 @@ and coalesced (2 requests per 100 ids); the reply has `requested`, `queued`, no
 """
 
 
+_ONE_PLAYLIST = "1 request (2 if the playlist isn't loaded yet), waits its turn and returns the result"
 COSTS = {"queue.add": "0 requests for tracks already known, else 1 per unknown id; "
-                      "waits its turn and returns the result"}
+                      "waits its turn and returns the result",
+         "track.info": "0 requests when the track is known locally, else 1; returns data",
+         "refetch.plan": "0 requests: what `refetch` would do, songs, requests and time",
+         "refetch": "2 requests per song, one song per 2 s, for the whole library; "
+                    "run `refetch plan` first and ask your human",
+         "playlist.delete": _ONE_PLAYLIST, "playlist.rename": _ONE_PLAYLIST,
+         "playlist.describe": _ONE_PLAYLIST,
+         "download.album": "0 requests for the list if already opened, else 2; then each "
+                           "track downloads paced 2 s apart",
+         "download.playlist": "0 requests for the list if already opened, else 2; then each "
+                              "track downloads paced 2 s apart",
+         **{f"{v}.{k}": "1 request, queued, answers at once with position and ETA"
+            for v in ("favorite", "unfavorite") for k in ("album", "artist", "playlist")}}
 
 
 def _cost(name, spec) -> str:

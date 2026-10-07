@@ -67,9 +67,14 @@ ticli playlist create "Road trip"
 ticli playlist add "Road trip" "daft punk - one more time"
 ticli like                                           # the playing track
 ticli download https://tidal.com/browse/track/123
+ticli download album "discovery" tier=MAX           # a whole album or playlist, like the TUI's D
+ticli queue move 4 1                                 # indexes as `ticli queue` lists them; `ticli queue clear` keeps only the current track
+ticli cache status                                   # cached songs vs the budget, downloads, metadata
+ticli track info current                             # album, quality, liked, downloaded or cached
+ticli playlist rename "Road trip" "Road trip 2026"   # also: playlist describe, playlist delete (y/N)
 ```
 
-Playlist names match your own playlists case-insensitively with no TIDAL request, otherwise one TIDAL search; several matches print a numbered top 5 (`ticli start playlist 2` picks). A song is a track id, a TIDAL URL, `"artist - title"` (added only when the match is confident, otherwise you get candidates) or `current`. Dangerous verbs (deleting, clearing the cache, logout) ask y/N. Run without a terminal, a verb is treated as an AI agent and obeys the TUI's AI-control switches.
+Playlist names match your own playlists case-insensitively with no TIDAL request, otherwise one TIDAL search; several matches print a numbered top 5 (`ticli start playlist 2` picks). A song is a track id, a TIDAL URL, `"artist - title"` (added only when the match is confident, otherwise you get candidates) or `current`. Dangerous verbs (deleting or renaming playlists, re-fetching the library, clearing the cache, logout) ask y/N; `ticli refetch` first shows what it would upgrade. Run without a terminal, a verb is treated as an AI agent and obeys the TUI's AI-control switches.
 
 ### Login, and where FLAC comes from
 

@@ -472,7 +472,15 @@ def _status(p, args) -> dict:
         "queue": {"length": len(p._queue), "index": p._queue_index},
         "switches": switches(cfg),
         "connectivity": p._connectivity,
+        "jobs": {name: _job_summary(job) for name, job in
+                 (("download", p._download_job), ("refetch", p._refetch_job)) if job},
     }
+
+
+def _job_summary(job) -> dict:
+    """A download or re-fetch job as the TUI's progress box shows it."""
+    return {k: job[k] for k in ("state", "tier", "done", "total", "tracks", "failed", "error")
+            if job.get(k) not in (None, "")}
 
 
 def switches(cfg) -> dict:
@@ -1637,8 +1645,7 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("history.add", _history_add, params=("query",)),
     Command("history.forget", _history_forget, params=("query",)),
     Command("history.list", _history_list, read=True),
-    Command("search", _search, read=True, tidal=True, params=("query",),
-            options=("types", "limit", "offset")),
+    Command("search", _search, read=True, tidal=True, params=("query",)),
     Command("track.info", _track_info, read=True, tidal=True, params=("track_id",)),
     Command("resolve", _resolve, read=True, tidal=True, params=("artist", "title")),
     Command("album.tracks", _album_tracks, read=True, tidal=True, params=("id", "offset", "limit")),

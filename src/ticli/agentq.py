@@ -369,6 +369,9 @@ def compact_state(status: dict, pending: int = 0) -> dict:
                           "dangerous": switches.get("allow_dangerous_commands", False)}}
     if status.get("connectivity"):
         state["connectivity"] = status["connectivity"]
+    running = {k: j for k, j in (status.get("jobs") or {}).items() if j.get("state") == "running"}
+    if running:
+        state["jobs"] = running
     if pending:
         state["pending"] = pending
     return state

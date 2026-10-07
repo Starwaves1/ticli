@@ -31,7 +31,7 @@ Machine-owned, disposable audio under the OS cache directory, held to `cache_bud
 _Avoid_: downloads, library, offline copies
 
 **Download**:
-A user-owned, tagged file in `~/Music/Ticli/<Artist>/<Album>/`. Outside the budget and eviction, and never re-fetched without the user's `[R]`.
+A user-owned, tagged file in `~/Music/Ticli/<Artist>/<Album>/`. Outside the budget and eviction, and never re-fetched without a human's `[R]` or an agent's `refetch` with dangerous commands allowed.
 _Avoid_: cached song, saved song
 
 **Scratch copy**:
@@ -96,7 +96,11 @@ Who a command runs for: `human` (TUI keys, `ticli <verb>` from a terminal) or `a
 The human's three TUI-only switches: Allow AI control, Allow dangerous commands, and the AI control key. No command can change them (ADR-0007).
 
 **Dangerous command**:
-A command that deletes or is hard to undo: removing from or deleting/renaming a playlist, deleting a download, clearing the cache, lowering the cache budget, logout, changing the login flow. Refused to agents unless Allow dangerous commands is on.
+A command that deletes or is hard to undo: removing from, deleting, renaming or re-describing a playlist, deleting a download, re-fetching the library (hundreds of requests), clearing the cache, lowering the cache budget, logout, changing the login flow. Refused to agents unless Allow dangerous commands is on.
+
+**Agent notice**:
+The transient `agent: ...` status line a connected TUI shows after an agent's action ("agent: queued 3 tracks"), so the human watches what the AI did. Reads show none.
+_Avoid_: agent toast, AI log
 
 **Trip**:
 The throttle's persisted stop, written on a 429 or 401/4006. Every agent request fails fast until a human runs `ticli agent unblock`.
