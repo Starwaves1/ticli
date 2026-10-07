@@ -2,6 +2,7 @@
 playlist-create arguments the legacy agent verbs and human verbs pass through."""
 
 import json
+import threading
 import time
 
 import pytest
@@ -121,10 +122,28 @@ class TestDownloadAlbum:
     def test_the_agent_toast_says_what_started(self, jobs):
         h, _acquired = jobs
         _album(h)
-        assert h.agent("download.album", {"id": "777"})["ok"]
-        h.idle()
-        assert h.core._toast.startswith('agent: downloading album "')
-        assert 'downloading album "Night Album" (3 tracks)' in h.core._toast
+        # The job's own "Downloaded N songs" toast replaces the agent's notice, so
+        # hold the download until the notice has been read.
+        parked, release = threading.Event(), threading.Event()
+        deliver = h.core._download_deliver
+
+        def held(*args, **kwargs):
+            parked.set()
+            assert release.wait(5), "the download was never released"
+            return deliver(*args, **kwargs)
+
+        h.core._download_deliver = held
+        try:
+            assert h.agent("download.album", {"id": "777"})["ok"]
+            h.idle()
+            assert parked.wait(3), "the download never started"
+            _settle(lambda: h.core._toast.startswith("agent:"))
+            toast = h.core._toast
+        finally:
+            release.set()
+        _done(h)
+        assert toast.startswith('agent: downloading album "')
+        assert 'downloading album "Night Album" (3 tracks)' in toast
 
     def test_a_bad_tier_is_refused(self, jobs):
         h, _acquired = jobs
