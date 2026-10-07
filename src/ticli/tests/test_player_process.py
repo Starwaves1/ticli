@@ -584,6 +584,27 @@ class TestSocketPath:
             self._listen()
         assert path.read_text() == "mine"
 
+    def test_binding_leaves_directories_made_meanwhile_searchable(self, monkeypatch, tmp_path):
+        # The cache threads core.start() launched run while the socket binds; a 0o700 cache
+        # directory created then must not come out 0o600, or every stat inside it is EACCES.
+        made = tmp_path / "made-during-bind"
+        real = playerd.socket.socket
+
+        class Racing(real):
+            def bind(self, address):
+                made.mkdir(mode=0o700)
+                return super().bind(address)
+
+        monkeypatch.setattr(playerd.socket, "socket", Racing)
+        server = playerd.PlayerServer(_core(playing=False))
+        try:
+            server.listen()
+            assert made.stat().st_mode & 0o777 == 0o700
+            assert ipc.socket_path().stat().st_mode & 0o777 == 0o600
+            assert [p.name for p in ipc.socket_path().parent.iterdir()] == [ipc.socket_path().name]
+        finally:
+            server.close()
+
 
 class TestSingleInstance:
     def test_a_second_player_refuses_and_says_so(self, monkeypatch):

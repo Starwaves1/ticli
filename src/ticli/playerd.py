@@ -81,12 +81,19 @@ class PlayerServer:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._clear_stale_socket()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        old = os.umask(0o177)
+        # Bound under a private name, made owner-only, then renamed into place. Not via
+        # os.umask: it is process-wide, and the cache threads core.start() launched
+        # would create their 0o700 directories as 0o600, unsearchable.
+        staging = self.path.with_name(f".{self.path.name}.{os.getpid()}")
+        staging.unlink(missing_ok=True)
         try:
-            sock.bind(str(self.path))
-        finally:
-            os.umask(old)
-        os.chmod(self.path, 0o600)
+            sock.bind(str(staging))
+            os.chmod(staging, 0o600)
+            os.rename(staging, self.path)
+        except OSError:
+            sock.close()
+            staging.unlink(missing_ok=True)
+            raise
         sock.listen(16)
         sock.setblocking(False)
         self.listener = sock
