@@ -330,7 +330,7 @@ def call(cmd: str, args: dict) -> dict:
         return error_reply(refused)
     if not cfg.get("allow_ai_control", True):
         return _disk_batch(items, cfg) if items is not None else _disk_reply(cmd, args, cfg)
-    conn, status = ipc.connect_or_start()
+    conn, status = ipc.connect_current()
     if conn is None:
         return _start_error(status)
     try:
@@ -341,7 +341,7 @@ def call(cmd: str, args: dict) -> dict:
         return {"ok": False, "code": "player_gone", "reason": "The player closed the connection.",
                 "fix": "Run `ticli agent status`; queued actions may still have run."}
     response.pop("id", None)
-    return response
+    return ipc.stale_reply(response, "ticli agent restart") if conn.stale else response
 
 
 def _disk_batch(items, cfg) -> dict:
@@ -578,3 +578,18 @@ def unblock() -> None:
     emit({"ok": True, "was_tripped": was})
     if not was:
         print("note: no stop was in force", file=sys.stderr)
+
+
+def restart() -> None:
+    """A fresh player on the current code, resuming where the old one was. Refused
+    while a download, re-fetch or queued agent work runs."""
+    from ticli import ipc
+    from ticli.agentq import error_reply
+    from ticli.commands import AGENT, gate
+    from ticli.utils.config import load_config
+
+    refused = gate("restart", AGENT, _key(), load_config())
+    if refused:
+        finish(error_reply(refused))
+    reply = ipc.restart()
+    finish(reply if reply["ok"] else error_reply(reply))

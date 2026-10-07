@@ -27,7 +27,7 @@ from typing import Optional
 from ticli import agentq, ipc
 from ticli import commands as command_layer
 from ticli.commands import AGENT, COMMANDS, HUMAN, ONLINE, tripped_error
-from ticli.utils import throttle
+from ticli.utils import testhooks, throttle
 from ticli.utils.config import PROTECTED_KEYS, UNREADABLE, load_config
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,8 @@ class PlayerServer:
         core._tick_hook = self._tick
         core._list_hook = self._list_changed
         self._default = ipc.encoder(remember=lambda kind, obj: core._remember(kind, [obj]))
+        self.code = ipc.code()
+        self._legacy = testhooks.legacy()
 
     # ── lifecycle ──
 
@@ -138,13 +140,22 @@ class PlayerServer:
         self._deliver_posted()
         self.broadcast()
 
-    def should_exit(self) -> bool:
+    def busy(self) -> list:
         core = self.core
-        busy = ((core._download_job or {}).get("state") == "running"
-                or core._download_run is not None
-                or (core._refetch_job or {}).get("state") == "running")
-        busy = busy or self.agent_queue.busy() or command_layer.in_flight() > 0
-        return self.had_client and not self.clients and not core._playing and not busy
+        return [name for name, on in (
+            ("download", (core._download_job or {}).get("state") == "running"
+             or core._download_run is not None),
+            ("refetch", (core._refetch_job or {}).get("state") == "running"),
+            ("agent queue", self.agent_queue.busy()),
+            ("command", command_layer.in_flight() > 0)) if on]
+
+    def should_exit(self) -> bool:
+        return self.had_client and not self.clients and not self.core._playing and not self.busy()
+
+    def hello(self) -> dict:
+        core = self.core
+        return {"code": self.code, "pid": os.getpid(), "loaded": core._current_track is not None,
+                "playing": bool(core._playing), "busy": self.busy()}
 
     def wake(self) -> None:
         try:
@@ -287,6 +298,13 @@ class PlayerServer:
             self._reply(client, rid, {"ok": False, "code": "bad_request",
                                       "reason": "A request is {id, cmd, args, caller}."})
             return
+        if self._legacy is not None and (cmd == "hello" or cmd in self._legacy):
+            unknown = {"ok": False, "code": "unknown_command", "reason": f"No command named {cmd!r}."}
+            self._reply(client, rid, unknown)
+            return
+        if cmd == "hello":
+            self._reply(client, rid, {"ok": True, "result": self.hello()})
+            return
         if cmd == "subscribe":
             self.broadcast(force=True)
             client.subscribed = True
@@ -343,7 +361,10 @@ class PlayerServer:
 
     def _execute(self, cmd, args, caller, key) -> dict:
         try:
-            return self.core.commands.execute(cmd, args, caller=caller, key=key)
+            response = self.core.commands.execute(cmd, args, caller=caller, key=key)
+            if self._legacy is not None and cmd == "status":
+                (response.get("result") or {}).pop("jobs", None)
+            return response
         except Exception as e:
             logger.warning("Command %s failed: %r", cmd, e)
             return {"ok": False, "code": "failed", "reason": str(e) or type(e).__name__}
@@ -603,11 +624,31 @@ class PlayerServer:
                 .encode())
 
 
+def hand_over(pid: int) -> None:
+    """Ask the player `pid` whether it plays, leave that for the next player, then stop
+    it: SIGTERM saves queue, index and position on every build, old ones included."""
+    if ipc.lock_holder() != pid:
+        return
+    conn = ipc.connect()
+    reply = conn.request("status", caller="human", timeout=ipc.HELLO_TIMEOUT) if conn else None
+    if conn is not None:
+        conn.close()
+    try:
+        ipc.write_handover(bool(((reply or {}).get("result") or {}).get("playing")))
+    except OSError as e:
+        logger.warning("Could not note the handover: %r", e)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ticli.playerd")
     parser.add_argument("--ready-fd", type=int)
     parser.add_argument("--quality")
     parser.add_argument("--login-flow")
+    parser.add_argument("--replace", type=int)
     opts = parser.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -627,7 +668,16 @@ def main(argv=None) -> int:
 
     core = HeadlessTidalPlayer(quality=opts.quality, login_flow=opts.login_flow)
     core.console = Console(file=open(os.devnull, "w"))
-    if not core.start(interactive=False):
+    if opts.replace:
+        hand_over(opts.replace)
+    started = core.start(interactive=False)
+    deadline = time.monotonic() + ipc.REPLACE_SECONDS
+    # The replaced player saves and leaves; its lock frees a moment later.
+    while (not started and opts.replace and core.start_failure == "running"
+           and ipc.lock_holder() in (opts.replace, None) and time.monotonic() < deadline):
+        time.sleep(ipc.RACE_POLL_SECONDS)
+        started = core.start(interactive=False)
+    if not started:
         ready(core.start_failure or "error: the player could not start")
         return 1
     server = PlayerServer(core)
@@ -648,6 +698,9 @@ def main(argv=None) -> int:
     # A signal can land on a worker thread, which never interrupts the loop's select.
     signal.set_wakeup_fd(server.wake_w)
 
+    handover = ipc.take_handover()
+    if handover and handover.get("playing") and core._current_track is not None:
+        core._start_current_from_position()
     ready("ready")
     try:
         server.serve()

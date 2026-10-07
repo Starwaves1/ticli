@@ -343,6 +343,7 @@ STREAM_TRUNCATED_MARGIN = 15.0
 # 19/s burst got the IP blocked (docs/adr/0001-tidal-rate-limits.md).
 REFETCH_MIN_INTERVAL = 2.0
 AGENT_NOTICE_SECONDS = 4.0
+NOTICE_SECONDS = 8.0
 
 # Parallelism only on CDN fetches; API resolving stays serial and paced (docs/adr/0001-tidal-rate-limits.md).
 DOWNLOAD_WORKERS = 3
@@ -6280,8 +6281,25 @@ class HeadlessTidalPlayer:
     def _drain_remote(self) -> None:
         for message in self.remote.read_messages():
             self._on_message(message)
-        if self.remote.closed:
+        if self.remote.closed and not self._reattach():
             self.running = False
+
+    def _reattach(self) -> bool:
+        """A handover replaced the player under us: attach to the new one."""
+        from ticli import ipc
+        if self._quitting or self._logged_out or not ipc.handover_pending():
+            return False
+        conn, _ = ipc.connect_or_start()
+        if conn is None:
+            return False
+        if not (conn.request("subscribe", timeout=SUBSCRIBE_TIMEOUT) or {}).get("ok"):
+            conn.close()
+            return False
+        self.remote, self._pending = conn, {}
+        held, conn.held = conn.held, []
+        for message in held:
+            self._on_message(message)
+        return True
 
     def _wait_timeout(self, now: Optional[float] = None) -> Optional[float]:
         """How long the TUI may sleep: to the next displayed second while playing, to a
@@ -6332,7 +6350,7 @@ class HeadlessTidalPlayer:
         threading.Thread(target=self._monitor_playback, daemon=True).start()
         return True
 
-    def run(self):
+    def run(self, notice: Optional[str] = None):
         """The TUI, attached to the background player over `self.remote`."""
         import tty
         import termios
@@ -6350,6 +6368,8 @@ class HeadlessTidalPlayer:
             self.console.print("[red]The player did not answer.[/red] "
                                f"[dim]Its log: {player_log_path()}[/dim]")
             return
+        if notice:
+            self._set_toast(notice, seconds=NOTICE_SECONDS)
 
         # SIGHUP/SIGTERM leave the player playing: only quitting stops it. The wake matters:
         # Python retries an interrupted select, which while paused has no timeout.
@@ -6403,6 +6423,7 @@ class HeadlessTidalPlayer:
             self._live = None
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
             self._tty_settings = None
+            remote = self.remote
             if self._quitting and not remote.closed:
                 # Quit means quit: the player stops and saves, then leaves once nobody needs it.
                 remote.request("stop", timeout=STOP_TIMEOUT)
@@ -6438,7 +6459,8 @@ def run_tui(quality: Optional[str] = None, login_flow: Optional[str] = None) -> 
     if not sys.stdin.isatty():
         console.print("[red]Player requires an interactive terminal.[/red]")
         return
-    conn, status = ipc.connect_or_start(quality, login_flow)
+    notes: list = []
+    conn, status = ipc.connect_current(quality, login_flow, say=notes.append)
     if conn is None and status == "login":
         # The player has no terminal, so a first sign-in happens here, then it starts again.
         if not HeadlessTidalPlayer(quality=quality, login_flow=login_flow)._login():
@@ -6447,7 +6469,11 @@ def run_tui(quality: Optional[str] = None, login_flow: Optional[str] = None) -> 
     if conn is None:
         console.print(f"[red]Could not start the player:[/red] {status}")
         return
-    HeadlessTidalPlayer(quality=quality, login_flow=login_flow, remote=conn).run()
+    if conn.stale:
+        notes.append(f"{ipc.STALE_REASON}; run `ticli restart` to update it (playback resumes)")
+    notice = notes[-1].removeprefix("ticli: ") if notes else None
+    notice = notice and notice[0].upper() + notice[1:]
+    HeadlessTidalPlayer(quality=quality, login_flow=login_flow, remote=conn).run(notice)
 
 
 def player_log_path():

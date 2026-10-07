@@ -84,6 +84,10 @@ def refusal(code: str, reason: str, fix: str = "", **extra) -> dict:
     return {"ok": False, "code": code, "reason": reason, **({"fix": fix} if fix else {}), **extra}
 
 
+def _note(text: str) -> None:
+    click.echo(text, err=True)
+
+
 class Link:
     """One connection to the player, kept for a whole verb so it cannot leave between
     the lookup and the action. Agents go through `ticli.agent.call` instead."""
@@ -112,7 +116,7 @@ class Link:
         from ticli import ipc
         from ticli.agentq import render
         if self.conn is None:
-            self.conn = ipc.connect()
+            self.conn, _ = ipc.connect_current(start=False, say=_note)
         if self.conn is None:
             failed = self._start()
             if failed:
@@ -129,6 +133,8 @@ class Link:
         response.pop("id", None)
         if response.get("ok"):
             response["result"] = render(response.get("result"))
+        elif self.conn.stale:
+            response = ipc.stale_reply(response, "ticli restart")
         return response
 
     def _start(self):
@@ -136,7 +142,7 @@ class Link:
         a silent wait reads as a hang. None once connected, else the refusal."""
         from ticli import agent, ipc
         click.echo("starting the player...", err=True)
-        self.conn, status = ipc.connect_or_start(timeout=START_SECONDS)
+        self.conn, status = ipc.connect_current(timeout=START_SECONDS, say=_note)
         if self.conn is not None:
             return None
         if status and "did not start in time" in status:
@@ -903,3 +909,20 @@ def queue(words, next_: bool) -> None:
     finally:
         link.close()
     say(who, "queue.add", reply)
+
+
+def restart(force: bool) -> None:
+    """`ticli restart`: a fresh player on the current code, resuming where it was."""
+    from ticli import ipc
+    root = click.get_current_context().find_root().params
+    reply = ipc.restart(root.get("quality"), root.get("login_flow"), force=force)
+    if not reply["ok"]:
+        raise fail(reply)
+    result = reply["result"]
+    if not result["running"]:
+        click.echo("the player is not running; it starts on the current code next time")
+    elif not result["restarted"]:
+        click.echo("the player did not restart")
+        raise SystemExit(1)
+    else:
+        click.echo("restarted the player" + ("; playback resumed" if result["playing"] else ""))

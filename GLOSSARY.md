@@ -81,6 +81,14 @@ _Avoid_: seek mode, scrub mode
 The background `ticli.playerd` that owns audio, the TIDAL session, queue, saved state, downloads and caches. Every TUI and CLI call is a client of its socket; it outlives the terminal and leaves when idle and alone.
 _Avoid_: daemon, server (in prose)
 
+**Handover**:
+Replacing a running player with one on newer code, keeping its place: the new player asks whether the old one plays, SIGTERMs it (which saves queue, index and position on every build) and resumes there. Clients start one on their own when the player's **code fingerprint** is older and it runs no job; `ticli restart` starts one on demand.
+_Avoid_: reload, upgrade (in prose)
+
+**Code fingerprint**:
+A hash of the package's `.py` paths, mtimes and sizes plus the newest mtime, taken when a process imports `ticli.ipc` and exchanged in `hello`. Only a client with the newer one replaces a player.
+_Avoid_: version (the package version doesn't change on an edit)
+
 **Agent surface**:
 `ticli agent <verb>`, the JSON-only CLI for programs. `HeadlessTidalPlayer` is the player core, and the TUI when attached with `remote`, despite its name.
 _Avoid_: API, headless mode

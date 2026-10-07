@@ -220,6 +220,15 @@ above minus ranking; albums `{id, title, artists, num_tracks, year}`; artists
 and coalesced (2 requests per 100 ids); the reply has `requested`, `queued`, no
 `added` (not known yet): check with `playlist show`.
 
+### `ticli agent restart` — 0 requests, or 2 to resume an uncached track
+Replaces the background player with one on ticli's current code; the queue, track,
+position and playing/paused carry over (about a second of silence). Answers
+`{"restarted", "running", "loaded", "playing"}`; `running: false` means no player
+was up. Refused with `busy` while a download, re-fetch or your queued commands run.
+Clients already do this on their own when the player is older and idle or only
+playing; an `unknown_command` whose reason starts "The background player is
+running older code" means it couldn't: run `restart`, then the command again.
+
 ### `ticli agent docs`, `ticli agent do`, `ticli agent unblock`
 `docs` prints this page (0 requests, markdown). `do` is described above.
 `unblock` is Human-only.

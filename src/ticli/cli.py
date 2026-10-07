@@ -246,6 +246,14 @@ def start(kind, name, no_tui):
     humancli.start(kind, " ".join(name), no_tui)
 
 
+@cli.command()
+@click.option("--force", is_flag=True, help="Even while a download or re-fetch runs (it is cut short).")
+def restart(force):
+    """Restart the background player on the current code; playback resumes where it was."""
+    from ticli import humancli
+    humancli.restart(force)
+
+
 @cli.command("search")
 @click.argument("query", nargs=-1, required=True)
 @click.option("--type", "types", multiple=True, type=click.Choice(["track", "album", "artist", "playlist"]), help="Repeatable. Default: all four.")
@@ -361,6 +369,15 @@ def do_(commands):
 
     from ticli import agent as impl
     impl.do(commands if commands is not None else sys.stdin.read())
+
+
+@agent.command("restart")
+def agent_restart():
+    """Restart the background player on the current code, resuming playback where it
+    was. 0 requests to TIDAL besides re-fetching the playing stream. Refused while a
+    download, re-fetch or queued agent work runs."""
+    from ticli import agent as impl
+    impl.restart()
 
 
 @agent.command()

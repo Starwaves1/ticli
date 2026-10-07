@@ -72,7 +72,10 @@ ticli queue move 4 1                                 # indexes as `ticli queue` 
 ticli cache status                                   # cached songs vs the budget, downloads, metadata
 ticli track info current                             # album, quality, liked, downloaded or cached
 ticli playlist rename "Road trip" "Road trip 2026"   # also: playlist describe, playlist delete (y/N)
+ticli restart                                        # the background player on the current code; playback resumes where it was
 ```
+
+After an update, the background player may still run the old code. A verb finding an older player that is idle or only playing replaces it on its own (one line on stderr, about a second of silence); while a download runs it leaves it and says to run `ticli restart`.
 
 Playlist names match your own playlists case-insensitively with no TIDAL request, otherwise one TIDAL search; several matches print a numbered top 5 (`ticli start playlist 2` picks). A song is a track id, a TIDAL URL, `"artist - title"` (added only when the match is confident, otherwise you get candidates) or `current`. Dangerous verbs (deleting or renaming playlists, re-fetching the library, clearing the cache, logout) ask y/N; `ticli refetch` first shows what it would upgrade. Run without a terminal, a verb is treated as an AI agent and obeys the TUI's AI-control switches.
 
