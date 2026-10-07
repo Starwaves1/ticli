@@ -28,11 +28,19 @@ DONE = {**TRANSPORT, "like": "liked", "unlike": "unliked", "stop": "stopped",
         "playlist.remove": "removed from the playlist", "download": "downloading",
         "download.cancel": "download cancelled", "download.delete": "download deleted",
         "queue.remove": "removed from the queue", "queue.play": "playing from the queue",
-        "seek": "seeked", "logout": "logged out", "cache.clear": "cache cleared"}
+        "seek": "seeked", "logout": "logged out", "cache.clear": "cache cleared",
+        "playlist.rename": "playlist renamed", "playlist.describe": "description changed",
+        **{f"{v}.{k}": f"{'added to' if v == 'favorite' else 'removed from'} favorites"
+           for v in ("favorite", "unfavorite") for k in ("album", "artist", "playlist")}}
 # Commands whose `id` argument is a name for this kind of thing.
 NAMED = {"playlist.add": "playlist", "playlist.remove": "playlist", "playlist.tracks": "playlist",
          "play.playlist": "playlist", "play.album": "album", "album.tracks": "album",
-         "play.artist": "artist", "artist.section": "artist"}
+         "play.artist": "artist", "artist.section": "artist",
+         "playlist.delete": "playlist", "playlist.rename": "playlist", "playlist.describe": "playlist",
+         "download.album": "album", "download.playlist": "playlist",
+         "favorite.album": "album", "unfavorite.album": "album", "favorite.artist": "artist",
+         "unfavorite.artist": "artist", "favorite.playlist": "playlist",
+         "unfavorite.playlist": "playlist"}
 ID_FORM = {"playlist": re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
            "album": re.compile(r"\d{5,}"), "artist": re.compile(r"\d{5,}")}
 PICK = re.compile(r"[1-9]\d?")
@@ -57,7 +65,7 @@ def _is_tidal_url(text: str) -> bool:
     return host == "tidal.com" or host.endswith(".tidal.com")
 
 CURRENT_BY_DEFAULT = ("like", "unlike", "download")
-QUEUE_ENTRY = ("queue.play", "queue.remove")  # their track_id pins an entry; it is not a song
+QUEUE_ENTRY = ("queue.play", "queue.remove", "queue.move")  # their track_id pins an entry; it is not a song
 SONG_FORMS = 'a track id, a TIDAL URL, "artist - title" or current'
 
 
@@ -84,6 +92,7 @@ class Link:
         self.who = who
         self.picks = picks  # `ticli agent` takes ids or names, never a number from an earlier list
         self.conn = None
+        self.labels: dict = {}  # arg -> the name it was resolved from, for a y/N prompt
 
     def running(self) -> bool:
         from ticli import ipc
@@ -244,6 +253,22 @@ def _line(cmd: str, reply: dict, result) -> str:
             if r.get("downloads") else "no downloads"
     if cmd == "queue.add" and "queue_length" in r:
         return _queue_added(r)
+    if cmd == "queue.move" and "index" in r:
+        return f'moved to #{r["index"] + 1} of {r.get("queue_length")}'
+    if cmd == "queue.clear" and "removed" in r:
+        return f'cleared {r["removed"]} track{"" if r["removed"] == 1 else "s"} from the queue'
+    if cmd == "history.list":
+        return "\n".join(r.get("history") or []) or "no search history"
+    if cmd == "cache.status" and "songs" in r:
+        return _cache_lines(r)
+    if cmd == "track.info" and r.get("track"):
+        return _track_info_lines(r)
+    if cmd in ("refetch.plan", "refetch") and "songs" in r:
+        return _refetch_line(cmd, r)
+    if cmd == "playlist.delete" and r.get("name"):
+        return f'deleted playlist "{r["name"]}"' if r.get("deleted", True) else "not deleted"
+    if cmd in ("download.album", "download.playlist") and "tracks" in r:
+        return f'downloading {r["tracks"]} tracks of "{r.get("label")}" at {r.get("tier")}'
     if cmd.startswith("play.") and "queue_length" in r:
         return f'playing: queue of {r["queue_length"]}'
     if cmd == "playlist.create" and isinstance(r.get("playlist"), dict):
@@ -251,6 +276,45 @@ def _line(cmd: str, reply: dict, result) -> str:
     if cmd in DONE:
         return DONE[cmd]
     return json.dumps(result, separators=(",", ":")) if result else "done"
+
+
+def _size(num) -> str:
+    from ticli.utils.downloads import format_bytes
+    return format_bytes(int(num or 0)) if num else "0 B"
+
+
+def _cache_lines(r: dict) -> str:
+    songs, owned, meta = r.get("songs") or {}, r.get("downloads") or {}, r.get("metadata") or {}
+    return "\n".join([
+        f'cached songs: {songs.get("count", 0)}, {_size(songs.get("bytes"))} of '
+        f'{_size(songs.get("budget_bytes"))}' + ("" if songs.get("enabled", True) else " (caching off)"),
+        f'downloads: {owned.get("count", 0)}, {_size(owned.get("bytes"))}',
+        f'metadata: {_size(meta.get("bytes"))} of {_size(meta.get("cap_bytes"))}'
+        + ("" if meta.get("enabled", True) else " (off)")])
+
+
+def _track_info_lines(r: dict) -> str:
+    t = r["track"]
+    local = [f'{where} ({(r[where] or {}).get("tier") or "tier unknown"})'
+             for where in ("downloaded", "cached") if r.get(where)]
+    return "\n".join([
+        f'{t.get("id")}  {_song(t)} [{_mmss(t.get("duration_seconds"))}]',
+        f'album: {t.get("album") or "?"}' + (" | explicit" if t.get("explicit") else ""),
+        f'quality: {r.get("quality") or "unknown"} | {"liked" if r.get("liked") else "not liked"}'
+        f' | {", ".join(local) or "not on disk"}'])
+
+
+def _refetch_line(cmd: str, r: dict) -> str:
+    if not r["songs"]:
+        return r.get("note") or f'nothing below {r.get("tier")} to upgrade'
+    minutes = max(1, round(r.get("eta_s", 0) / 60))
+    what = (f'{r["songs"]} songs to {r.get("target")} ({r.get("downloads", 0)} downloads, '
+            f'{r.get("cached", 0)} cached, ~{_size(r.get("bytes"))}): {r.get("requests")} requests, '
+            f'at least {minutes} min')
+    if cmd == "refetch.plan":
+        return "would upgrade " + what
+    return ("re-fetching " if r.get("started") else "already re-fetching " if r.get("running")
+            else "not started: ") + what
 
 
 def _queue_added(r: dict) -> str:
@@ -294,7 +358,7 @@ def guard(cmd: str, who: str, read: bool = False) -> None:
         raise Stop(refused)
 
 
-def confirmed(cmd: str, args: dict) -> bool:
+def confirmed(cmd: str, args: dict, labels=None) -> bool:
     """Dangerous verbs ask the human, default no (ADR-0007)."""
     from types import SimpleNamespace
 
@@ -307,7 +371,9 @@ def confirmed(cmd: str, args: dict) -> bool:
         dangerous = True
     if not dangerous:
         return True
-    shown = " ".join(str(v) for v in args.values())
+    labels = labels or {}
+    shown = " ".join(f'"{labels[k]}" ({v})' if labels.get(k) not in (None, str(v)) else str(v)
+                     for k, v in args.items())
     return click.confirm(f'"{cmd.replace(".", " ")} {shown}" is dangerous. Continue?', default=False)
 
 
@@ -530,8 +596,12 @@ def prepare(link: Link, cmd: str, args: dict) -> tuple:
     songs = args.get("track_ids") if isinstance(args.get("track_ids"), list) else []
     example = " ".join(["ticli", cmd.replace(".", " "), "2", *(shlex.quote(str(t)) for t in songs)])
     kind = NAMED.get(cmd)
+    if cmd == "playlist.delete" and link.who == AGENT and not ID_FORM["playlist"].fullmatch(
+            str(args.get("id", "")).strip()):
+        raise Stop(refusal("bad_args", "playlist delete takes a playlist id, never a name.",
+                           "Get the id from `playlist list`, and confirm it with your human."))
     if kind and "id" in args:
-        args["id"], _label = resolve_name(link, kind, args["id"], example)
+        args["id"], link.labels["id"] = resolve_name(link, kind, args["id"], example)
     if cmd == "queue.add":
         for named in ("album", "playlist"):
             if named in args:
@@ -562,6 +632,16 @@ def prepare(link: Link, cmd: str, args: dict) -> tuple:
     return cmd, args
 
 
+def _preview_refetch(link: Link) -> None:
+    """What the y/N is about: refetch makes a request pair per song, hundreds for a big library."""
+    plan = link.ask("refetch.plan")
+    if not plan.get("ok"):
+        raise Stop(plan)
+    click.echo(_refetch_line("refetch.plan", plan["result"]))
+    if not plan["result"]["songs"]:
+        raise SystemExit(0)
+
+
 def run(cmd: str, args: dict, then=None, label=None) -> None:
     from ticli.commands import COMMANDS
     who = caller()
@@ -571,7 +651,9 @@ def run(cmd: str, args: dict, then=None, label=None) -> None:
             if who == AGENT:
                 guard(cmd, who, read=COMMANDS[cmd].read)
             cmd, args = prepare(link, cmd, args)
-            if who == HUMAN and not confirmed(cmd, args):
+            if who == HUMAN and cmd == "refetch":
+                _preview_refetch(link)
+            if who == HUMAN and not confirmed(cmd, args, link.labels):
                 click.echo("cancelled", err=True)
                 raise SystemExit(1)
             reply = link.ask(cmd, args)
@@ -679,10 +761,10 @@ def _open_tui() -> None:
     run_tui(quality=root.get("quality"), login_flow=root.get("login_flow"))
 
 
-def search(words, types, limit) -> None:
+def search(words, types, limit, offset=0) -> None:
     kinds = [f"{t}s" for t in types] if types else None
     run("search", {"query": " ".join(words), **({"types": kinds} if kinds else {}),
-                   "limit": limit})
+                   "limit": limit, **({"offset": offset} if offset else {})})
 
 
 def start(kind: str, name: str, no_tui: bool) -> None:

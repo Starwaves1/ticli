@@ -342,6 +342,7 @@ STREAM_TRUNCATED_MARGIN = 15.0
 
 # 19/s burst got the IP blocked (docs/adr/0001-tidal-rate-limits.md).
 REFETCH_MIN_INTERVAL = 2.0
+AGENT_NOTICE_SECONDS = 4.0
 
 # Parallelism only on CDN fetches; API resolving stays serial and paced (docs/adr/0001-tidal-rate-limits.md).
 DOWNLOAD_WORKERS = 3
@@ -1541,6 +1542,7 @@ class HeadlessTidalPlayer:
         # Bumped by pause/seek/play: the monitor's position resync is dropped if it moved meanwhile
         self._clock_epoch = 0
         self._playing_badge = None
+        self._playing_granted = None
         self._prefetch = None
         self._prefetch_id = None
         self._nav_history = []
@@ -2090,7 +2092,7 @@ class HeadlessTidalPlayer:
             self.running = False
 
     def _note_agent_action(self, what: str) -> None:
-        self._set_toast(f"agent: {what}")
+        self._set_toast(f"agent: {what}", seconds=AGENT_NOTICE_SECONDS)
         self._wake()
 
     def _load_favorites(self):
@@ -2322,6 +2324,7 @@ class HeadlessTidalPlayer:
         self._clock_epoch += 1
         self._seek_target = None
         self._prefetch_id = None
+        self._playing_granted = None
         self._current_track = track
         self._playing = True
         self._play_start_time = None
@@ -2334,7 +2337,7 @@ class HeadlessTidalPlayer:
                 # the owner blocked, and a row with a file on disk must play with no network
                 local, badge = self._local_source(track)
                 if local:
-                    real, url, granted = track, "", None
+                    real, url, granted = track, "", self._local_granted(track)
                 else:
                     if (self._connectivity if automatic else self._reconnect()) != ONLINE:
                         raise _NoLocalCopy(track, self._connectivity)
@@ -2354,6 +2357,7 @@ class HeadlessTidalPlayer:
                 artist = ", ".join(a.name for a in real.artists) if real.artists else ""
                 title = f"{real.name} — {artist}" if artist else real.name
                 self._playing_badge = badge
+                self._playing_granted = granted
                 self.audio.play_url(url, seek=seek, title=title, cache_key=real.id,
                                     local=local, quality=granted)
                 if self._play_gen != gen:
@@ -2423,6 +2427,18 @@ class HeadlessTidalPlayer:
             if self._connectivity != ONLINE or self._tier_is_enough(record.get("quality")):
                 return cached, None
         return None, None
+
+    def _local_granted(self, track):
+        track_id = getattr(track, "id", None)
+        entry = downloads.load_index().get(str(track_id)) if downloads.path_for(track_id) else None
+        return (entry or self._cache.audio_record(track_id) or {}).get("granted" if entry else "quality")
+
+    def _tier_name(self, quality) -> Optional[str]:
+        return next((name for name, q in self.QUALITY_MAP.items() if q == quality), quality)
+
+    def _playing_tier(self) -> Optional[str]:
+        """The tier TIDAL granted the track playing (or its local copy has), by its ticli name."""
+        return self._tier_name(self._playing_granted)
 
     def _download_badge(self, granted) -> Optional[str]:
         label = self._tier_label(granted)

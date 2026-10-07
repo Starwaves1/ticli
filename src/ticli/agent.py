@@ -517,10 +517,10 @@ def _legacy(payload: dict, top) -> None:
     finish(out)
 
 
-def search(query: str, types: tuple, limit: int) -> None:
+def search(query: str, types: tuple, limit: int, offset: int = 0) -> None:
     kinds = [f"{t}s" for t in (types or ("track",))]
-    _legacy(call("search", {"query": query, "types": kinds, "limit": limit}),
-            lambda r: {"query": query, **{k: r.get(k, []) for k in kinds},
+    _legacy(call("search", {"query": query, "types": kinds, "limit": limit, "offset": offset}),
+            lambda r: {"query": query, "offset": offset, **{k: r.get(k, []) for k in kinds},
                        **({"source": r["source"]} if "source" in r else {})})
 
 
@@ -547,9 +547,14 @@ def playlist_show(playlist_id: str) -> None:
             lambda r: {"playlist": r.get("playlist"), "tracks": r.get("tracks", [])})
 
 
-def playlist_create(name: str, description: str) -> None:
-    _legacy(call("playlist.create", {"name": name, "description": description}),
-            lambda r: {"playlist": r.get("playlist")})
+def playlist_create(name: str, description: str, track_ids: tuple = ()) -> None:
+    args = {"name": name, "description": description}
+    if track_ids:
+        args["track_ids"] = [str(t) for t in track_ids]
+    cmd, args, refused = with_ids("playlist.create", args)
+    _legacy(refused if refused is not None else call(cmd, args),
+            lambda r: {"playlist": r.get("playlist"),
+                       **({"added": r["added"]} if "added" in r else {})})
 
 
 def playlist_add(playlist_id: str, track_ids: tuple) -> None:

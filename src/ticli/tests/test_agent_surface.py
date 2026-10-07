@@ -688,5 +688,5 @@ def test_docs_teach_queue_add():
     from ticli.agent_docs import render
     docs = " ".join(render().split())
     for phrase in ("queue add ID... [--next]", "never starts playback", "Never `play track`: that replaces the queue",
-                   "`ticli agent queue add [track_ids...]` (`queue.add`): 0 requests for tracks already known"):
+                   "`ticli agent queue add [track_ids...] [album=] [playlist=] [mix=] [position=]` (`queue.add`): 0 requests for tracks already known"):
         assert phrase in docs, phrase

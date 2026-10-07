@@ -61,6 +61,7 @@ class Command:
     tidal: bool = False
     dangerous: object = False  # bool, or (player, args) -> bool
     params: tuple = ()  # positional CLI order; a trailing "*" collects the rest into a list
+    options: tuple = ()  # key=value only, shown in docs as [key=]
 
     def is_dangerous(self, player, args) -> bool:
         return bool(self.dangerous(player, args) if callable(self.dangerous) else self.dangerous)
@@ -156,7 +157,7 @@ class Commands:
         finally:
             _inline.on, _inline.caller = was, was_caller
         if caller == AGENT and not cmd.read:
-            p._note_agent_action(AGENT_TOASTS.get(name, name))
+            p._note_agent_action(agent_notice(p, name, args, result))
         return {"ok": True, "result": result}
 
 
@@ -460,8 +461,11 @@ def _play_list(p, tracks, index) -> dict:
 def _status(p, args) -> dict:
     track = p._current_track
     cfg = p.config
+    shown = _track_json(track)
+    if shown is not None:
+        shown.update(liked=str(track.id) in {str(i) for i in p._liked_ids}, quality=p._playing_tier())
     return {
-        "track": _track_json(track),
+        "track": shown,
         "playing": bool(p._playing),
         "position": round(p._get_position(), 1) if track else 0,
         "queue": {"length": len(p._queue), "index": p._queue_index},
@@ -938,12 +942,36 @@ def _download_delete(p, args) -> dict:
     return {"deleted": False}
 
 
-def _refetch(p, args):
+REFETCH_REQUESTS_PER_SONG = 2  # the track lookup, then its playbackinfo
+
+
+def _refetch_plan(p, args) -> dict:
+    """What `refetch` would do, from the download index and cache tracker alone: 0 requests."""
+    plan = p._refetch_candidates()
+    songs = len(plan["downloads"]) + len(plan["cache"])
+    target = p._tier_name(p._upgrade_target())
+    result = {"tier": p._quality_name, "target": target, "songs": songs,
+              "downloads": len(plan["downloads"]), "cached": len(plan["cache"]),
+              "skipped": plan.get("skipped", 0), "unknown": plan.get("unknown", 0),
+              "bytes": plan.get("bytes", 0),
+              "requests": songs * REFETCH_REQUESTS_PER_SONG,
+              "eta_s": songs * throttle.MIN_INTERVAL_SECONDS,
+              "running": (p._refetch_job or {}).get("state") == "running"}
+    if target != p._quality_name:
+        result["note"] = f"This login isn't served {p._quality_name}; songs go up to {target} at most."
+    return result
+
+
+def _refetch(p, args) -> dict:
     _require_online(p)
+    was = (p._refetch_job or {}).get("state") == "running"
+    plan = _refetch_plan(p, args)
     if _by_agent():
         p._start_refetch_job(paced=True)
     else:
         p._start_refetch_job()
+    started = not was and (p._refetch_job or {}).get("state") == "running"
+    return {**plan, "started": started, "running": was or started}
 
 
 def _refetch_cancel(p, args):
@@ -1290,18 +1318,74 @@ def _history_forget(p, args):
     p._search_history = [q for q in p._search_history if q != query]
 
 
+# ── parity: queue, history, cache, track info ──
+
+
+def _queue_move(p, args) -> dict:
+    raise NotImplementedError
+
+
+def _queue_clear(p, args) -> dict:
+    raise NotImplementedError
+
+
+def _history_list(p, args) -> dict:
+    raise NotImplementedError
+
+
+def _cache_status(p, args) -> dict:
+    raise NotImplementedError
+
+
+def _track_info(p, args) -> dict:
+    raise NotImplementedError
+
+
+# ── parity: playlists and favourites ──
+
+
+def _playlist_delete(p, args) -> dict:
+    raise NotImplementedError
+
+
+def _playlist_rename(p, args) -> dict:
+    raise NotImplementedError
+
+
+def _playlist_describe(p, args) -> dict:
+    raise NotImplementedError
+
+
+def _favorite(kind: str, on: bool):
+    def handler(p, args) -> dict:
+        raise NotImplementedError
+    return handler
+
+
+# ── parity: whole-list downloads ──
+
+
+def _download_whole(kind: str):
+    def handler(p, args) -> dict:
+        raise NotImplementedError
+    return handler
+
+
 COMMANDS = {cmd.name: cmd for cmd in (
     Command("status", _status, read=True),
     Command("toggle", _toggle, tidal=True),
     Command("pause", _pause),
     Command("resume", _resume, tidal=True),
-    Command("seek", _seek, tidal=True, params=("position",)),
+    Command("seek", _seek, tidal=True, params=("position",), options=("delta",)),
     Command("next", _next, tidal=True),
     Command("prev", _prev, tidal=True),
     Command("queue.list", _queue_list, read=True),
     Command("queue.play", _queue_play, tidal=True, params=("index", "track_id")),
     Command("queue.remove", _queue_remove, tidal=True, params=("index", "track_id")),
-    Command("queue.add", _queue_add, tidal=True, params=("track_ids*",)),
+    Command("queue.add", _queue_add, tidal=True, params=("track_ids*",),
+            options=("album", "playlist", "mix", "position")),
+    Command("queue.move", _queue_move, params=("index", "to", "track_id")),
+    Command("queue.clear", _queue_clear),
     Command("play.track", _play_track_cmd, tidal=True, params=("track_id",)),
     Command("play.album", _play_album, tidal=True, params=("id", "index")),
     Command("play.playlist", _play_playlist, tidal=True, params=("id", "index")),
@@ -1315,23 +1399,35 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("playlist.add", _playlist_add, tidal=True, params=("id", "track_ids*")),
     Command("playlist.remove", _playlist_remove, tidal=True, dangerous=True,
             params=("id", "index", "track_id")),
-    Command("download", _download, tidal=True, params=("track_ids*",)),
+    Command("playlist.delete", _playlist_delete, tidal=True, dangerous=True, params=("id",)),
+    Command("playlist.rename", _playlist_rename, tidal=True, params=("id", "name")),
+    Command("playlist.describe", _playlist_describe, tidal=True, params=("id", "description")),
+    *(Command(f"{verb}.{kind}", _favorite(kind, verb == "favorite"), tidal=True, params=("id",))
+      for verb in ("favorite", "unfavorite") for kind in ("album", "artist", "playlist")),
+    Command("download", _download, tidal=True, params=("track_ids*",), options=("tier", "label")),
+    Command("download.album", _download_whole("album"), tidal=True, params=("id", "tier")),
+    Command("download.playlist", _download_whole("playlist"), tidal=True, params=("id", "tier")),
     Command("download.cancel", _download_cancel),
     Command("download.list", _download_list, read=True),
     Command("download.delete", _download_delete, dangerous=True, params=("track_id",)),
-    Command("refetch", _refetch, tidal=True),
+    Command("refetch", _refetch, tidal=True, dangerous=True),
+    Command("refetch.plan", _refetch_plan, read=True),
     Command("refetch.cancel", _refetch_cancel),
     Command("settings.get", _settings_get, read=True),
     Command("settings.set", _settings_set, dangerous=_settings_set_dangerous,
             params=("key", "value")),
     Command("cache.clear", _cache_clear, dangerous=True),
+    Command("cache.status", _cache_status, read=True),
     Command("login.pkce", _login_pkce, tidal=True, dangerous=True),
     Command("logout", _logout, dangerous=True),
     Command("stop", _stop),
     Command("login.reload", _login_reload),
     Command("history.add", _history_add, params=("query",)),
     Command("history.forget", _history_forget, params=("query",)),
-    Command("search", _search, read=True, tidal=True, params=("query",)),
+    Command("history.list", _history_list, read=True),
+    Command("search", _search, read=True, tidal=True, params=("query",),
+            options=("types", "limit", "offset")),
+    Command("track.info", _track_info, read=True, tidal=True, params=("track_id",)),
     Command("resolve", _resolve, read=True, tidal=True, params=("artist", "title")),
     Command("album.tracks", _album_tracks, read=True, tidal=True, params=("id", "offset", "limit")),
     Command("playlist.tracks", _playlist_tracks, read=True, tidal=True,
@@ -1344,23 +1440,67 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("mix.tracks", _mix_tracks, read=True, tidal=True, params=("id",)),
 )}
 
+def _n(count, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _title(track) -> str:
+    return f'"{getattr(track, "name", None) or "a track"}"'
+
+
+def _named_list(p, args) -> str:
+    found = _live_playlist(p, args.get("id", "")) or _known(p, "playlist", args.get("id", ""))
+    return f'"{found.name}"' if getattr(found, "name", None) else "a playlist"
+
+
+# What a connected TUI shows, as "agent: ...", after an agent's action: str, or
+# (player, args, result) -> str for one that can say what it changed.
 AGENT_TOASTS = {
     "toggle": "play/pause", "pause": "paused", "resume": "resumed", "seek": "seeked",
     "next": "next track", "prev": "previous track", "queue.play": "played from the queue",
-    "queue.remove": "removed a queue entry", "queue.add": "added to the queue",
-    "play.track": "played a track",
+    "queue.remove": "removed a queue entry",
+    "queue.add": lambda p, a, r: f'queued {_n(r["added"], "track")}'
+                                 + (" to play next" if r.get("position") == "next" else ""),
+    "queue.move": lambda p, a, r: f'moved queue entry {a.get("index", 0) + 1} to {r["index"] + 1}',
+    "queue.clear": lambda p, a, r: f'cleared the queue ({_n(r["removed"], "track")})',
+    "play.track": lambda p, a, r: f"playing {_title(p._current_track)}",
     "play.album": "played an album", "play.playlist": "played a playlist",
     "play.artist": "played an artist", "play.mix": "played a mix",
-    "play.downloads": "played your downloads", "play.radio": "started radio", "like": "liked a track",
-    "unlike": "unliked a track", "playlist.create": "created a playlist",
-    "playlist.add": "added to a playlist", "playlist.remove": "removed from a playlist",
-    "download": "started a download", "download.cancel": "cancelled the download",
+    "play.downloads": "played your downloads", "play.radio": "started radio",
+    "like": lambda p, a, r: f'liked {_n(len(r.get("track_ids") or [1]), "track")}',
+    "unlike": lambda p, a, r: f'unliked {_n(len(r.get("track_ids") or [1]), "track")}',
+    "playlist.create": lambda p, a, r: f'created playlist "{a.get("name")}"',
+    "playlist.add": lambda p, a, r: f'added {_n(len(a.get("track_ids") or [1]), "track")} '
+                                    f"to {_named_list(p, a)}",
+    "playlist.remove": "removed from a playlist",
+    "playlist.delete": lambda p, a, r: f'deleted playlist "{r.get("name") or a.get("id")}"',
+    "playlist.rename": lambda p, a, r: f'renamed playlist "{r.get("was")}" to "{r.get("name")}"',
+    "playlist.describe": lambda p, a, r: f'changed the description of "{r.get("name")}"',
+    **{f"{verb}.{kind}": f"{'added' if verb == 'favorite' else 'removed'} {art} {kind} "
+                         f"{'to' if verb == 'favorite' else 'from'} favorites"
+       for verb in ("favorite", "unfavorite")
+       for kind, art in (("album", "an"), ("artist", "an"), ("playlist", "a"))},
+    "download": lambda p, a, r: f'downloading {_n(r.get("tracks", 1), "track")}',
+    "download.album": lambda p, a, r: f'downloading album "{r.get("label")}" ({_n(r.get("tracks", 0), "track")})',
+    "download.playlist": lambda p, a, r: f'downloading playlist "{r.get("label")}" '
+                                         f'({_n(r.get("tracks", 0), "track")})',
+    "download.cancel": "cancelled the download",
     "download.delete": "deleted a download", "refetch": "started a re-fetch",
     "refetch.cancel": "cancelled the re-fetch", "settings.set": "changed a setting",
     "cache.clear": "cleared the cache", "login.pkce": "switched login", "logout": "logged out",
     "stop": "stopped playback", "login.reload": "reloaded the login",
     "history.add": "added to search history", "history.forget": "edited search history",
 }
+
+
+def agent_notice(p, name: str, args: dict, result) -> str:
+    what = AGENT_TOASTS.get(name, name)
+    if not callable(what):
+        return what
+    try:
+        return what(p, args, result if isinstance(result, dict) else {})
+    except Exception:
+        return name.replace(".", " ")
 
 
 # ── reads from disk, for agents while AI control is off: zero requests, no player ──

@@ -222,7 +222,8 @@ def _cost(name, spec) -> str:
 
 def _row(name, spec) -> str:
     verb = LEGACY_VERBS.get(name, name.replace(".", " "))
-    args = " ".join(f"[{p[:-1]}...]" if p.endswith("*") else f"[{p}]" for p in spec.params)
+    args = " ".join([*(f"[{p[:-1]}...]" if p.endswith("*") else f"[{p}]" for p in spec.params),
+                     *(f"[{o}=]" for o in spec.options)])
     flags = " **DANGEROUS** (needs that switch)" if spec.dangerous else ""
     return (f"- `ticli agent {verb}{' ' + args if args else ''}` (`{name}`): {_cost(name, spec)}{flags}")
 

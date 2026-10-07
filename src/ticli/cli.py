@@ -107,7 +107,8 @@ class RegistryGroup(click.Group):
 
 
 def _shape(spec) -> str:
-    return " ".join(f"[{p}...]" if p.endswith("*") else f"[{p}]" for p in spec.params) or "(none)"
+    return " ".join([*(f"[{p}...]" if p.endswith("*") else f"[{p}]" for p in spec.params),
+                     *(f"[{o}=]" for o in spec.options)]) or "(none)"
 
 
 class AgentGroup(RegistryGroup):
@@ -249,10 +250,11 @@ def start(kind, name, no_tui):
 @click.argument("query", nargs=-1, required=True)
 @click.option("--type", "types", multiple=True, type=click.Choice(["track", "album", "artist", "playlist"]), help="Repeatable. Default: all four.")
 @click.option("--limit", default=10, show_default=True)
-def search_(query, types, limit):
+@click.option("--offset", default=0, show_default=True, help="Skip this many per type: the next page.")
+def search_(query, types, limit, offset):
     """Search TIDAL. One request however many --type."""
     from ticli import humancli
-    humancli.search(query, types, limit)
+    humancli.search(query, types, limit, offset)
 
 
 @cli.group(cls=AgentGroup)
@@ -291,10 +293,11 @@ def status(verify):
 @click.argument("query")
 @click.option("--type", "types", multiple=True, type=click.Choice(["track", "album", "artist", "playlist"]), help="Repeatable. Default: track.")
 @click.option("--limit", default=10, show_default=True, help="Results per type.")
-def search(query, types, limit):
-    """Search TIDAL. Costs 1 request regardless of how many --type."""
+@click.option("--offset", default=0, show_default=True, help="Skip this many per type: the next page.")
+def search(query, types, limit, offset):
+    """Search TIDAL. Costs 1 request regardless of how many --type; each page is one more."""
     from ticli import agent as impl
-    impl.search(query, types, limit)
+    impl.search(query, types, limit, offset)
 
 
 @agent.command()
@@ -310,7 +313,8 @@ def resolve(artist, title, limit):
 
 @agent.group()
 def playlist():
-    """Your playlists: list, show, create, add."""
+    """Your playlists: list, show, create, add; `playlist delete|rename|describe|remove`
+    are the generated verbs (see `ticli agent docs`)."""
 
 
 @playlist.command("list")
@@ -330,11 +334,12 @@ def playlist_show(playlist_id):
 
 @playlist.command("create")
 @click.argument("name")
+@click.argument("track_ids", nargs=-1)
 @click.option("--description", default="", help="Optional description.")
-def playlist_create(name, description):
-    """Create an empty playlist. Costs 1 request."""
+def playlist_create(name, track_ids, description):
+    """Create a playlist, optionally with tracks. Costs 1 request, plus 2 per 100 tracks."""
     from ticli import agent as impl
-    impl.playlist_create(name, description)
+    impl.playlist_create(name, description, track_ids)
 
 
 @playlist.command("add")

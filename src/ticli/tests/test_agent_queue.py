@@ -423,6 +423,8 @@ class TestAgentDownloadsArePaced:
         h.core._refetch_candidates = lambda: {"downloads": ["1", "2"], "cache": []}
         fetched = []
         h.core._refetch_one = lambda kind, key, tier, gen: fetched.append(key)
+        h.core._upgrade_target = lambda: None
+        h.core.config["allow_dangerous_commands"] = True
         assert h.agent("refetch")["ok"]
         _settle(lambda: (h.core._refetch_job or {}).get("state") == "done")
         assert fetched == ["1", "2"] and len(acquired) == 2

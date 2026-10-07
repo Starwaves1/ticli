@@ -16,7 +16,8 @@ from typing import Callable, Optional
 
 from ticli import ipc
 from ticli.commands import (
-    ADD_LIMIT, COMMANDS, _live_playlist, queue_add_cost, tripped_error, unknown_tracks,
+    ADD_LIMIT, COMMANDS, LIST_SOURCES, _live_playlist, _local_list, queue_add_cost, tripped_error,
+    unknown_tracks,
 )
 from ticli.utils import throttle
 
@@ -96,6 +97,13 @@ def estimate(core, cmd: str, args: dict) -> int:
         return unknown_tracks(core, ids) if args.get("track_ids") else 0
     if cmd == "refetch":
         return 0
+    if cmd in ("playlist.delete", "playlist.rename", "playlist.describe"):
+        return 1 if _live_playlist(core, args.get("id", "")) is not None else 2
+    if cmd in ("download.album", "download.playlist"):
+        kind = cmd.split(".")[1]
+        return 0 if _local_list(core, kind, str(args.get("id", ""))) else LIST_SOURCES[kind][1]
+    if cmd == "track.info":
+        return unknown_tracks(core, [args.get("track_id")])
     if cmd in LOCAL_MOSTLY:
         return 0
     if cmd == "queue.add":
