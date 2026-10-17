@@ -618,6 +618,7 @@ def _paged(filter_name="tracks", page_size=10, totals=None):
 
 
 def _scroll_to_bottom(p):
+    p._handle_search_key(player_mod.KEY_DOWN)  # out of the search bar, onto the first row
     for _ in range(len(p._search_results) + 1):
         p._handle_search_key(player_mod.KEY_DOWN)
 
@@ -642,7 +643,7 @@ class TestFetchMoreOnScroll:
 
     def test_cursor_stays_put_across_the_append(self, config_file):
         p = _paged(page_size=10)
-        for _ in range(9):
+        for _ in range(10):  # the first press leaves the search bar
             p._handle_search_key(player_mod.KEY_DOWN)
         assert p._search_cursor == 9  # the last row
         p._search_last_fetch = 0

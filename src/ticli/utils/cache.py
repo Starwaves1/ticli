@@ -238,7 +238,7 @@ class CachedPlaylist:
     `editable` a bool."""
 
     cached = True
-    __slots__ = ("id", "name", "num_tracks", "creator", "editable")
+    __slots__ = ("id", "name", "num_tracks", "creator", "editable", "description")
 
     def __init__(self, record: dict):
         if not isinstance(record, dict):
@@ -249,6 +249,7 @@ class CachedPlaylist:
         creator = _clean_str(record.get("creator"))
         self.creator = _Named(creator) if creator else None
         self.editable = bool(record.get("editable"))
+        self.description = _clean_str(record.get("description")) or ""
 
 
 def track_record(track) -> dict:
@@ -267,13 +268,17 @@ def track_record(track) -> dict:
 
 def playlist_record(playlist, editable: bool) -> dict:
     creator = getattr(playlist, "creator", None)
-    return {
+    record = {
         "id": str(getattr(playlist, "id", "") or ""),
         "name": getattr(playlist, "name", None),
         "num_tracks": getattr(playlist, "num_tracks", None),
         "creator": getattr(creator, "name", None) if creator else None,
         "editable": bool(editable),
     }
+    description = _clean_str(getattr(playlist, "description", None))
+    if description:
+        record["description"] = description
+    return record
 
 
 class CachedAlbum:

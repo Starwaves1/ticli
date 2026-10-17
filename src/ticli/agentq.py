@@ -364,7 +364,10 @@ def compact_state(status: dict, pending: int = 0) -> dict:
                  "pos": round(status.get("position") or 0), "dur": track.get("duration_seconds"),
                  **{k: track[k] for k in ("liked", "quality") if k in track}},
              "playing": bool(status.get("playing")),
-             "queue": {"len": queue.get("length", 0), "index": queue.get("index", -1)},
+             "queue": {"len": queue.get("length", 0), "index": queue.get("index", -1),
+                       **({"shuffle": True} if status.get("shuffle") else {}),
+                       **({"repeat": status["repeat"]}
+                          if status.get("repeat") not in (None, "off") else {})},
              "switches": {"ai": switches.get("allow_ai_control", True),
                           "dangerous": switches.get("allow_dangerous_commands", False)}}
     if status.get("connectivity"):

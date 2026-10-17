@@ -381,7 +381,7 @@ class TestTheKeyIsFree:
                      "_handle_artist_key", "_handle_queue_key"):
             source = inspect.getsource(getattr(p, name))
             assert source.count('== "d"') == 1, f"{name} should open downloads"
-        # Search types every printable key, so `d` must never be a command there
+        # The search bar types every printable key; `d` is a command only with the results selected
         search = inspect.getsource(p._handle_search_key)
         assert '"d"' not in search
 

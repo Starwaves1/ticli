@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import random
 import re
 import signal
 import socket
@@ -242,7 +243,8 @@ HIDE_HOLD_KEYS = frozenset({KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, " "})
 HIDE_HINT_RANK = 9
 
 from ticli.commands import (
-    HUMAN, OFFLINE, ONLINE, SIGNED_OUT, Commands, auth_rejected, download_tracks, unauthorized,
+    HUMAN, OFFLINE, ONLINE, REPEAT_MODES, SIGNED_OUT, Commands, auth_rejected, download_tracks,
+    unauthorized,
 )
 from ticli.utils.credential_store import save_tokens, load_tokens
 from ticli.utils.config import (
@@ -279,6 +281,8 @@ STATE_DIR = Path.home() / ".config" / "ticli"
 STATE_FILE = STATE_DIR / "player_state.json"
 
 PLAYLIST_NAME_MAX = 100
+PLAYLIST_DESCRIPTION_MAX = 500
+TEXT_EDIT_SHOWN = 60
 
 AUDIO_PLAYERS = ["mpv", "ffplay"]
 
@@ -1447,6 +1451,9 @@ class HeadlessTidalPlayer:
         # Never closed: the kernel releases the lock at exit, crashes included
         self._instance_lock_fd: Optional[int] = None
         self._liked_ids: set = set()
+        self._shuffle = False
+        self._unshuffled: Optional[list] = None
+        self._repeat = REPEAT_MODES[0]
         self._radio_fetching = False
         self._radio_last_fetch = 0.0
         self._player_focus = False
@@ -1490,6 +1497,11 @@ class HeadlessTidalPlayer:
         self._picker_loading = False
         self._picker_busy = False
         self._picker_new_name: Optional[str] = None
+        self._carry: Optional[dict] = None
+        self._text_edit: Optional[dict] = None
+        self._playlist_delete: Optional[dict] = None
+        self._queue_clear_pending = False
+        self._search_focus = "bar"
         self._last_playlist_id: Optional[str] = None
         self._download_open = False
         self._download_track = None
@@ -1858,10 +1870,21 @@ class HeadlessTidalPlayer:
         except Exception:
             pass
 
-    def _run(self, command: str, /, **args) -> dict:
+    def _run(self, command: str, /, on_refused=None, **args) -> dict:
         if self.remote is None:
-            return self.commands.execute(command, args, caller=HUMAN)
-        self._pending[self.remote.send(command, args)] = self._remote_refusal
+            reply = self.commands.execute(command, args, caller=HUMAN)
+            if on_refused is not None and not reply.get("ok"):
+                self._set_toast(reply.get("reason") or "The player refused that",
+                                seconds=PLAYER_ERROR_SECONDS)
+                on_refused(reply)
+            return reply
+
+        def done(response):
+            self._remote_refusal(response)
+            if on_refused is not None and not response.get("ok"):
+                on_refused(response)
+
+        self._pending[self.remote.send(command, args)] = done if on_refused else self._remote_refusal
         return {"ok": True, "result": {"accepted": True}}
 
     def _honour_start_flags(self) -> None:
@@ -1975,6 +1998,8 @@ class HeadlessTidalPlayer:
             "track": self._current_track,
             "queue": list(self._queue),
             "queue_index": self._queue_index,
+            "shuffle": bool(self._shuffle),
+            "repeat": self._repeat,
             "clock": [bool(self._playing), self._play_offset, self._play_start_time],
             "liked": sorted(self._liked_ids, key=str),
             "toast": [self._toast, self._toast_until],
@@ -2010,6 +2035,10 @@ class HeadlessTidalPlayer:
                 self._queue_cursor = max(0, min(self._queue_cursor, len(self._queue) - 1))
             elif key == "queue_index":
                 self._queue_index = value
+            elif key == "shuffle":
+                self._shuffle = bool(value)
+            elif key == "repeat":
+                self._repeat = value if value in REPEAT_MODES else REPEAT_MODES[0]
             elif key == "clock":
                 self._playing, self._play_offset, self._play_start_time = value
             elif key == "liked":
@@ -2398,6 +2427,10 @@ class HeadlessTidalPlayer:
         i = next((i for i, t in enumerate(queue) if t is row), None)
         if i is not None:
             queue[i] = resolved
+        order = self._unshuffled or []
+        i = next((i for i, t in enumerate(order) if t is row), None)
+        if i is not None:
+            order[i] = resolved
 
     def _resolve_for_artwork(self, track, gen) -> None:
         queue = self._queue
@@ -2472,12 +2505,17 @@ class HeadlessTidalPlayer:
     def _maybe_prefetch_next(self):
         if self._prefetch_id is not None or not self._playing or self._connectivity != ONLINE:
             return
-        if not self._queue or self._queue_index >= len(self._queue) - 1:
+        if not self._queue or self._repeat == "one":
             return
+        following = self._queue_index + 1
+        if following >= len(self._queue):
+            if self._repeat != "all":
+                return
+            following = 0
         duration = getattr(self._current_track, "duration", 0) or 0
         if duration <= 0 or duration - self._get_position() > PREFETCH_LEAD:
             return
-        nxt = self._queue[self._queue_index + 1]
+        nxt = self._queue[following]
         track_id = getattr(nxt, "id", None)
         if track_id is None:
             return
@@ -2545,6 +2583,59 @@ class HeadlessTidalPlayer:
             self._queue_index = index
             self._play_track(self._queue[index])
 
+    def _set_shuffle(self, on: bool) -> None:
+        """On shuffles what comes after the current track; off puts those back in their
+        original order. `_unshuffled` is that order, kept in step with queue edits."""
+        if on == self._shuffle:
+            return
+        self._shuffle = on
+        start = self._queue_index + 1
+        rest = self._queue[start:]
+        if on:
+            self._unshuffled = list(self._queue)
+            random.shuffle(rest)
+        else:
+            rest = self._in_original_order(rest)
+            self._unshuffled = None
+        self._queue[start:] = rest
+
+    def _in_original_order(self, rows: list) -> list:
+        slots: dict = {}
+        for rank, track in enumerate(self._unshuffled or ()):
+            slots.setdefault(id(track), []).append(rank)
+        ranked, last = [], -1
+        for track in rows:
+            free = slots.get(id(track))
+            if free:
+                last = free.pop(0)
+            ranked.append((last, track))
+        ranked.sort(key=lambda pair: pair[0])
+        return [track for _, track in ranked]
+
+    def _reset_order(self) -> None:
+        self._unshuffled = list(self._queue) if self._shuffle else None
+
+    def _order_insert(self, tracks: list, after_current: bool) -> None:
+        order = self._unshuffled
+        if order is None:
+            return
+        at = len(order)
+        if after_current and 0 <= self._queue_index < len(self._queue):
+            current = self._queue[self._queue_index]
+            at = next((i + 1 for i, t in enumerate(order) if t is current), at)
+        order[at:at] = tracks
+
+    def _order_remove(self, track) -> None:
+        order = self._unshuffled
+        if not order:
+            return
+        at = next((i for i, t in enumerate(order) if t is track), None)
+        if at is None:
+            at = next((i for i, t in enumerate(order)
+                       if getattr(t, "id", None) == getattr(track, "id", None)), None)
+        if at is not None:
+            order.pop(at)
+
     def _next_track(self):
         self._advance(1)
 
@@ -2561,20 +2652,33 @@ class HeadlessTidalPlayer:
 
     def _advance(self, step: int, automatic: bool = False) -> bool:
         """Next/prev and auto-advance. Offline, entries with no local copy are skipped,
-        with one toast; nothing local left stops playback. Never reconnects."""
+        with one toast; nothing local left stops playback. Never reconnects.
+        Repeat one replays the track at its natural end; repeat all wraps forward."""
+        count = len(self._queue)
+        if automatic and self._repeat == "one" and 0 <= self._queue_index < count:
+            step = 0
+        wrap = self._repeat == "all" and step > 0
         index = self._queue_index + step
+        if wrap and index >= count:
+            index = 0
         if self._connectivity == ONLINE:
-            if not 0 <= index < len(self._queue):
+            if not 0 <= index < count:
                 return False
             self._queue_index = index
             self._play_track(self._queue[index], **({"automatic": True} if automatic else {}))
             return True
         owned = {row["id"] for row in downloads.present()}
         skipped = 0
-        while 0 <= index < len(self._queue) and not self._has_local_copy(self._queue[index], owned):
+        while (0 <= index < count and skipped < count
+               and not self._has_local_copy(self._queue[index], owned)):
+            if step == 0:
+                index = -1
+                break
             index += step
             skipped += 1
-        if not 0 <= index < len(self._queue):
+            if wrap and index >= count:
+                index = 0
+        if skipped >= count or not 0 <= index < count:
             if skipped:
                 self._set_toast("Offline — nothing further in the queue has a local copy",
                                 seconds=PLAYER_ERROR_SECONDS)
@@ -2732,6 +2836,7 @@ class HeadlessTidalPlayer:
             return False
         self._queue = queue
         self._queue_index = 0
+        self._reset_order()
         self._prefetch = None
         self._prefetch_id = None
         self._queue_cursor = 0
@@ -2976,6 +3081,9 @@ class HeadlessTidalPlayer:
         status_line = Text()
         if self._queue:
             status_line.append(f"   Queue: {self._queue_index + 1}/{len(self._queue)}", style="dim")
+        modes = self._play_modes()
+        if modes:
+            status_line.append(f"   {modes}", style="cyan")
         quality_label = self._playing_badge or \
             self.QUALITY_LABELS.get(self._quality_name, "")
         if quality_label:
@@ -3073,9 +3181,14 @@ class HeadlessTidalPlayer:
 
     def _build_search_display(self) -> Text:
         content = Text()
-        content.append("   Search: ", style="bold yellow")
-        content.append(self._search_query, style="white")
-        content.append("\u2588", style="bold white")
+        in_results = self._search_in_results()
+        if in_results:
+            content.append("   Search: ", style="dim")
+            content.append(self._search_query, style="dim")
+        else:
+            content.append(" \u25b8 Search: ", style="bold yellow")
+            content.append(self._search_query, style="bold white")
+            content.append("\u2588", style="bold white")
 
         content.append_text(self._tab_row(
             self.SEARCH_FILTERS, self.SEARCH_FILTER_LABELS,
@@ -3093,8 +3206,9 @@ class HeadlessTidalPlayer:
             content.append("\n")
             for i in range(page_start, page_end):
                 item = self._search_results[i]
+                selected = in_results and i == self._search_cursor
                 content.append("\n")
-                self._mark_cursor(content, i == self._search_cursor)
+                self._mark_cursor(content, selected)
                 self._download_mark(
                     content, getattr(item.get("obj"), "id", None)
                     if item["type"] == "track" else None)
@@ -3102,7 +3216,7 @@ class HeadlessTidalPlayer:
                                "artist": "bold yellow", "playlist": "bold blue"}
                 badge = item["type"].upper()
                 content.append(f"[{badge}]", style=type_styles.get(item["type"], "dim"))
-                content.append(f" {item['name']}", style="bold white" if i == self._search_cursor else "white")
+                content.append(f" {item['name']}", style="bold white" if selected else "white")
                 if item.get("artist"):
                     content.append(f"  {item['artist']}", style="dim")
                 if item.get("playlist"):
@@ -3145,13 +3259,15 @@ class HeadlessTidalPlayer:
         content = Text()
         content.append(f"   {self._browse_title}", style="bold magenta")
         self._age_note(content, self._browse_fetched)
+        self._text_edit_line(content)
+        tracks = self._carried_rows(self.MODE_BROWSE) or self._browse_tracks
 
         if self._browse_loading:
             content.append("\n\n   Loading...", style="dim yellow")
         elif self._browse_message:
             content.append(f"\n\n   {self._browse_message}", style="dim green")
-        elif self._browse_tracks:
-            total = len(self._browse_tracks)
+        elif tracks:
+            total = len(tracks)
             page = self._page_rows()
             page_start = max(0, ((self._browse_cursor - 1) // page) * page) if self._browse_cursor > 0 else 0
             page_end = min(page_start + page, total)
@@ -3167,13 +3283,19 @@ class HeadlessTidalPlayer:
                     content.append("    ", style="")
                     content.append("  \u25b6 Play All", style="dim green")
 
+            carried = self._carry is not None and self._carry["mode"] == self.MODE_BROWSE
             for i in range(page_start, page_end):
-                track = self._browse_tracks[i]
+                track = tracks[i]
                 content.append("\n")
-                self._mark_cursor(content, i == self._browse_cursor)
+                held = carried and i == self._browse_cursor
+                if held:
+                    content.append("  ↕ ", style="bold yellow")
+                else:
+                    self._mark_cursor(content, i == self._browse_cursor)
                 self._download_mark(content, getattr(track, "id", None))
                 content.append(f"{i+1:>2}. ", style="dim")
-                content.append(track.name, style="bold white" if i == self._browse_cursor else "white")
+                content.append(track.name, style="bold black on yellow" if held else
+                               "bold white" if i == self._browse_cursor else "white")
                 if track.artists:
                     content.append(f"  {track.artists[0].name}", style="dim")
                 content.append(f"  {format_time(track.duration)}", style="dim cyan")
@@ -3255,21 +3377,30 @@ class HeadlessTidalPlayer:
     def _build_queue_display(self) -> Text:
         content = Text()
         content.append("   Queue", style="bold yellow")
-        if not self._queue:
+        queue = self._carried_rows(self.MODE_QUEUE) or self._queue
+        current = self._queue[self._queue_index] if 0 <= self._queue_index < len(self._queue) else None
+        if not queue:
             content.append("\n\n   Queue is empty", style="dim")
         else:
-            total = len(self._queue)
+            total = len(queue)
             page = self._page_rows()
             page_start = (self._queue_cursor // page) * page
             page_end = min(page_start + page, total)
             content.append(f"  ({total} tracks)", style="dim")
+            modes = self._play_modes()
+            if modes:
+                content.append(f"  {modes}", style="cyan")
             content.append("\n")
+            carried = queue is not self._queue
             for i in range(page_start, page_end):
-                track = self._queue[i]
+                track = queue[i]
                 content.append("\n")
-                is_current = (i == self._queue_index)
+                is_current = track is current if carried else (i == self._queue_index)
                 is_cursor = (i == self._queue_cursor)
-                if is_cursor:
+                held = carried and is_cursor
+                if held:
+                    content.append("  ↕ ", style="bold yellow")
+                elif is_cursor:
                     self._mark_cursor(content, True)
                 elif is_current:
                     content.append("  \u266b ", style="bold cyan")
@@ -3279,7 +3410,8 @@ class HeadlessTidalPlayer:
                 t_name = track.name if hasattr(track, "name") else "?"
                 t_artist = track.artists[0].name if hasattr(track, "artists") and track.artists else ""
                 t_dur = format_time(track.duration) if hasattr(track, "duration") else ""
-                name_style = "bold cyan" if is_current else ("bold white" if is_cursor else "white")
+                name_style = ("bold black on yellow" if held else "bold cyan" if is_current
+                              else "bold white" if is_cursor else "white")
                 content.append(f"{i + 1:>2}. ", style="dim")
                 content.append(t_name, style=name_style)
                 if is_current:
@@ -3295,6 +3427,7 @@ class HeadlessTidalPlayer:
         content = Text()
         content.append("   Your Playlists", style="bold magenta")
         self._age_note(content, self._playlists_fetched)
+        self._text_edit_line(content)
 
         if self._playlists_loading:
             content.append("\n\n   Loading playlists...", style="dim yellow")
@@ -3326,6 +3459,22 @@ class HeadlessTidalPlayer:
             content.append("\n\n   No playlists found", style="dim")
 
         return content
+
+    def _text_edit_line(self, content: Text) -> None:
+        edit = self._text_edit
+        if edit is None:
+            return
+        shown = edit["value"]
+        if len(shown) > TEXT_EDIT_SHOWN:
+            shown = "…" + shown[-(TEXT_EDIT_SHOWN - 1):]
+        content.append("\n\n  ▸ ", style="bold cyan")
+        content.append("Rename: " if edit["field"] == "name" else "Description: ", style="bold white")
+        content.append(f"‹ {shown}▏›", style="bold yellow")
+
+    def _play_modes(self) -> str:
+        parts = (["shuffle"] if self._shuffle else []) + (
+            [f"repeat {self._repeat}"] if self._repeat != "off" else [])
+        return " · ".join(parts)
 
     def _build_add_to_playlist_display(self) -> Text:
         content = Text()
@@ -3761,6 +3910,22 @@ class HeadlessTidalPlayer:
             ("y", "bold"),
             (" to confirm, any other key to cancel", "dim"))
 
+    def _build_queue_clear_confirm(self) -> Text:
+        keep = self._current_track is not None
+        gone = max(0, len(self._queue) - (1 if keep else 0))
+        return self._styled(
+            (f"\n   Clear {gone} track{'' if gone == 1 else 's'} from the queue"
+             f"{', keeping the one playing' if keep else ''}? ", "bold yellow"),
+            ("y", "bold"),
+            (" to confirm, any other key to cancel", "dim"))
+
+    def _build_playlist_delete_confirm(self) -> Text:
+        name = (self._playlist_delete or {}).get("name", "")
+        return self._styled(
+            (f'\n   Delete playlist "{name}" from TIDAL? ', "bold yellow"),
+            ("y", "bold"),
+            (" to confirm, any other key to cancel", "dim"))
+
     def _mode_hints(self) -> list:
         if self._footer_hidden:
             return []
@@ -3774,12 +3939,30 @@ class HeadlessTidalPlayer:
     def _screen_hints(self) -> list:
         if self._mini_player or self._download_open:
             return []
+        if self._text_edit is not None:
+            return [Hint("Enter", "save", None, 0), Hint("Esc", "cancel", None, 1)]
+        if self._carry is not None:
+            return [Hint("\u2191/\u2193", "move", None, 0), Hint("Enter", "drop", None, 1),
+                    Hint("Esc", "cancel", None, 2)]
         if self._mode == self.MODE_SEARCH:
-            hints = [
-                Hint("Enter/\u2192", "search/open", "open", 0),
-                Hint("\u2191/\u2193", "navigate", "move", 2),
-                Hint("Tab", "filter", None, 3),
-            ]
+            if self._search_in_results():
+                return [
+                    Hint("Enter/\u2192", "open", None, 0),
+                    Hint("\u2191/\u2193", "navigate", "move", 2),
+                    Hint("q", "queue", None, 3),
+                    Hint("y", "playlist", "list", 5),
+                    Hint("d", "download", "get", 6),
+                    Hint("/", "edit search", "edit", 4),
+                    Hint("Tab", "filter", None, 7),
+                    Hint("Space", "pause/play", "pause", 8),
+                    Hint("\u2190/Esc", "back", None, 1),
+                ]
+            if self._search_results:
+                hints = [Hint("\u2193/Enter", "results", None, 0)]
+            else:
+                hints = [Hint("Enter", "search", None, 0),
+                         Hint("\u2191/\u2193", "navigate", "move", 2)]
+            hints.append(Hint("Tab", "filter", None, 3))
             if self._search_results:
                 hints.append(Hint("Space", "pause/play", "pause", 4))
             hints += [Hint("\u2190/Esc", "back", None, 1),
@@ -3791,12 +3974,17 @@ class HeadlessTidalPlayer:
                 Hint("\u2191/\u2193", "navigate", "move", 2),
                 Hint("Space", "pause/play", "pause", 4),
                 Hint("a", "play all", "all", 5),
+                Hint("s", "shuffle play", "shuffle", 5),
                 Hint("y", "add to playlist", "add", 6),
                 Hint("d", "download", "get", 7),
                 Hint("D", "download all", "all", 9),
             ]
             if self._browse_playlist is not None:
-                hints.append(Hint("x", "remove", "del", 8))
+                hints += [Hint("x", "remove", "del", 8),
+                          Hint("m", "move", None, 8),
+                          Hint("R", "rename", None, 9),
+                          Hint("E", "description", "desc", 9),
+                          Hint("X", "delete playlist", "delete", 9)]
             hints.append(Hint("v", "volume", "vol", 3))
             hints.append(Hint("\u2190/Esc", "back", None, 1))
             return hints
@@ -3816,21 +4004,32 @@ class HeadlessTidalPlayer:
                 Hint("Enter", "play", None, 0),
                 Hint("\u2191/\u2193", "navigate", "move", 2),
                 Hint("Space", "pause/play", "pause", 4),
+                Hint("s", f"shuffle: {'on' if self._shuffle else 'off'}", None, 5),
+                Hint("r", f"repeat: {self._repeat}", None, 5),
+                Hint("m", "move", None, 6),
                 Hint("x", "remove", "del", 6),
                 Hint("y", "add to playlist", "add", 7),
                 Hint("d", "download", "get", 8),
                 Hint("D", "download all", "all", 9),
+                Hint("C", "clear", None, 9),
                 Hint("v", "volume", "vol", 3),
                 Hint("\u2190/Esc", "back", None, 1),
             ]
         if self._mode == self.MODE_PLAYLISTS:
-            return [
+            hints = [
                 Hint("Enter/\u2192", "open", None, 0),
                 Hint("\u2191/\u2193", "navigate", "move", 2),
                 Hint("Space", "pause/play", "pause", 4),
                 Hint("v", "volume", "vol", 3),
                 Hint("\u2190/Esc", "back", None, 1),
             ]
+            row = (self._playlists[self._playlists_cursor]
+                   if 0 <= self._playlists_cursor < len(self._playlists) else None)
+            if row is not None and self._owns(row):
+                hints += [Hint("R", "rename", None, 5),
+                          Hint("E", "description", "desc", 6),
+                          Hint("X", "delete", None, 7)]
+            return hints
         if self._mode == self.MODE_ADD_TO_PLAYLIST:
             if self._picker_new_name is not None:
                 return [
@@ -3880,6 +4079,8 @@ class HeadlessTidalPlayer:
                 Hint("\u2191", "scrub", None, 6),
                 Hint("l", "like", None, 6),
                 Hint("r", "radio", None, 6),
+                Hint("S", f"shuffle: {'on' if self._shuffle else 'off'}", "shuffle", 6),
+                Hint("R", f"repeat: {self._repeat}", "repeat", 6),
                 Hint("y", "add to playlist", "add", 7),
                 Hint("d", "download", "get", 6),
                 Hint("q", "queue", None, 6),
@@ -4182,6 +4383,10 @@ class HeadlessTidalPlayer:
             content.append_text(self._build_refetch_confirm())
         elif self._downloads_delete is not None:
             content.append_text(self._build_delete_download_confirm())
+        elif self._queue_clear_pending:
+            content.append_text(self._build_queue_clear_confirm())
+        elif self._playlist_delete is not None:
+            content.append_text(self._build_playlist_delete_confirm())
 
         return self._with_footer(content, fit)
 
@@ -4275,7 +4480,7 @@ class HeadlessTidalPlayer:
         state = {"mode": mode}
         if mode == self.MODE_SEARCH:
             state.update(query=self._search_query, filter=self._search_filter,
-                         cursor=self._search_cursor)
+                         cursor=self._search_cursor, focus=self._search_focus)
         elif mode == self.MODE_BROWSE:
             state.update(title=self._browse_title,
                          tracks=list(self._browse_tracks),
@@ -4303,6 +4508,7 @@ class HeadlessTidalPlayer:
             self._mode = self.MODE_SEARCH
             self._search_query = state.get("query", "")
             self._search_filter = state.get("filter", "all")
+            self._search_focus = state.get("focus", "bar")
             if self._search_filter in self._search_views:
                 self._search_cursor = state.get("cursor", 0)
             # The generation is left alone: a page still in flight is for this same query.
@@ -4836,11 +5042,11 @@ class HeadlessTidalPlayer:
             self._run("play.artist", id=self._obj_id(self._artist),
                       section=self._artist_section, index=index)
 
-    def _play_browse(self, index: int):
+    def _play_browse(self, index: int, shuffle: bool = False):
         if not self._browse_tracks or self._browse_source is None:
             return
         kind, source_id = self._browse_source
-        self._run(f"play.{kind}", id=source_id, index=index)
+        self._run(f"play.{kind}", id=source_id, index=index, **({"shuffle": True} if shuffle else {}))
 
     def _load_playlists(self):
         cached = self._cache.get_playlists()
@@ -4921,11 +5127,154 @@ class HeadlessTidalPlayer:
         self._run("playlist.remove", id=self._obj_id(pl), index=self._browse_cursor,
                   track_id=getattr(self._browse_tracks[self._browse_cursor], "id", None))
 
+    def _owns(self, playlist) -> bool:
+        return self._is_editable(playlist) or bool(getattr(playlist, "editable", False))
+
+    def _pick_up(self, mode) -> None:
+        if mode == self.MODE_BROWSE:
+            if self._browse_playlist is None:
+                self._set_toast("Only your own playlists can be reordered")
+                return
+            if self._browse_remove_busy:
+                self._set_toast("A playlist change is still in flight")
+                return
+            rows, at = self._browse_tracks, self._browse_cursor
+        else:
+            rows, at = self._queue, self._queue_cursor
+        if not rows or not 0 <= at < len(rows):
+            return
+        self._player_focus = False
+        self._carry = {"mode": mode, "from": at, "at": at, "rows": list(rows), "track": rows[at]}
+
+    def _carried_rows(self, mode) -> Optional[list]:
+        carry = self._carry
+        return carry["rows"] if carry is not None and carry["mode"] == mode else None
+
+    def _set_carry_cursor(self, mode, index: int) -> None:
+        if mode == self.MODE_BROWSE:
+            self._browse_cursor = index
+        else:
+            self._queue_cursor = index
+
+    def _handle_carry_key(self, key: str) -> None:
+        carry = self._carry
+        rows, at = carry["rows"], carry["at"]
+        if key in (KEY_UP, KEY_DOWN):
+            to = at - 1 if key == KEY_UP else at + 1
+            if 0 <= to < len(rows):
+                rows[at], rows[to] = rows[to], rows[at]
+                carry["at"] = to
+                self._set_carry_cursor(carry["mode"], to)
+        elif key in (KEY_ENTER, KEY_ENTER2):
+            self._drop()
+        elif key == KEY_ESC:
+            self._carry = None
+            self._set_carry_cursor(carry["mode"], carry["from"])
+
+    def _drop(self) -> None:
+        carry, self._carry = self._carry, None
+        mode, frm, to = carry["mode"], carry["from"], carry["at"]
+        self._set_carry_cursor(mode, to)
+        if frm == to:
+            return
+        track_id = getattr(carry["track"], "id", None)
+        if mode == self.MODE_QUEUE:
+            self._run("queue.move", index=frm, to=to, track_id=track_id)
+            return
+        source, original = self._browse_source, list(self._browse_tracks)
+
+        def restore(_reply):
+            if self._browse_source == source:
+                self._browse_tracks = original
+                self._browse_cursor = frm
+
+        self._run("playlist.move", on_refused=restore, id=self._obj_id(self._browse_playlist),
+                  index=frm, to=to, track_id=track_id)
+        if self.remote is not None:
+            # In process the write's own `_list_changed` shows the order; setting it here could undo a failed write's restore.
+            self._browse_tracks = list(carry["rows"])
+
+    def _begin_text_edit(self, playlist, field: str) -> None:
+        if playlist is None:
+            self._set_toast("Only your own playlists can be changed")
+            return
+        was = getattr(playlist, field, "") or ""
+        self._player_focus = False
+        self._text_edit = {"field": field, "id": self._obj_id(playlist), "playlist": playlist,
+                           "value": was, "was": was}
+
+    def _handle_text_edit_key(self, key: str) -> None:
+        edit = self._text_edit
+        limit = PLAYLIST_NAME_MAX if edit["field"] == "name" else PLAYLIST_DESCRIPTION_MAX
+        if key == KEY_ESC:
+            self._text_edit = None
+        elif key in (KEY_BACKSPACE, KEY_BACKSPACE2):
+            edit["value"] = edit["value"][:-1]
+        elif key in (KEY_ENTER, KEY_ENTER2):
+            self._submit_text_edit()
+        elif len(key) == 1 and key.isprintable() and len(edit["value"]) < limit:
+            edit["value"] += key
+
+    def _submit_text_edit(self) -> None:
+        edit = self._text_edit
+        field, value, was = edit["field"], edit["value"].strip(), edit["was"]
+        if not value:
+            self._set_toast("Playlist name can't be empty" if field == "name"
+                            else "TIDAL keeps the old description when given an empty one")
+            return
+        self._text_edit = None
+        if value == was:
+            return
+        target, renamed = edit["playlist"], field == "name" and self._browse_title == was
+        if renamed:
+            self._browse_title = value
+        if self.remote is not None:
+            setattr(target, field, value)
+
+        def revert(_reply):
+            if self.remote is not None:
+                setattr(target, field, was)
+            if renamed and self._browse_title == value:
+                self._browse_title = was
+
+        if field == "name":
+            self._run("playlist.rename", on_refused=revert, id=edit["id"], name=value)
+        else:
+            self._run("playlist.describe", on_refused=revert, id=edit["id"], description=value)
+
+    def _confirm_playlist_delete(self, playlist, from_detail: bool) -> None:
+        if playlist is None:
+            self._set_toast("Only your own playlists can be deleted")
+            return
+        self._playlist_delete = {"id": self._obj_id(playlist), "from_detail": from_detail,
+                                 "name": getattr(playlist, "name", None) or "this playlist"}
+
+    def _delete_playlist(self, target: dict) -> None:
+        pid = target["id"]
+        before = list(self._playlists)
+        self._playlists = [p for p in before if self._obj_id(p) != pid]
+        if target["from_detail"]:
+            self._go_back()
+        self._playlists_cursor = max(0, min(self._playlists_cursor, len(self._playlists) - 1))
+
+        def restore(_reply):
+            self._playlists = before
+
+        self._run("playlist.delete", on_refused=restore, id=pid)
+
     def _set_toast(self, msg: str, seconds: float = 2.5):
         self._toast = msg
         self._toast_until = time.time() + seconds
 
+    def _search_track(self):
+        if self._mode != self.MODE_SEARCH or not self._search_in_results():
+            return None
+        item = self._search_results[min(self._search_cursor, len(self._search_results) - 1)]
+        return item["obj"] if item["type"] == "track" else None
+
     def _target_track_for_picker(self):
+        if self._search_track() is not None:
+            return self._search_track()
         if self._mode == self.MODE_QUEUE and self._queue and self._queue_cursor < len(self._queue):
             return self._queue[self._queue_cursor]
         if self._mode == self.MODE_BROWSE and self._browse_tracks and self._browse_cursor >= 0:
@@ -4947,6 +5296,8 @@ class HeadlessTidalPlayer:
         return pinned + [p for p in playlists if self._obj_id(p) != pid]
 
     def _download_target(self, whole: bool = False) -> tuple:
+        if self._search_track() is not None:
+            return [self._search_track()], ""
         if self._mode == self.MODE_BROWSE and self._browse_tracks:
             if whole or self._browse_cursor < 0:
                 return list(self._browse_tracks), self._browse_title or "This list"
@@ -5799,12 +6150,33 @@ class HeadlessTidalPlayer:
                 self._run("refetch")
             return
 
+        if self._queue_clear_pending:
+            self._queue_clear_pending = False
+            if confirmed:
+                self._run("queue.clear")
+                self._queue_cursor = 0
+            return
+
+        if self._playlist_delete is not None:
+            target, self._playlist_delete = self._playlist_delete, None
+            if confirmed:
+                self._delete_playlist(target)
+            return
+
         if self._volume_open:
             self._handle_volume_key(key)
             return
 
         if self._download_open:
             self._handle_download_key(key)
+            return
+
+        if self._text_edit is not None:
+            self._handle_text_edit_key(key)
+            return
+
+        if self._carry is not None:
+            self._handle_carry_key(key)
             return
 
         was_focused = self._player_focus
@@ -5857,7 +6229,8 @@ class HeadlessTidalPlayer:
     def _can_open_volume(self) -> bool:
         return (self._mode != self.MODE_SEARCH and not self._download_open
                 and self._settings_edit is None and self._settings_secret is None
-                and self._picker_new_name is None)
+                and self._picker_new_name is None and self._text_edit is None
+                and self._carry is None)
 
     def _can_hide_footer(self) -> bool:
         return (self._mode == self.MODE_PLAYER and not self._mini_player
@@ -5871,9 +6244,11 @@ class HeadlessTidalPlayer:
             or self._settings_edit is not None
             or self._settings_secret is not None
             or self._picker_new_name is not None
+            or self._text_edit is not None or self._carry is not None
             or self._quit_pending or self._logout_pending
             or self._disable_songs_pending or self._clear_cache_pending
-            or self._refetch_pending or self._downloads_delete is not None)
+            or self._refetch_pending or self._downloads_delete is not None
+            or self._queue_clear_pending or self._playlist_delete is not None)
 
     def _open_volume(self, from_focus: bool = False):
         self._volume_from_focus = from_focus
@@ -5914,6 +6289,7 @@ class HeadlessTidalPlayer:
             self._focus_player()
         elif key == "s":
             self._enter_mode(self.MODE_SEARCH)
+            self._search_focus = "bar"
             self._search_query = ""
             self._search_history_cursor = None
             self._search_filter = "all" if self._connectivity == ONLINE else "music"
@@ -5928,6 +6304,10 @@ class HeadlessTidalPlayer:
             self._toggle_like()
         elif key == "r":
             self._run("play.radio")
+        elif key == "S":
+            self._run("shuffle")
+        elif key == "R":
+            self._run("repeat")
         elif key == "y":
             self._open_playlist_picker()
         elif key == "d":
@@ -5980,11 +6360,13 @@ class HeadlessTidalPlayer:
         if key in (KEY_TAB, KEY_SHIFT_TAB):
             self._cycle_search_filter(1 if key == KEY_TAB else -1)
             return
+        if self._search_in_results():
+            self._handle_search_results_key(key)
+            return
+        self._search_focus = "bar"
         history = self._history_rows()
         if key == KEY_UP:
-            if self._search_results and self._search_cursor > 0:
-                self._search_cursor -= 1
-            elif history and self._search_history_cursor is not None:
+            if history and self._search_history_cursor is not None:
                 self._search_history_cursor = (
                     self._search_history_cursor - 1
                     if self._search_history_cursor > 0 else None)
@@ -5992,17 +6374,14 @@ class HeadlessTidalPlayer:
                 self._focus_player()
         elif key == KEY_DOWN:
             if self._search_results:
-                if self._search_cursor < len(self._search_results) - 1:
-                    self._search_cursor += 1
-                else:
-                    self._search_more()
+                self._search_focus = "results"
             elif history:
                 self._search_history_cursor = (
                     0 if self._search_history_cursor is None
                     else min(self._search_history_cursor + 1, len(history) - 1))
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
             if self._search_results:
-                self._select_search_result()
+                self._search_focus = "results"
             elif key != KEY_RIGHT:
                 if history and self._search_history_cursor is not None:
                     self._search_query = history[self._search_history_cursor]
@@ -6025,6 +6404,58 @@ class HeadlessTidalPlayer:
             self._search_history_cursor = None
             self._reset_search_results()
 
+    def _search_in_results(self) -> bool:
+        return self._search_focus == "results" and bool(self._search_results)
+
+    def _handle_search_results_key(self, key: str):
+        """With the selection in the results, letters are actions; nothing is typed."""
+        if key == KEY_UP:
+            if self._search_cursor > 0:
+                self._search_cursor -= 1
+            else:
+                self._search_focus = "bar"
+        elif key == KEY_DOWN:
+            if self._search_cursor < len(self._search_results) - 1:
+                self._search_cursor += 1
+            else:
+                self._search_more()
+        elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT):
+            self._select_search_result()
+        elif key == "/":
+            self._search_focus = "bar"
+        elif key in ("q", "y", "d"):
+            item = self._search_results[min(self._search_cursor, len(self._search_results) - 1)]
+            {"q": self._queue_search_result, "y": self._search_result_to_playlist,
+             "d": self._download_search_result}[key](item)
+
+    def _queue_search_result(self, item: dict) -> None:
+        kind, obj = item["type"], item["obj"]
+        if kind == "track":
+            args = {"track_ids": [getattr(obj, "id", None)]}
+        elif kind in ("album", "playlist", "mix"):
+            args = {kind: self._obj_id(obj)}
+        else:
+            self._set_toast("Open the artist to queue its tracks")
+            return
+        reply = self._run("queue.add", on_refused=lambda _reply: None, position="end", **args)
+        if reply.get("ok"):
+            self._set_toast(f'Queued "{item.get("name") or getattr(obj, "name", "")}"')
+
+    def _search_result_to_playlist(self, item: dict) -> None:
+        if item["type"] != "track":
+            self._set_toast("Open it to add its tracks to a playlist")
+            return
+        self._open_playlist_picker()
+
+    def _download_search_result(self, item: dict) -> None:
+        kind = item["type"]
+        if kind == "track":
+            self._open_download()
+        elif kind in ("album", "playlist"):
+            self._run(f"download.{kind}", id=self._obj_id(item["obj"]))
+        else:
+            self._set_toast("Open the artist to download its tracks")
+
     def _handle_browse_key(self, key: str):
         if self._handle_back_or_toggle(key):
             return
@@ -6036,8 +6467,18 @@ class HeadlessTidalPlayer:
             self._play_browse(max(self._browse_cursor, 0))
         elif key == "a":
             self._play_browse(0)
+        elif key == "s":
+            self._play_browse(0, shuffle=True)
         elif key == "x":
             self._remove_from_browse_playlist()
+        elif key == "m":
+            self._pick_up(self.MODE_BROWSE)
+        elif key == "R":
+            self._begin_text_edit(self._browse_playlist, "name")
+        elif key == "E":
+            self._begin_text_edit(self._browse_playlist, "description")
+        elif key == "X":
+            self._confirm_playlist_delete(self._browse_playlist, from_detail=True)
         elif key == "y":
             self._open_playlist_picker()
         elif key == "d":
@@ -6080,6 +6521,17 @@ class HeadlessTidalPlayer:
                           track_id=getattr(self._queue[self._queue_cursor], "id", None))
         elif key == "x":
             self._remove_from_queue()
+        elif key == "m":
+            self._pick_up(self.MODE_QUEUE)
+        elif key == "C":
+            if len(self._queue) > (0 if self._current_track is None else 1):
+                self._queue_clear_pending = True
+            else:
+                self._set_toast("Nothing to clear")
+        elif key in ("s", "S"):
+            self._run("shuffle")
+        elif key in ("r", "R"):
+            self._run("repeat")
         elif key == "y":
             self._open_playlist_picker()
         elif key == "d":
@@ -6090,12 +6542,21 @@ class HeadlessTidalPlayer:
     def _handle_playlists_key(self, key: str):
         if self._handle_back_or_toggle(key, back=self._show_player):
             return
+        row = (self._playlists[self._playlists_cursor]
+               if 0 <= self._playlists_cursor < len(self._playlists) else None)
         if key == KEY_UP:
             self._cursor_up("_playlists_cursor", len(self._playlists))
         elif key == KEY_DOWN:
             self._cursor_down("_playlists_cursor", len(self._playlists))
         elif key in (KEY_ENTER, KEY_ENTER2, KEY_RIGHT) and self._playlists:
             self._open_playlist(self._playlists[self._playlists_cursor])
+        elif key in ("R", "E", "X"):
+            if row is None or not self._owns(row):
+                self._set_toast("Only your own playlists can be changed")
+            elif key == "X":
+                self._confirm_playlist_delete(row, from_detail=False)
+            else:
+                self._begin_text_edit(row, "name" if key == "R" else "description")
 
     def _handle_add_to_playlist_key(self, key: str):
         if self._picker_new_name is not None:

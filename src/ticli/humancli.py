@@ -34,6 +34,7 @@ DONE = {**TRANSPORT, "like": "liked", "unlike": "unliked", "stop": "stopped",
            for v in ("favorite", "unfavorite") for k in ("album", "artist", "playlist")}}
 # Commands whose `id` argument is a name for this kind of thing.
 NAMED = {"playlist.add": "playlist", "playlist.remove": "playlist", "playlist.tracks": "playlist",
+         "playlist.move": "playlist",
          "play.playlist": "playlist", "play.album": "album", "album.tracks": "album",
          "play.artist": "artist", "artist.section": "artist",
          "playlist.delete": "playlist", "playlist.rename": "playlist", "playlist.describe": "playlist",
@@ -194,8 +195,10 @@ def status_line(reply: dict) -> str:
     queue = state.get("queue") or {}
     where = f' (queue {queue.get("index", 0) + 1}/{queue["len"]})' if queue.get("len") else ""
     pending = f' | {state["pending"]} agent commands pending' if state.get("pending") else ""
+    modes = ((" | shuffle" if queue.get("shuffle") else "")
+             + (f' | repeat {queue["repeat"]}' if queue.get("repeat") else ""))
     return (f'{"playing" if state.get("playing") else "paused"}: {track["artist"]} - {track["title"]} '
-            f'[{_mmss(track["pos"])}/{_mmss(track["dur"])}]{where}{pending}')
+            f'[{_mmss(track["pos"])}/{_mmss(track["dur"])}]{where}{modes}{pending}')
 
 
 def _search_lines(r: dict) -> str:
@@ -263,6 +266,12 @@ def _line(cmd: str, reply: dict, result) -> str:
         return f'moved to #{r["index"] + 1} of {r.get("queue_length")}'
     if cmd == "queue.clear" and "removed" in r:
         return f'cleared {r["removed"]} track{"" if r["removed"] == 1 else "s"} from the queue'
+    if cmd == "shuffle" and "shuffle" in r:
+        return f'shuffle {"on" if r["shuffle"] else "off"}'
+    if cmd == "repeat" and "repeat" in r:
+        return f'repeat {r["repeat"]}'
+    if cmd == "playlist.move" and "index" in r:
+        return f'moving to #{r["index"] + 1}'
     if cmd == "history.list":
         return "\n".join(r.get("history") or []) or "no search history"
     if cmd == "cache.status" and "songs" in r:

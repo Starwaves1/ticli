@@ -91,6 +91,11 @@ agents, **requests 2 s apart**; you never pace by hand and cannot bypass it.
   (`queue remove 2 TRACK_ID`, `queue move 5 1 TRACK_ID` to put entry 5 at 1); if the
   queue moved you get `stale`, not another track. `queue clear` keeps only the
   current track; neither touches playback.
+- `shuffle on|off|toggle` shuffles what comes after the current track; off puts it back
+  in the original order. `repeat off|all|one|cycle`: all wraps to the first entry, one
+  replays the track when it ends. Both last until the player stops; `status` has
+  `shuffle` and `repeat`, and `state.queue` shows them while on. `play album|playlist|mix|downloads ID shuffle=true` plays a
+  list shuffled once.
 - Adding to the play queue: `queue add ID... [--next]` (or `album=ID`, `playlist=ID`,
   `mix=ID` for all of a list's tracks; a song may be `"artist - title"` or a URL).
   Default is the end; `--next` plays it after the current track. It never replaces the

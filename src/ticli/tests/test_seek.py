@@ -176,6 +176,7 @@ class TestFocusFromLists:
 
     def test_up_inside_the_list_only_moves_the_cursor(self):
         p = self._search_player()
+        p._search_focus = "results"
         p._handle_key(KEY_UP)
         assert p._search_cursor == 0
         assert p._player_focus is False

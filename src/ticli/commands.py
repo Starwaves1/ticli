@@ -8,6 +8,7 @@ This module must not import `ticli.player`: `ticli agent` imports the gate.
 """
 
 import json
+import random
 import re
 import sys
 import threading
@@ -29,6 +30,7 @@ HUMAN = "human"
 AGENT = "agent"
 
 ARTIST_SECTIONS = ("tracks", "albums", "playlists", "suggestions")
+REPEAT_MODES = ("off", "all", "one")
 
 WRONG_KEY_DELAY_SECONDS = 1.0
 
@@ -438,22 +440,44 @@ def _track_json(track) -> Optional[dict]:
             "duration_seconds": getattr(track, "duration", None)}
 
 
-def _play_list(p, tracks, index) -> dict:
+def _play_list(p, tracks, index, shuffle=False) -> dict:
+    """`shuffle` plays the whole list in a random order; shuffle mode keeps the chosen track first."""
     if not tracks:
         raise CommandError("empty", "Nothing to play.")
-    if not 0 <= index < len(tracks):
+    if shuffle:
+        index = 0
+    elif not 0 <= index < len(tracks):
         raise CommandError("bad_args", f"index must be 0..{len(tracks) - 1}.")
+    order = list(tracks)
+    if shuffle or p._shuffle:
+        first = [] if shuffle else [order.pop(index)]
+        random.shuffle(order)
+        order, index = first + order, 0
     if p._connectivity != ONLINE:
         owned = {row["id"] for row in downloads.present()}
-        if not p._has_local_copy(tracks[index], owned) and p._reconnect() != ONLINE:
-            local = [i for i in range(index, len(tracks)) if p._has_local_copy(tracks[i], owned)]
+        if not p._has_local_copy(order[index], owned) and p._reconnect() != ONLINE:
+            local = [i for i in range(index, len(order)) if p._has_local_copy(order[i], owned)]
             if not local:
                 raise offline_error(p)
             p._toast_skipped(local[0] - index)
             index = local[0]
-    p._queue = list(tracks)
+    p._queue = order
+    p._unshuffled = list(tracks) if p._shuffle else None
     p._play_queue_index(index)
-    return {"queue_length": len(tracks), "index": index}
+    result = {"queue_length": len(order), "index": index}
+    if shuffle or p._shuffle:
+        result["shuffled"] = True
+    return result
+
+
+def _shuffle_arg(args) -> bool:
+    value = args.get("shuffle", False)
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value not in ("true", "false", "on", "off", "yes", "no", "1", "0", ""):
+            raise CommandError("bad_args", "shuffle is true or false.")
+        return value in ("true", "on", "yes", "1")
+    return bool(value)
 
 
 # ── handlers ──
@@ -470,6 +494,8 @@ def _status(p, args) -> dict:
         "playing": bool(p._playing),
         "position": round(p._get_position(), 1) if track else 0,
         "queue": {"length": len(p._queue), "index": p._queue_index},
+        "shuffle": bool(p._shuffle),
+        "repeat": p._repeat,
         "switches": switches(cfg),
         "connectivity": p._connectivity,
         "jobs": {name: _job_summary(job) for name, job in
@@ -546,7 +572,7 @@ def _queue_play(p, args):
 def _queue_remove(p, args) -> dict:
     index = _queue_entry(p, args)
     removing_current = index == p._queue_index
-    p._queue.pop(index)
+    p._order_remove(p._queue.pop(index))
     if index < p._queue_index:
         p._queue_index -= 1
     elif removing_current:
@@ -621,14 +647,17 @@ def _queue_add(p, args) -> dict:
         raise CommandError("empty", "Nothing to queue: that list has no tracks.")
     if not p._queue and p._current_track is not None:
         p._queue, p._queue_index = [p._current_track], 0
+        p._reset_order()
     if not p._queue:
         index = 0
         p._queue, p._queue_index = list(tracks), 0
+        p._reset_order()
         p._current_track = tracks[0]
         p._play_offset, p._play_start_time = 0, None
     else:
         index = p._queue_index + 1 if where == "next" else len(p._queue)
         p._queue[index:index] = tracks
+        p._order_insert(tracks, after_current=where == "next")
         if where == "next":
             p._prefetch_id = None
     p._wake()
@@ -678,15 +707,15 @@ LIST_SOURCES = {"album": (_album_list, 2), "playlist": (_playlist_list, 2), "mix
 
 
 def _play_album(p, args) -> dict:
-    return _play_list(p, _album_list(p, str(args.get("id", ""))), _index(args))
+    return _play_list(p, _album_list(p, str(args.get("id", ""))), _index(args), _shuffle_arg(args))
 
 
 def _play_playlist(p, args) -> dict:
-    return _play_list(p, _playlist_list(p, str(args.get("id", ""))), _index(args))
+    return _play_list(p, _playlist_list(p, str(args.get("id", ""))), _index(args), _shuffle_arg(args))
 
 
 def _play_mix(p, args) -> dict:
-    return _play_list(p, _mix_list(p, str(args.get("id", ""))), _index(args))
+    return _play_list(p, _mix_list(p, str(args.get("id", ""))), _index(args), _shuffle_arg(args))
 
 
 def _play_downloads(p, args) -> dict:
@@ -698,7 +727,7 @@ def _play_downloads(p, args) -> dict:
         if str(args["track_id"]) not in ids:
             raise CommandError("not_found", "That track is not downloaded.", "Run `download list`.")
         index = ids.index(str(args["track_id"]))
-    return _play_list(p, tracks, index)
+    return _play_list(p, tracks, index, _shuffle_arg(args))
 
 
 def _artist_section_arg(args) -> str:
@@ -916,6 +945,57 @@ def _playlist_remove(p, args) -> dict:
     return {"accepted": True}
 
 
+def _playlist_move(p, args) -> dict:
+    playlist_id = str(args.get("id", ""))
+    index = _index(args, None)
+    to = args.get("to")
+    source = ("playlist", playlist_id)
+    browsed = p._browse_playlist if (p._browse_playlist is not None
+                                     and _sid(p._browse_playlist) == playlist_id) else None
+    pl = next((c for c in (_known(p, "playlist", playlist_id), browsed,
+                           _editable_playlist(p, playlist_id)) if hasattr(c, "move_by_index")), None)
+    tracks = _list(p, source)
+    if tracks is None:
+        raise CommandError("not_loaded", "Open that playlist first so its rows are known.",
+                           "Run playlist.tracks with its id, then move by index.")
+    if pl is None:
+        raise _not_yours("reordered")
+    if not 0 <= index < len(tracks):
+        raise CommandError("bad_args", "No track at that index.")
+    if not isinstance(to, int) or isinstance(to, bool) or not 0 <= to < len(tracks):
+        raise CommandError("bad_args", f"to must be 0..{len(tracks) - 1}.")
+    track = tracks[index]
+    if "track_id" in args and str(args["track_id"]) != _sid(track):
+        raise CommandError("stale", "That playlist changed; reopen it before moving.")
+    if p._browse_remove_busy or p._picker_busy:
+        raise CommandError("busy", "A playlist change is still in flight.")
+    if index == to:
+        return {"accepted": True, "index": to}
+    _require_online(p)
+    p._browse_remove_busy = True
+    order = list(tracks)
+    order.insert(to, order.pop(index))
+
+    def _run():
+        try:
+            # TIDAL's toIndex is the slot the row lands before, counted while it is still in place.
+            if not pl.move_by_index(index, to + 1 if to > index else to):
+                raise CommandError("api_error", "TIDAL did not move that track.")
+            p._list_changed(source, order)
+            p._cache.put_playlist_tracks(playlist_id, order)
+            p._set_toast(f'Moved "{track.name}" to #{to + 1} in {pl.name}')
+        except Exception:
+            p._list_changed(source, tracks)
+            p._set_toast("Failed to move the track; the playlist is unchanged")
+            _reraise_inline()
+        finally:
+            p._browse_remove_busy = False
+            p._wake()
+
+    _background(_run)
+    return {"accepted": True, "index": to}
+
+
 def _start_downloads(p, tracks, tier, label) -> dict:
     if _by_agent():
         # One slot, each track's stream request through the shared 2 s throttle (ADR-0001).
@@ -1062,6 +1142,7 @@ def _logout(p, args):
     p._current_track = None
     p._queue = []
     p._queue_index = -1
+    p._reset_order()
     p.running = False
     p.console.print("[yellow]Logged out. Tokens cleared.[/yellow]")
 
@@ -1362,9 +1443,32 @@ def _queue_clear(p, args) -> dict:
     else:
         p._queue = []
     p._queue_index = 0 if p._queue else -1
+    p._reset_order()
     p._prefetch_id = None
     p._wake()
     return {"removed": max(0, before - len(p._queue)), "queue_length": len(p._queue)}
+
+
+def _shuffle(p, args) -> dict:
+    mode = str(args.get("mode") or "toggle").strip().lower()
+    if mode not in ("on", "off", "toggle"):
+        raise CommandError("bad_args", "shuffle takes on, off or toggle.")
+    p._set_shuffle(not p._shuffle if mode == "toggle" else mode == "on")
+    p._prefetch_id = None
+    p._wake()
+    return {"shuffle": p._shuffle, "queue_length": len(p._queue)}
+
+
+def _repeat(p, args) -> dict:
+    mode = str(args.get("mode") or "cycle").strip().lower()
+    if mode == "cycle":
+        mode = REPEAT_MODES[(REPEAT_MODES.index(p._repeat) + 1) % len(REPEAT_MODES)]
+    elif mode not in REPEAT_MODES:
+        raise CommandError("bad_args", "repeat takes off, all, one or cycle.")
+    p._repeat = mode
+    p._prefetch_id = None
+    p._wake()
+    return {"repeat": mode}
 
 
 def _history_list(p, args) -> dict:
@@ -1506,7 +1610,8 @@ def _playlist_edit(p, args, title=None, description=None) -> dict:
             records = p._cache.get("playlists")
             if records:
                 p._cache.put("playlists", [
-                    {**r, "name": found.name} if str(r.get("id")) == pid else r for r in records])
+                    {**r, "name": found.name, **({"description": description} if description else {})}
+                    if str(r.get("id")) == pid else r for r in records])
             p._set_toast(f'Renamed "{was}" to "{found.name}"' if title
                          else f'Changed the description of "{found.name}"')
         except Exception:
@@ -1606,12 +1711,15 @@ COMMANDS = {cmd.name: cmd for cmd in (
             options=("album", "playlist", "mix", "position")),
     Command("queue.move", _queue_move, params=("index", "to", "track_id")),
     Command("queue.clear", _queue_clear),
+    Command("shuffle", _shuffle, params=("mode",)),
+    Command("repeat", _repeat, params=("mode",)),
     Command("play.track", _play_track_cmd, tidal=True, params=("track_id",)),
-    Command("play.album", _play_album, tidal=True, params=("id", "index")),
-    Command("play.playlist", _play_playlist, tidal=True, params=("id", "index")),
+    Command("play.album", _play_album, tidal=True, params=("id", "index"), options=("shuffle",)),
+    Command("play.playlist", _play_playlist, tidal=True, params=("id", "index"),
+            options=("shuffle",)),
     Command("play.artist", _play_artist, tidal=True, params=("id", "section", "index")),
-    Command("play.mix", _play_mix, tidal=True, params=("id", "index")),
-    Command("play.downloads", _play_downloads, params=("index", "track_id")),
+    Command("play.mix", _play_mix, tidal=True, params=("id", "index"), options=("shuffle",)),
+    Command("play.downloads", _play_downloads, params=("index", "track_id"), options=("shuffle",)),
     Command("play.radio", _radio, tidal=True),
     Command("like", _like(True), tidal=True, params=("track_ids*",)),
     Command("unlike", _like(False), tidal=True, params=("track_ids*",)),
@@ -1619,6 +1727,8 @@ COMMANDS = {cmd.name: cmd for cmd in (
     Command("playlist.add", _playlist_add, tidal=True, params=("id", "track_ids*")),
     Command("playlist.remove", _playlist_remove, tidal=True, dangerous=True,
             params=("id", "index", "track_id")),
+    Command("playlist.move", _playlist_move, tidal=True, dangerous=True,
+            params=("id", "index", "to", "track_id")),
     Command("playlist.delete", _playlist_delete, tidal=True, dangerous=True, params=("id",)),
     Command("playlist.rename", _playlist_rename, tidal=True, dangerous=True, params=("id", "name")),
     Command("playlist.describe", _playlist_describe, tidal=True, dangerous=True, params=("id", "description")),
@@ -1682,6 +1792,8 @@ AGENT_TOASTS = {
                                  + (" to play next" if r.get("position") == "next" else ""),
     "queue.move": lambda p, a, r: f'moved queue entry {a.get("index", 0) + 1} to {r["index"] + 1}',
     "queue.clear": lambda p, a, r: f'cleared the queue ({_n(r["removed"], "track")})',
+    "shuffle": lambda p, a, r: f'shuffle {"on" if r.get("shuffle") else "off"}',
+    "repeat": lambda p, a, r: f'repeat {r.get("repeat")}',
     "play.track": lambda p, a, r: f"playing {_title(p._current_track)}",
     "play.album": "played an album", "play.playlist": "played a playlist",
     "play.artist": "played an artist", "play.mix": "played a mix",
@@ -1692,6 +1804,7 @@ AGENT_TOASTS = {
     "playlist.add": lambda p, a, r: f'added {_n(len(a.get("track_ids") or [1]), "track")} '
                                     f"to {_named_list(p, a)}",
     "playlist.remove": "removed from a playlist",
+    "playlist.move": lambda p, a, r: f'moved a track to #{a.get("to", 0) + 1} in {_named_list(p, a)}',
     "playlist.delete": lambda p, a, r: f'deleted playlist "{r.get("name") or a.get("id")}"',
     "playlist.rename": lambda p, a, r: f'renamed playlist "{r.get("was")}" to "{r.get("name")}"',
     "playlist.describe": lambda p, a, r: f'changed the description of "{r.get("name")}"',

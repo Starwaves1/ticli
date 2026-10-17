@@ -327,6 +327,34 @@ class TestBrowsingThroughThePlayer:
         assert _pump(ui, lambda: [t.id for t in ui._browse_tracks] == [1, 3])
         assert removed == [1]
 
+    def test_moving_in_a_playlist_is_one_write_through_the_player(self, running):
+        run = running()
+        moves = []
+        tracks = [_track(1), _track(2), _track(3)]
+        playlist = player_mod.tidalapi.UserPlaylist.__new__(player_mod.tidalapi.UserPlaylist)
+        playlist.id, playlist.name, playlist.num_tracks = "p1", "Mix", 3
+        playlist.tracks = lambda: tracks
+        playlist.move_by_index = lambda i, to: (moves.append((i, to)), True)[-1]
+        run.core._remember("playlist", [playlist])
+        run.core._cache.put_playlist_tracks = lambda *a: None
+        ui = _tui()
+        ui._open_playlist(ipc.CachedPlaylist({"id": "p1", "name": "Mix", "editable": True}))
+        assert _pump(ui, lambda: len(ui._browse_tracks) == 3 and ui._browse_playlist is not None)
+        ui._browse_cursor = 0
+        for key in ("m", player_mod.KEY_DOWN, player_mod.KEY_DOWN, player_mod.KEY_ENTER):
+            ui._handle_key(key)
+        assert [t.id for t in ui._browse_tracks] == [2, 3, 1]
+        assert _pump(ui, lambda: moves == [(0, 3)])
+        assert [t.id for t in run.core._lists[("playlist", "p1")]] == [2, 3, 1]
+
+    def test_shuffle_and_repeat_reach_the_tui(self, running):
+        run = running()
+        ui = _tui()
+        ui._handle_key("S")
+        ui._handle_key("R")
+        assert _pump(ui, lambda: ui._shuffle and ui._repeat == "all")
+        assert run.core._shuffle and run.core._repeat == "all"
+
 
 class _SlowLookup:
     is_pkce = False
