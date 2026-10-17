@@ -69,15 +69,16 @@ ticli like                                           # the playing track
 ticli download https://tidal.com/browse/track/123
 ticli download album "discovery" tier=MAX           # a whole album or playlist, like the TUI's D
 ticli queue move 4 1                                 # indexes as `ticli queue` lists them; `ticli queue clear` keeps only the current track
+ticli shuffle on                                     # off / toggle; `ticli repeat all` (off / one / cycle); `ticli play album X shuffle=true` once
 ticli cache status                                   # cached songs vs the budget, downloads, metadata
 ticli track info current                             # album, quality, liked, downloaded or cached
-ticli playlist rename "Road trip" "Road trip 2026"   # also: playlist describe, playlist delete (y/N)
+ticli playlist rename "Road trip" "Road trip 2026"   # also: playlist describe, playlist move, playlist delete (y/N)
 ticli restart                                        # the background player on the current code; playback resumes where it was
 ```
 
 After an update, the background player may still run the old code. A verb finding an older player that is idle or only playing replaces it on its own (one line on stderr, about a second of silence); while a download runs it leaves it and says to run `ticli restart`.
 
-Playlist names match your own playlists case-insensitively with no TIDAL request, otherwise one TIDAL search; several matches print a numbered top 5 (`ticli start playlist 2` picks). A song is a track id, a TIDAL URL, `"artist - title"` (added only when the match is confident, otherwise you get candidates) or `current`. Dangerous verbs (deleting or renaming playlists, re-fetching the library, clearing the cache, logout) ask y/N; `ticli refetch` first shows what it would upgrade. Run without a terminal, a verb is treated as an AI agent and obeys the TUI's AI-control switches.
+Playlist names match your own playlists case-insensitively with no TIDAL request, otherwise one TIDAL search; several matches print a numbered top 5 (`ticli start playlist 2` picks). A song is a track id, a TIDAL URL, `"artist - title"` (added only when the match is confident, otherwise you get candidates) or `current`. Dangerous verbs (deleting, renaming or reordering playlists, re-fetching the library, clearing the cache, logout) ask y/N; `ticli refetch` first shows what it would upgrade. Run without a terminal, a verb is treated as an AI agent and obeys the TUI's AI-control switches.
 
 ### Login, and where FLAC comes from
 
@@ -114,7 +115,7 @@ The names follow TIDAL's own app — `MEDIUM` is the 320k option TIDAL files und
 | `v` | Volume (`←` `→` adjust, `Esc` close) |
 | `t` | Mini player |
 | `h` | Hide the controls until you press something |
-| `m` | More: `l` like · `r` radio · `y` add to playlist · `d` download · `q` queue · `p` playlists · `c` settings |
+| `m` | More: `l` like · `r` radio · `S` shuffle · `R` repeat (off / all / one) · `y` add to playlist · `d` download · `q` queue · `p` playlists · `c` settings |
 | `esc` | Quit |
 
 #### Everywhere else
@@ -123,11 +124,12 @@ The names follow TIDAL's own app — `MEDIUM` is the 320k option TIDAL files und
 
 | Screen | Extra keys |
 |--------|-----------|
-| Search | `Tab` cycle scope (tracks / albums / artists / playlists / your playlists) |
-| Album / playlist | `a` play all · `y` add to playlist · `d` / `D` download one / all · `x` remove (your own playlists) |
+| Search | `Tab` cycle scope (tracks / albums / artists / playlists / your playlists) · `↓` from the search bar into the results, where letters are keys: `q` queue · `y` add to playlist · `d` download · `/` back to the bar |
+| Album / playlist | `a` play all · `s` shuffle play · `y` add to playlist · `d` / `D` download one / all · your own playlists: `x` remove · `m` move (`↑` `↓`, `Enter` drop, `Esc` cancel) · `R` rename · `E` description · `X` delete |
 | Artist | `Tab` switch section · `a` play all · `d` / `D` download |
-| Queue | `Enter` jump · `x` remove · `y` / `d` / `D` as above |
+| Queue | `Enter` jump · `x` remove · `m` move · `s` shuffle · `r` repeat · `C` clear (keeps the playing track) · `y` / `d` / `D` as above |
 | Settings (`c`) | `←` `→` change · `o` log out · `u` FLAC sign-in · `R` re-fetch library at current quality · `d` downloads list · `x` clear cache |
+| Playlists (`p`) | your own: `R` rename · `E` description · `X` delete |
 | Downloads | `x` delete a file |
 
 ## Downloads

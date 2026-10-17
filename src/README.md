@@ -99,9 +99,11 @@ The old spellings `LOSSLESS` and `HIRES` still work as aliases.
 
 | Key | Action |
 |-----|--------|
+| `↓` | From the search bar into the results (`↑` from the top, or `/`, goes back) |
 | `↑` `↓` | Navigate results |
 | `enter` `→` | Play track / open album or artist |
 | `backspace` | Delete character |
+| `q` `y` `d` | In the results: queue, add to playlist, download |
 | `esc` `←` | Back |
 
 #### Queue
@@ -111,6 +113,9 @@ The old spellings `LOSSLESS` and `HIRES` still work as aliases.
 | `↑` `↓` | Navigate |
 | `enter` | Jump to track |
 | `x` | Remove track |
+| `m` | Move track (`↑` `↓`, `enter` drop, `esc` cancel) |
+| `s` `r` | Shuffle, repeat (off / all / one) |
+| `C` | Clear (keeps the playing track) |
 | `esc` `←` | Back |
 
 ## How it works
