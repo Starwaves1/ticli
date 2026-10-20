@@ -16,6 +16,15 @@ appear in the owner's real config directory the first time run() took one.
 Redirecting it here rather than there, because the next test to call `run()`
 would have had the same hole.
 
+The cache directory, the config directory and the credential store (keychain
+and its fallback file under `~/.config/ticli`) are redirected per test by the
+fixtures below, but a per-test fixture only protects the test it runs in. A
+thread a test leaves running outlives that test's monkeypatch, and when the
+monkeypatch is undone the module constant goes back to the *real* path — one
+such thread once deleted the owner's real cache index. So every path constant
+is also redirected for the whole session, and the per-test fixtures restore to
+that scratch directory, never to the real one.
+
 A playback failure asks every installed backend for its version
 (`backend_health.probe_backends`). That is a real subprocess against whatever
 mpv/ffplay this machine has, so a test's outcome would depend on the machine —
@@ -33,6 +42,7 @@ import pytest
 from ticli import ipc as ipc_mod
 from ticli import player as player_mod
 from ticli.utils import backend_health as backend_health_mod
+from ticli.utils import cache as cache_mod
 from ticli.utils import config as config_mod
 from ticli.utils import credential_store as credential_store_mod
 from ticli.utils import downloads as downloads_mod
@@ -41,11 +51,8 @@ from ticli.utils import throttle as throttle_mod
 
 @pytest.fixture(autouse=True, scope="session")
 def never_the_real_dirs_after_teardown(tmp_path_factory):
-    """A thread a test leaves running outlives that test's monkeypatch, so the
-    per-test fixtures below must restore to a scratch directory, never the real one."""
-    base = tmp_path_factory.mktemp("after-teardown")
+    base = tmp_path_factory.mktemp("session-scratch")
     mp = pytest.MonkeyPatch()
-    from ticli.utils import cache as cache_mod
     mp.setattr(cache_mod, "CACHE_DIR", base / "cache")
     mp.setattr(downloads_mod, "DOWNLOAD_ROOT", base / "Music")
     mp.setattr(player_mod, "STATE_DIR", base / "state")
@@ -56,6 +63,8 @@ def never_the_real_dirs_after_teardown(tmp_path_factory):
     mp.setattr(credential_store_mod, "keyring", None)
     mp.setattr(credential_store_mod, "FALLBACK_DIR", base / "credentials")
     mp.setattr(credential_store_mod, "FALLBACK_FILE", base / "credentials" / "session.json")
+    yield base
+    mp.undo()
 
 
 @pytest.fixture(autouse=True)
@@ -92,7 +101,6 @@ def never_the_real_tokens(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def never_the_real_cache(tmp_path, monkeypatch):
-    from ticli.utils import cache as cache_mod
     monkeypatch.setattr(cache_mod, "CACHE_DIR", tmp_path / "cache")
 
 
